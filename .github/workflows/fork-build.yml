@@ -87,8 +87,8 @@ jobs:
           file: Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ steps.owner.outputs.name }}/server:dev
-            ghcr.io/${{ steps.owner.outputs.name }}/server:dev-${{ steps.version.outputs.short_sha }}
+            ghcr.io/${{ steps.owner.outputs.name }}/music-assistant:dev
+            ghcr.io/${{ steps.owner.outputs.name }}/music-assistant:dev-${{ steps.version.outputs.short_sha }}
           build-args: |
             MASS_VERSION=${{ steps.version.outputs.version }}
             BASE_IMAGE_VERSION=${{ env.BASE_IMAGE_VERSION }}
