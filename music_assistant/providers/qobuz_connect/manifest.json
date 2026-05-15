@@ -1,0 +1,13 @@
+{
+  "type": "plugin",
+  "domain": "qobuz_connect",
+  "stage": "experimental",
+  "name": "Qobuz Connect",
+  "description": "Experimental Qobuz Connect receiver that controls Music Assistant's native Qobuz playback.",
+  "codeowners": ["@local-dev"],
+  "requirements": [
+    "qobuz-proxy @ git+https://github.com/leolobato/qobuz-proxy.git@v1.3.5"
+  ],
+  "documentation": "https://github.com/music-assistant/server",
+  "multi_instance": true
+}
