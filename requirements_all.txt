@@ -83,6 +83,7 @@ pytz==2026.2
 pywam==0.2.0
 pywidevine==1.9.0
 PyYAML==6.0.3
+qobuz-proxy @ git+https://github.com/leolobato/qobuz-proxy.git@v1.3.5
 qqmusic-api-python==0.6.6
 radios==0.3.2
 rokuecp==0.19.5
