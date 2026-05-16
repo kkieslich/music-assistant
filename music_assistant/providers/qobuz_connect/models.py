@@ -71,7 +71,11 @@ class PlayingState(IntEnum):
 class BufferState(IntEnum):
     """Qobuz buffer states."""
 
+    UNKNOWN = 0
+    BUFFERING = 1
     OK = 2
+    ERROR = 3
+    UNDERRUN = 4
 
 
 class Origin(StrEnum):
@@ -184,6 +188,7 @@ class QobuzMirror:
     current_item: QueueTrackRef | None = None
     next_item: QueueTrackRef | None = None
     playing_state: PlayingState = PlayingState.STOPPED
+    buffer_state: BufferState = BufferState.OK
     position_ms: int = 0
     position_timestamp_ms: int = 0
     duration_ms: int = 0

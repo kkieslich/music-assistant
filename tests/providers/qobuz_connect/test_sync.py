@@ -7,9 +7,10 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from music_assistant_models.enums import PlaybackState
+from music_assistant_models.enums import MediaType, PlaybackState
 
 from music_assistant.providers.qobuz_connect.models import (
+    BufferState,
     PlayingState,
     QueueError,
     QueueLoadAck,
@@ -25,6 +26,7 @@ class _FakePlayerQueues:
 
     def __init__(self, queue: Any) -> None:
         self.queue = queue
+        self.queue_items: list[Any] = []
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
 
     def get(self, player_id: str) -> Any:
@@ -41,6 +43,12 @@ class _FakePlayerQueues:
     async def play_index(self, player_id: str, index: int, **kwargs: Any) -> None:
         self.calls.append(("play_index", (player_id, index), kwargs))
         self.queue.state = PlaybackState.PLAYING
+        self.queue.current_index = index
+        if self.queue_items:
+            item = self.queue_items[index]
+            self.queue.current_item = SimpleNamespace(
+                track_id=getattr(item.media_item, "item_id", None)
+            )
 
     async def seek(self, player_id: str, position: int) -> None:
         self.calls.append(("seek", (player_id, position), {}))
@@ -48,6 +56,16 @@ class _FakePlayerQueues:
     async def stop(self, player_id: str) -> None:
         self.calls.append(("stop", (player_id,), {}))
         self.queue.state = PlaybackState.IDLE
+
+    def clear(self, queue_id: str, skip_stop: bool = False) -> None:
+        self.calls.append(("clear", (queue_id,), {"skip_stop": skip_stop}))
+        self.queue_items = []
+        self.queue.current_item = None
+        self.queue.current_index = None
+
+    async def load(self, queue_id: str, queue_items: list[Any], **kwargs: Any) -> None:
+        self.calls.append(("load", (queue_id, queue_items), kwargs))
+        self.queue_items = queue_items
 
     async def play_media(self, queue_id: str, media: Any, **kwargs: Any) -> None:
         self.calls.append(("play_media", (queue_id, media), kwargs))
@@ -111,8 +129,13 @@ class _FakeProvider:
 async def _fake_get_track(track_id: str) -> Any:
     return SimpleNamespace(
         item_id=track_id,
+        name=f"Track {track_id}",
+        media_type=MediaType.TRACK,
+        uri=f"qobuz://track/{track_id}",
+        image=None,
+        available=True,
         duration=180,
-        album=SimpleNamespace(item_id="123456"),
+        album=SimpleNamespace(item_id="123456", image=None, media_type=MediaType.ALBUM),
         track_number=2,
     )
 
@@ -178,6 +201,147 @@ async def test_play_after_paused_seek_resumes_at_pending_position() -> None:
 
 
 @pytest.mark.asyncio
+async def test_qobuz_play_reports_buffering_before_ma_confirms() -> None:
+    """A Qobuz play command should not flicker back to paused while MA loads."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PAUSED)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            position_ms=0,
+            current_item=QueueTrackRef(queue_item_id=11, track_id="376286112"),
+        )
+    )
+
+    assert session.renderer_states[0]["playing_state"] == PlayingState.PLAYING
+    assert engine.qobuz_state.buffer_state == BufferState.BUFFERING
+    assert session.renderer_states[0]["buffer_state"] == BufferState.BUFFERING
+
+
+@pytest.mark.asyncio
+async def test_stale_ma_pause_does_not_override_pending_qobuz_play() -> None:
+    """While buffering, stale MA state must not undo the latest Qobuz command."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PAUSED)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=11, track_id="376286112")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+    engine.qobuz_state.buffer_state = BufferState.BUFFERING
+    engine.qobuz_state.position_ms = 25_000
+
+    await engine.report_state()
+
+    assert engine.qobuz_state.playing_state == PlayingState.PLAYING
+    assert engine.qobuz_state.buffer_state == BufferState.BUFFERING
+    assert session.renderer_states[-1]["playing_state"] == PlayingState.PLAYING
+    assert session.renderer_states[-1]["buffer_state"] == BufferState.BUFFERING
+
+
+@pytest.mark.asyncio
+async def test_ma_playing_confirmation_clears_buffering() -> None:
+    """Buffering clears once MA reaches the commanded play state."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=11, track_id="376286112")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+    engine.qobuz_state.buffer_state = BufferState.BUFFERING
+
+    await engine.report_state()
+
+    assert cast("Any", engine.qobuz_state).buffer_state == BufferState.OK
+    assert cast("Any", session.renderer_states[-1])["buffer_state"] == BufferState.OK
+
+
+@pytest.mark.asyncio
+async def test_ma_position_past_pending_seek_clears_buffering() -> None:
+    """A slow confirmation can arrive after MA has already passed the exact seek target."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    queue.corrected_elapsed_time = 76.2
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=11, track_id="376286112")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+    engine.qobuz_state.buffer_state = BufferState.BUFFERING
+    engine._pending_qobuz_position_ms = 73_794
+
+    await engine.report_state()
+
+    assert engine.qobuz_state.buffer_state == BufferState.OK
+    assert cast("Any", engine)._pending_qobuz_position_ms is None
+    assert session.renderer_states[-1]["position_ms"] == 76_200
+
+
+@pytest.mark.asyncio
+async def test_stop_based_pause_confirms_qobuz_pause() -> None:
+    """MA outputs that stop on pause should still leave QiOS showing paused."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.IDLE)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=11, track_id="376286112")
+    engine.qobuz_state.playing_state = PlayingState.PAUSED
+    engine.qobuz_state.buffer_state = BufferState.BUFFERING
+    engine.qobuz_state.position_ms = 33_000
+
+    await engine.report_state()
+
+    assert engine.qobuz_state.playing_state == PlayingState.PAUSED
+    assert engine.qobuz_state.buffer_state == BufferState.OK
+    assert engine.qobuz_state.position_ms == 33_000
+    assert session.renderer_states[-1]["playing_state"] == PlayingState.PAUSED
+
+
+@pytest.mark.asyncio
+async def test_paused_buffering_is_not_sent_to_qobuz() -> None:
+    """Only playing startup exposes BUFFERING to clients."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.IDLE)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=11, track_id="376286112")
+    engine.qobuz_state.playing_state = PlayingState.PAUSED
+    engine.qobuz_state.buffer_state = BufferState.BUFFERING
+
+    await engine.report_state(sync_from_ma=False)
+
+    assert session.renderer_states[-1]["playing_state"] == PlayingState.PAUSED
+    assert session.renderer_states[-1]["buffer_state"] == BufferState.OK
+
+
+@pytest.mark.asyncio
+async def test_mid_track_handoff_reports_target_position_before_loading() -> None:
+    """The first report for a handoff should carry Qobuz's target position."""
+    session = _FakeSession()
+    provider = _FakeProvider(_queue(PlaybackState.PAUSED, track_id="old"), session=session)
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            position_ms=72_000,
+            current_item=QueueTrackRef(queue_item_id=11, track_id="376286112"),
+        )
+    )
+
+    assert session.renderer_states[0]["position_ms"] == 72_000
+    assert engine.qobuz_state.buffer_state == BufferState.BUFFERING
+    assert session.renderer_states[0]["buffer_state"] == BufferState.BUFFERING
+    assert ("play_media",) not in [(call[0],) for call in provider.mass.player_queues.calls]
+    assert provider.mass.player_queues.calls[-1] == (
+        "play_index",
+        ("player", 0),
+        {"seek_position": 72},
+    )
+
+
+@pytest.mark.asyncio
 async def test_play_after_stop_based_pause_restarts_current_item() -> None:
     """Players that implement pause as stop should still resume from Qobuz play."""
     provider = _FakeProvider(_queue(PlaybackState.IDLE))
@@ -214,6 +378,55 @@ async def test_resume_report_does_not_advance_by_paused_duration(monkeypatch: An
 
 
 @pytest.mark.asyncio
+async def test_playing_report_uses_anchor_not_interpolated_position(monkeypatch: Any) -> None:
+    """State reports should not double-interpolate during volume or heartbeat reports."""
+    session = _FakeSession()
+    provider = _FakeProvider(_queue(PlaybackState.PLAYING), session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=11, track_id="376286112")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+    engine.qobuz_state.buffer_state = BufferState.OK
+    engine.qobuz_state.position_ms = 42_000
+    engine.qobuz_state.position_timestamp_ms = 100_000
+    monkeypatch.setattr(
+        "music_assistant.providers.qobuz_connect.sync.time.time",
+        lambda: 105.0,
+    )
+
+    await engine.report_state(sync_from_ma=False)
+
+    assert session.renderer_states[-1]["position_ms"] == 42_000
+    assert session.renderer_states[-1]["position_timestamp_ms"] == 100_000
+
+
+@pytest.mark.asyncio
+async def test_ma_natural_advance_promotes_known_qobuz_next_item() -> None:
+    """MA advancing to Qobuz next should update the mirror, not send MA-origin load."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING, track_id="397744036")
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=1, track_id="217628808")
+    engine.qobuz_state.next_item = QueueTrackRef(queue_item_id=2, track_id="397744036")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+    engine.qobuz_state.position_ms = 73_794
+    engine._pending_qobuz_position_ms = 73_794
+    engine._pending_qobuz_position_ref = "1:217628808"
+
+    await engine.handle_ma_queue_event(_event(queue))
+
+    assert engine.qobuz_state.current_item == QueueTrackRef(
+        queue_item_id=2,
+        track_id="397744036",
+    )
+    assert cast("Any", engine).qobuz_state.next_item is None
+    assert engine.qobuz_state.position_ms == 10_000
+    assert cast("Any", engine)._pending_qobuz_position_ms is None
+    assert session.queue_loads == []
+    assert session.renderer_states[-1]["queue_item_id"] == 2
+
+
+@pytest.mark.asyncio
 async def test_play_with_only_next_item_promotes_next_to_current() -> None:
     """Qobuz can send the selected item as nextQueueItem before PLAYING."""
     provider = _FakeProvider(_queue(PlaybackState.PAUSED, track_id="old"))
@@ -231,7 +444,7 @@ async def test_play_with_only_next_item_promotes_next_to_current() -> None:
         queue_item_id=11,
         track_id="376286112",
     )
-    assert provider.mass.player_queues.calls[0][0] == "play_media"
+    assert provider.mass.player_queues.calls[-1][0] == "play_index"
 
 
 @pytest.mark.asyncio
@@ -434,6 +647,7 @@ async def test_playing_position_echo_inside_tolerance_is_not_a_seek() -> None:
     engine.qobuz_state.playing_state = PlayingState.PLAYING
 
     await engine.handle_qobuz_set_state(SetStateEvent(position_ms=10_200))
+    await asyncio.sleep(0.4)
 
     assert provider.mass.player_queues.calls == []
 
@@ -446,5 +660,52 @@ async def test_playing_position_divergence_seeks_ma_once() -> None:
     engine.qobuz_state.playing_state = PlayingState.PLAYING
 
     await engine.handle_qobuz_set_state(SetStateEvent(position_ms=50_000))
+    await asyncio.sleep(0.4)
 
     assert provider.mass.player_queues.calls == [("seek", ("player", 50), {})]
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_backward_seek_does_not_confirm_against_old_forward_position() -> None:
+    """A backward seek must wait for MA to actually return near the target."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    queue.corrected_elapsed_time = 109
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=11, track_id="376286112")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+    engine.qobuz_state.buffer_state = BufferState.OK
+
+    await engine.handle_qobuz_set_state(SetStateEvent(position_ms=19_000))
+    await asyncio.sleep(0.4)
+    await engine.report_state()
+
+    assert engine.qobuz_state.buffer_state == BufferState.BUFFERING
+    assert session.renderer_states[-1]["position_ms"] == 19_000
+    assert session.renderer_states[-1]["buffer_state"] == BufferState.BUFFERING
+
+    queue.corrected_elapsed_time = 20
+    await engine.report_state()
+
+    assert cast("Any", engine.qobuz_state).buffer_state == BufferState.OK
+    assert cast("Any", session.renderer_states[-1])["buffer_state"] == BufferState.OK
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_playing_position_command_reports_buffering_until_confirmed() -> None:
+    """Playing seek commands freeze QiOS while MA prepares the seeked stream."""
+    session = _FakeSession()
+    provider = _FakeProvider(_queue(PlaybackState.PLAYING), session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=11, track_id="376286112")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+    engine.qobuz_state.buffer_state = BufferState.OK
+
+    await engine.handle_qobuz_set_state(SetStateEvent(position_ms=50_000))
+
+    assert session.renderer_states[0]["playing_state"] == PlayingState.PLAYING
+    assert session.renderer_states[0]["buffer_state"] == BufferState.BUFFERING
+    await engine.stop()

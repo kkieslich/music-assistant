@@ -8,6 +8,7 @@ Qobuz provider and player queue.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import uuid
 from collections.abc import Callable
@@ -250,6 +251,7 @@ class QobuzConnectProvider(PluginProvider):
                 on_volume_delta=self._on_volume_delta_command,
                 on_quality=self._on_quality_change,
                 on_state_request=self._sync.report_state,
+                on_set_active=self._on_set_active,
             )
             self._session.set_tokens(tokens)
             await self._session.start()
@@ -270,6 +272,23 @@ class QobuzConnectProvider(PluginProvider):
     async def _on_volume_delta_command(self, delta: int) -> None:
         """Handle relative volume command from Qobuz."""
         await self._sync.set_volume_delta(delta)
+
+    async def _on_set_active(self, active: bool) -> None:
+        """Handle SRVR_RNDR_SET_ACTIVE from the Qobuz cloud.
+
+        Sent when the user picks a different renderer in the Qobuz app —
+        we have to release the MA player so two devices don't keep streaming
+        in parallel.
+        """
+        if active:
+            self.logger.info("Qobuz Connect activated")
+            return
+        self.logger.info("Qobuz Connect deactivated by cloud; releasing MA player")
+        player_id = self.get_target_player_id()
+        if player_id:
+            with contextlib.suppress(Exception):
+                await self.mass.player_queues.stop(player_id)
+        self._sync.reset_for_deactivation()
 
     async def _broadcast_current_volume(self) -> None:
         """Report current MA player volume to Qobuz."""

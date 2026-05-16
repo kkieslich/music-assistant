@@ -14,6 +14,7 @@ import websockets
 from websockets import ClientConnection
 
 from .models import (
+    BufferState,
     ConnectTokens,
     DeviceConfig,
     JWTConnectToken,
@@ -55,6 +56,7 @@ class QobuzConnectSession:
         on_volume_delta: Callable[[int], Awaitable[None]],
         on_quality: Callable[[int], Awaitable[None]],
         on_state_request: Callable[[], Awaitable[None]],
+        on_set_active: Callable[[bool], Awaitable[None]],
     ) -> None:
         """Initialize session."""
         self.device = device
@@ -78,6 +80,7 @@ class QobuzConnectSession:
         self._on_volume_delta = on_volume_delta
         self._on_quality = on_quality
         self._on_state_request = on_state_request
+        self._on_set_active = on_set_active
 
     @property
     def is_connected(self) -> bool:
@@ -124,6 +127,7 @@ class QobuzConnectSession:
         self,
         *,
         playing_state: PlayingState,
+        buffer_state: BufferState,
         position_ms: int,
         position_timestamp_ms: int,
         duration_ms: int,
@@ -134,6 +138,7 @@ class QobuzConnectSession:
         return await self.send_message(
             self._codec.encode_renderer_state(
                 playing_state=playing_state,
+                buffer_state=buffer_state,
                 position_ms=position_ms,
                 position_timestamp_ms=position_timestamp_ms,
                 duration_ms=duration_ms,
@@ -329,6 +334,11 @@ class QobuzConnectSession:
             elif msg_type == QConnectMessageType.SRVR_RNDR_SET_MAX_AUDIO_QUALITY:
                 if msg.HasField("srvrRndrSetMaxAudioQuality"):
                     await self._on_quality(msg.srvrRndrSetMaxAudioQuality.maxAudioQuality)
+            elif msg_type == QConnectMessageType.SRVR_RNDR_SET_ACTIVE:
+                if msg.HasField("srvrRndrSetActive"):
+                    active = bool(msg.srvrRndrSetActive.active)
+                    LOGGER.debug("Qobuz SET_ACTIVE active=%s", active)
+                    await self._on_set_active(active)
             elif msg_type == QConnectMessageType.SRVR_CTRL_QUEUE_TRACKS_LOADED:
                 if ack := self._codec.parse_queue_load_ack(msg):
                     LOGGER.debug(
