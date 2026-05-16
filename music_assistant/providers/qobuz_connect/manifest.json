@@ -5,9 +5,7 @@
   "name": "Qobuz Connect",
   "description": "Experimental Qobuz Connect receiver that controls Music Assistant's native Qobuz playback.",
   "codeowners": ["@local-dev"],
-  "requirements": [
-    "qobuz-proxy @ https://github.com/leolobato/qobuz-proxy/archive/refs/tags/v1.3.5.tar.gz"
-  ],
+  "requirements": [],
   "documentation": "https://github.com/music-assistant/server",
   "multi_instance": true
 }

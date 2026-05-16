@@ -1,0 +1,407 @@
+"""Qobuz Connect websocket session management."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hashlib
+import logging
+import time
+import uuid
+from collections.abc import Awaitable, Callable
+
+import websockets
+from websockets import ClientConnection
+
+from .models import (
+    ConnectTokens,
+    DeviceConfig,
+    JWTConnectToken,
+    PlayingState,
+    QConnectMessageType,
+    QueueError,
+    QueueLoadAck,
+    QueueVersion,
+    SetStateEvent,
+)
+from .protocol import QobuzConnectCodec
+
+LOGGER = logging.getLogger(__name__)
+
+PING_INTERVAL = 10.0
+PONG_TIMEOUT = 30.0
+RECV_TIMEOUT = 1.0
+TOKEN_REFRESH_BUFFER = 60
+INITIAL_RECONNECT_DELAY = 1.0
+MAX_RECONNECT_DELAY = 60.0
+
+
+class TokenRefreshRequired(Exception):
+    """Raised when the websocket must wait for refreshed tokens."""
+
+
+class QobuzConnectSession:
+    """Own the Qobuz cloud websocket and typed protocol events."""
+
+    def __init__(
+        self,
+        device: DeviceConfig,
+        *,
+        on_set_state: Callable[[SetStateEvent], Awaitable[None]],
+        on_queue_load_ack: Callable[[QueueLoadAck], Awaitable[None]],
+        on_queue_error: Callable[[QueueError], Awaitable[None]],
+        on_queue_version: Callable[[QueueVersion], Awaitable[None]],
+        on_volume: Callable[[int], Awaitable[None]],
+        on_volume_delta: Callable[[int], Awaitable[None]],
+        on_quality: Callable[[int], Awaitable[None]],
+        on_state_request: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Initialize session."""
+        self.device = device
+        self._device_uuid = _uuid_to_bytes(device.uuid)
+        self._codec = QobuzConnectCodec(self._device_uuid)
+        self._ws: ClientConnection | None = None
+        self._ws_token: JWTConnectToken | None = None
+        self._session_uuid: bytes | None = None
+        self._token_update_event = asyncio.Event()
+        self._token_version = 0
+        self._should_run = False
+        self._is_connected = False
+        self._receive_task: asyncio.Task[None] | None = None
+        self._pending_messages: list[bytes] = []
+        self._reconnect_delay = INITIAL_RECONNECT_DELAY
+        self._on_set_state = on_set_state
+        self._on_queue_load_ack = on_queue_load_ack
+        self._on_queue_error = on_queue_error
+        self._on_queue_version = on_queue_version
+        self._on_volume = on_volume
+        self._on_volume_delta = on_volume_delta
+        self._on_quality = on_quality
+        self._on_state_request = on_state_request
+
+    @property
+    def is_connected(self) -> bool:
+        """Return whether websocket is connected."""
+        return self._is_connected
+
+    def set_tokens(self, tokens: ConnectTokens) -> None:
+        """Set or refresh Qobuz cloud tokens."""
+        previous_token = self._ws_token
+        previous_session_uuid = self._session_uuid
+        if tokens.ws_token:
+            self._ws_token = tokens.ws_token
+        self._session_uuid = _uuid_to_bytes(tokens.session_id)
+        self._token_version += 1
+        self._token_update_event.set()
+        if (
+            self._should_run
+            and self._ws
+            and (previous_token != self._ws_token or previous_session_uuid != self._session_uuid)
+        ):
+            asyncio.create_task(self._close_for_token_refresh())
+
+    async def start(self) -> None:
+        """Start websocket connection loop."""
+        if not self._ws_token or not self._ws_token.is_valid():
+            LOGGER.error("Cannot start Qobuz Connect session without websocket token")
+            return
+        if self._should_run:
+            return
+        self._should_run = True
+        self._receive_task = asyncio.create_task(self._connection_loop())
+
+    async def stop(self) -> None:
+        """Stop websocket session."""
+        self._should_run = False
+        if self._ws:
+            await self._ws.close()
+        if self._receive_task:
+            self._receive_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._receive_task
+
+    async def send_renderer_state(
+        self,
+        *,
+        playing_state: PlayingState,
+        position_ms: int,
+        position_timestamp_ms: int,
+        duration_ms: int,
+        queue_item_id: int,
+        queue_version: QueueVersion,
+    ) -> bool:
+        """Report renderer state to Qobuz."""
+        return await self.send_message(
+            self._codec.encode_renderer_state(
+                playing_state=playing_state,
+                position_ms=position_ms,
+                position_timestamp_ms=position_timestamp_ms,
+                duration_ms=duration_ms,
+                queue_item_id=queue_item_id,
+                queue_version=queue_version,
+            )
+        )
+
+    async def send_queue_load_tracks(
+        self,
+        *,
+        action_uuid: bytes,
+        track_id: str,
+        queue_version: QueueVersion,
+        qobuz_reference_id: int | None = None,
+        queue_position: int = 0,
+        autoplay_reset: bool = True,
+        context_uuid: bytes | None = None,
+        qweb_track_session: bool = False,
+    ) -> bool:
+        """Ask the Qobuz cloud queue to load a track selected in MA."""
+        return await self.send_message(
+            self._codec.encode_queue_load_tracks(
+                action_uuid=action_uuid,
+                track_id=track_id,
+                queue_version=queue_version,
+                qobuz_reference_id=qobuz_reference_id,
+                queue_position=queue_position,
+                autoplay_reset=autoplay_reset,
+                context_uuid=context_uuid,
+                qweb_track_session=qweb_track_session,
+            )
+        )
+
+    async def send_autoplay_load_tracks(
+        self,
+        *,
+        action_uuid: bytes,
+        track_ids: list[int],
+        queue_version: QueueVersion,
+        context_uuid: bytes | None = None,
+        autoplay_reset: bool = True,
+        autoplay_loading: bool = False,
+        prepend: bool = True,
+        append: bool = False,
+    ) -> bool:
+        """Ask the Qobuz cloud to load explicit track ids through the autoplay path."""
+        return await self.send_message(
+            self._codec.encode_autoplay_load_tracks(
+                action_uuid=action_uuid,
+                track_ids=track_ids,
+                queue_version=queue_version,
+                context_uuid=context_uuid,
+                autoplay_reset=autoplay_reset,
+                autoplay_loading=autoplay_loading,
+                prepend=prepend,
+                append=append,
+            )
+        )
+
+    async def send_player_state(
+        self,
+        *,
+        playing_state: PlayingState,
+        position_ms: int,
+        queue_version: QueueVersion,
+        queue_item_id: int,
+    ) -> bool:
+        """Send controller player-state command."""
+        return await self.send_message(
+            self._codec.encode_player_state(
+                playing_state=playing_state,
+                position_ms=position_ms,
+                queue_version=queue_version,
+                queue_item_id=queue_item_id,
+            )
+        )
+
+    async def send_volume_changed(self, volume: int) -> bool:
+        """Report renderer volume to Qobuz."""
+        return await self.send_message(self._codec.encode_volume_changed(volume))
+
+    async def send_quality_reports(self, quality: int) -> None:
+        """Report device/file/max quality to Qobuz."""
+        await self.send_message(self._codec.encode_file_audio_quality_changed(quality))
+        await self.send_message(self._codec.encode_device_audio_quality_changed(quality))
+        await self.send_message(self._codec.encode_max_audio_quality_changed(quality))
+
+    async def send_message(self, data: bytes) -> bool:
+        """Send an encoded websocket frame, queuing if disconnected."""
+        if self._ws and self._is_connected:
+            try:
+                await self._ws.send(data)
+                return True
+            except Exception:
+                LOGGER.exception("Failed to send Qobuz websocket message")
+        self._pending_messages.append(data)
+        return False
+
+    async def _connection_loop(self) -> None:
+        while self._should_run:
+            should_backoff = True
+            try:
+                if not await self._wait_for_valid_token(TOKEN_REFRESH_BUFFER):
+                    break
+                assert self._ws_token is not None
+                async with websockets.connect(
+                    self._ws_token.endpoint,
+                    ping_interval=PING_INTERVAL,
+                    ping_timeout=PONG_TIMEOUT,
+                ) as ws:
+                    self._ws = ws
+                    self._is_connected = False
+                    await ws.send(self._codec.encode_authenticate(self._ws_token.jwt))
+                    if self._session_uuid:
+                        await ws.send(self._codec.encode_subscribe(self._session_uuid))
+                        await ws.send(
+                            self._codec.encode_join_session(
+                                self._device_uuid,
+                                self.device.name,
+                                self._session_uuid,
+                                self.device.max_quality,
+                            )
+                        )
+                    self._is_connected = True
+                    self._reconnect_delay = INITIAL_RECONNECT_DELAY
+                    await self._flush_pending_messages()
+                    await self._receive_loop()
+            except TokenRefreshRequired:
+                should_backoff = False
+                self._is_connected = False
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("Qobuz Connect websocket error")
+                self._is_connected = False
+            finally:
+                self._ws = None
+                self._is_connected = False
+            if self._should_run and should_backoff:
+                await asyncio.sleep(self._reconnect_delay)
+                self._reconnect_delay = min(self._reconnect_delay * 2, MAX_RECONNECT_DELAY)
+
+    async def _receive_loop(self) -> None:
+        while self._should_run and self._ws:
+            try:
+                data = await asyncio.wait_for(self._ws.recv(), timeout=RECV_TIMEOUT)
+                if isinstance(data, bytes):
+                    await self._handle_message(data)
+            except TimeoutError:
+                if self._ws_token and _token_expiring(self._ws_token, TOKEN_REFRESH_BUFFER):
+                    raise TokenRefreshRequired
+            except websockets.ConnectionClosed:
+                raise
+
+    async def _handle_message(self, data: bytes) -> None:
+        decoded = self._codec.decode_frame(data)
+        if not decoded:
+            return
+        if decoded.msg_type.name == "PAYLOAD":
+            await self._handle_payload(decoded.payload)
+        elif decoded.msg_type.name == "ERROR":
+            LOGGER.error("Qobuz websocket error %s: %s", decoded.error_code, decoded.error_message)
+        elif decoded.msg_type.name == "DISCONNECT":
+            raise websockets.ConnectionClosed(None, None)
+
+    async def _handle_payload(self, payload: bytes | None) -> None:
+        if not payload:
+            return
+        batch = self._codec.decode_qconnect_batch(payload)
+        if not batch:
+            return
+        for msg in batch.messages:
+            msg_type = msg.messageType
+            if msg_type == QConnectMessageType.SRVR_RNDR_SET_STATE:
+                if event := self._codec.parse_set_state(msg):
+                    LOGGER.debug(
+                        "Qobuz SET_STATE state=%s pos=%s current=%s next=%s qv=%s",
+                        event.playing_state,
+                        event.position_ms,
+                        _format_track_ref(event.current_item),
+                        _format_track_ref(event.next_item),
+                        event.queue_version,
+                    )
+                    await self._on_set_state(event)
+            elif msg_type == QConnectMessageType.SRVR_RNDR_SET_VOLUME:
+                if msg.HasField("srvrRndrSetVolume"):
+                    vol = msg.srvrRndrSetVolume
+                    if vol.HasField("volume"):
+                        await self._on_volume(vol.volume)
+                    elif vol.HasField("volumeDelta"):
+                        await self._on_volume_delta(vol.volumeDelta)
+            elif msg_type == QConnectMessageType.SRVR_RNDR_SET_MAX_AUDIO_QUALITY:
+                if msg.HasField("srvrRndrSetMaxAudioQuality"):
+                    await self._on_quality(msg.srvrRndrSetMaxAudioQuality.maxAudioQuality)
+            elif msg_type == QConnectMessageType.SRVR_CTRL_QUEUE_TRACKS_LOADED:
+                if ack := self._codec.parse_queue_load_ack(msg):
+                    LOGGER.debug(
+                        "Qobuz queue-load ACK qv=%s tracks=%s",
+                        ack.queue_version,
+                        [_format_track_ref(track) for track in ack.tracks],
+                    )
+                    await self._on_queue_load_ack(ack)
+            elif msg_type == QConnectMessageType.SRVR_CTRL_AUTOPLAY_TRACKS_LOADED:
+                if ack := self._codec.parse_autoplay_load_ack(msg):
+                    LOGGER.debug(
+                        "Qobuz autoplay-load ACK qv=%s tracks=%s",
+                        ack.queue_version,
+                        [_format_track_ref(track) for track in ack.tracks],
+                    )
+                    await self._on_queue_load_ack(ack)
+            elif msg_type == QConnectMessageType.SRVR_CTRL_QUEUE_ERROR_MESSAGE:
+                if error := self._codec.parse_queue_error(msg):
+                    await self._on_queue_error(error)
+            elif msg_type == QConnectMessageType.SRVR_CTRL_QUEUE_VERSION_CHANGED:
+                if version := self._codec.parse_queue_version_changed(msg):
+                    await self._on_queue_version(version)
+            elif msg_type == QConnectMessageType.CTRL_SRVR_ASK_FOR_RENDERER_STATE:
+                LOGGER.debug("Qobuz requested renderer state")
+                await self._on_state_request()
+            else:
+                LOGGER.debug("Unhandled Qobuz Connect message type: %s", msg_type)
+
+    async def _flush_pending_messages(self) -> None:
+        if not self._pending_messages or not self._ws:
+            return
+        for data in self._pending_messages:
+            try:
+                await self._ws.send(data)
+            except Exception:
+                LOGGER.exception("Failed to flush Qobuz websocket message")
+        self._pending_messages.clear()
+
+    async def _wait_for_valid_token(self, buffer_s: int = 0) -> bool:
+        while self._should_run:
+            if (
+                self._ws_token
+                and self._ws_token.is_valid()
+                and not _token_expiring(
+                    self._ws_token,
+                    buffer_s,
+                )
+            ):
+                return True
+            token_version = self._token_version
+            self._token_update_event.clear()
+            if self._token_version != token_version:
+                continue
+            await self._token_update_event.wait()
+        return False
+
+    async def _close_for_token_refresh(self) -> None:
+        if self._ws:
+            await self._ws.close()
+
+
+def _token_expiring(token: JWTConnectToken, buffer_s: int) -> bool:
+    return token.exp <= int(time.time()) + buffer_s
+
+
+def _uuid_to_bytes(uuid_str: str) -> bytes:
+    try:
+        return uuid.UUID(uuid_str).bytes
+    except ValueError:
+        return hashlib.md5(uuid_str.encode(), usedforsecurity=False).digest()
+
+
+def _format_track_ref(track_ref: object | None) -> str:
+    if track_ref is None:
+        return "-"
+    return f"{getattr(track_ref, 'queue_item_id', '?')}:{getattr(track_ref, 'track_id', '?')}"
