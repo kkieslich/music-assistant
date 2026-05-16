@@ -1,0 +1,1 @@
+"""Qobuz Connect provider tests."""

@@ -1,74 +1,34 @@
 """Experimental Qobuz Connect receiver for Music Assistant.
 
-This prototype reuses qobuz-proxy's Connect discovery/WebSocket/protobuf layer,
-but maps playback commands to Music Assistant's native player queue. That keeps
-streaming, seeking, buffering and provider auth inside Music Assistant instead
-of forwarding audio through a DLNA bridge.
+This provider implements enough of Qobuz Connect locally to expose Music
+Assistant as a Qobuz Connect target while keeping playback inside MA's native
+Qobuz provider and player queue.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import time
+import logging
 import uuid
-from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as _installed_pkg_version
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
-from music_assistant_models.enums import ConfigEntryType, QueueOption
+from music_assistant_models.enums import ConfigEntryType, EventType
 from music_assistant_models.enums import PlaybackState as MAPlaybackState
-from music_assistant_models.errors import InvalidDataError, PlayerUnavailableError
+from music_assistant_models.errors import InvalidDataError
 
 from music_assistant.models.plugin import PluginProvider
 
-# Pin the qobuz-proxy version expected by this provider. Must match the @<tag>
-# at the end of the `requirements` URL in manifest.json. If the installed version
-# drifts (e.g. after bumping the manifest tag), we raise ImportError so MA's
-# provider loader reinstalls from the manifest URL.
-EXPECTED_QOBUZ_PROXY_VERSION = "1.3.5"
-
-try:
-    _qobuz_proxy_installed_version: str | None = _installed_pkg_version("qobuz-proxy")
-except PackageNotFoundError:
-    _qobuz_proxy_installed_version = None
-
-if (
-    _qobuz_proxy_installed_version is not None
-    and _qobuz_proxy_installed_version != EXPECTED_QOBUZ_PROXY_VERSION
-):
-    raise ImportError(
-        f"qobuz-proxy {EXPECTED_QOBUZ_PROXY_VERSION} required, "
-        f"but {_qobuz_proxy_installed_version} is installed"
-    )
-
-from qobuz_proxy.auth.oauth import OAUTH_APP_ID  # noqa: E402
-from qobuz_proxy.backends.types import BufferStatus, PlaybackState  # noqa: E402
-from qobuz_proxy.config import (  # noqa: E402
-    AUTO_QUALITY,
-    BackendConfig,
-    Config,
-    DeviceConfig,
-    LoggingConfig,
-    QobuzConfig,
-    ServerConfig,
-)
-from qobuz_proxy.connect import ConnectTokens, DiscoveryService, WsManager  # noqa: E402
-from qobuz_proxy.playback import (  # noqa: E402
-    PlaybackCommandHandler,
-    QobuzQueue,
-    QueueHandler,
-    QueueTrack,
-    StateReporter,
-    VolumeCommandHandler,
-)
+from .discovery import QobuzConnectDiscovery
+from .models import ConnectTokens, DeviceConfig
+from .session import QobuzConnectSession
+from .sync import QobuzConnectSyncEngine
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
-    from music_assistant_models.media_items import Track
+    from music_assistant_models.event import MassEvent
     from music_assistant_models.provider import ProviderManifest
-    from qobuz_proxy.playback.state_reporter import PlaybackStateReport
 
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
@@ -83,6 +43,7 @@ CONF_INITIAL_VOLUME = "initial_volume"
 
 PLAYER_ID_AUTO = "__auto__"
 DEFAULT_INITIAL_VOLUME = 25
+AUTO_QUALITY = 0
 
 # Stable namespace for deriving the Qobuz device UUID from MA's instance_id, so
 # the mDNS-advertised serial and the cloud JOIN_SESSION device UUID match and
@@ -194,23 +155,30 @@ class QobuzConnectProvider(PluginProvider):
 
         self._device_uuid = str(uuid.uuid5(_DEVICE_UUID_NAMESPACE, self.instance_id))
 
-        self._queue = QobuzQueue()
-        self._player = MAQueueBackedQobuzPlayer(self)
-        self._discovery: DiscoveryService | None = None
-        self._ws_manager: WsManager | None = None
-        self._state_reporter: StateReporter | None = None
-        self._queue_handler: QueueHandler | None = None
-        self._playback_handler: PlaybackCommandHandler | None = None
-        self._volume_handler: VolumeCommandHandler | None = None
+        self._device_config = DeviceConfig(
+            name=self._publish_name,
+            uuid=self._device_uuid,
+            http_port=self._http_port,
+            bind_address=self.mass.streams.bind_ip,
+            max_quality=self._max_quality,
+        )
+        self._discovery: QobuzConnectDiscovery | None = None
+        self._session: QobuzConnectSession | None = None
+        self._sync = QobuzConnectSyncEngine(self)
         self._ws_setup_lock = asyncio.Lock()
+        self._unsubscribe_queue_events: Callable[[], None] | None = None
 
     async def loaded_in_mass(self) -> None:
         """Start Qobuz Connect discovery after provider load."""
-        await self._queue.start()
-        await self._player.start()
-        self._discovery = DiscoveryService(
-            config=self._build_qobuz_proxy_config(),
-            app_id=OAUTH_APP_ID,
+        logging.getLogger("websockets.client").setLevel(logging.WARNING)
+        logging.getLogger("websockets.protocol").setLevel(logging.WARNING)
+        await self._sync.start()
+        self._unsubscribe_queue_events = self.mass.subscribe(
+            self._on_ma_queue_event,
+            EventType.QUEUE_UPDATED,
+        )
+        self._discovery = QobuzConnectDiscovery(
+            device=self._device_config,
             on_connect=self._on_app_connected,
             quality_getter=lambda: self._max_quality,
         )
@@ -224,19 +192,19 @@ class QobuzConnectProvider(PluginProvider):
 
     async def unload(self, is_removed: bool = False) -> None:
         """Unload provider and stop network services."""
-        if self._state_reporter:
-            await self._state_reporter.stop()
-        if self._ws_manager:
-            await self._ws_manager.stop()
+        if self._unsubscribe_queue_events is not None:
+            self._unsubscribe_queue_events()
+            self._unsubscribe_queue_events = None
+        await self._sync.stop()
+        if self._session:
+            await self._session.stop()
         if self._discovery:
             await self._discovery.stop()
-        await self._player.stop()
-        await self._queue.stop()
 
     @property
-    def qobuz_queue(self) -> QobuzQueue:
-        """Return qobuz-proxy queue state."""
-        return self._queue
+    def qobuz_session(self) -> QobuzConnectSession | None:
+        """Return active Qobuz Connect websocket session."""
+        return self._session
 
     def get_target_player_id(self) -> str | None:
         """Resolve configured target player."""
@@ -261,19 +229,6 @@ class QobuzConnectProvider(PluginProvider):
             raise InvalidDataError("The Qobuz music provider must be configured first")
         return cast("QobuzProvider", provider)
 
-    def _build_qobuz_proxy_config(self) -> Config:
-        """Build the minimal qobuz-proxy config needed by discovery/ws code."""
-        return Config(
-            qobuz=QobuzConfig(max_quality=self._max_quality),
-            device=DeviceConfig(name=self._publish_name, uuid=self._device_uuid),
-            backend=BackendConfig(type="stub"),
-            server=ServerConfig(
-                http_port=self._http_port,
-                bind_address=self.mass.streams.bind_ip,
-            ),
-            logging=LoggingConfig(level="debug"),
-        )
-
     def _on_app_connected(self, tokens: ConnectTokens) -> None:
         """Handle Qobuz app connection callback."""
         self.mass.create_task(self._setup_websocket(tokens))
@@ -281,358 +236,73 @@ class QobuzConnectProvider(PluginProvider):
     async def _setup_websocket(self, tokens: ConnectTokens) -> None:
         """Set up Qobuz Connect WebSocket command handling."""
         async with self._ws_setup_lock:
-            if self._ws_manager is not None:
-                self._ws_manager.set_tokens(tokens)
+            if self._session is not None:
+                self._session.set_tokens(tokens)
                 return
 
-            self._ws_manager = WsManager(config=self._build_qobuz_proxy_config())
-            self._ws_manager.set_tokens(tokens)
-            self._ws_manager.set_max_audio_quality(self._max_quality)
-
-            # MAQueueBackedQobuzPlayer duck-types qobuz_proxy.playback.QobuzPlayer
-            # rather than inheriting; cast to Any so mypy stops complaining.
-            ma_player_as_any = cast("Any", self._player)
-
-            self._queue_handler = QueueHandler(self._queue)
-            self._playback_handler = PlaybackCommandHandler(
-                ma_player_as_any,
-                queue=self._queue,
-                on_quality_change=self._on_quality_change,
+            self._session = QobuzConnectSession(
+                self._device_config,
+                on_set_state=self._sync.handle_qobuz_set_state,
+                on_queue_load_ack=self._sync.handle_queue_load_ack,
+                on_queue_error=self._sync.handle_queue_error,
+                on_queue_version=self._sync.handle_queue_version,
+                on_volume=self._on_volume_command,
+                on_volume_delta=self._on_volume_delta_command,
+                on_quality=self._on_quality_change,
+                on_state_request=self._sync.report_state,
             )
-            self._volume_handler = VolumeCommandHandler(ma_player_as_any)
-
-            # qobuz_proxy expects sync handlers; we dispatch async work via
-            # mass.create_task and drop the returned Task, so cast to Any.
-            for msg_type in self._queue_handler.get_message_types():
-                self._ws_manager.register_handler(
-                    msg_type,
-                    cast(
-                        "Any",
-                        lambda mt, msg, h=self._queue_handler: self.mass.create_task(
-                            h.handle_message(mt, msg)
-                        ),
-                    ),
-                )
-            for msg_type in self._playback_handler.get_message_types():
-                self._ws_manager.register_handler(
-                    msg_type,
-                    cast(
-                        "Any",
-                        lambda mt, msg, h=self._playback_handler: self.mass.create_task(
-                            h.handle_message(mt, msg)
-                        ),
-                    ),
-                )
-            for msg_type in self._volume_handler.get_message_types():
-                self._ws_manager.register_handler(
-                    msg_type,
-                    cast(
-                        "Any",
-                        lambda mt, msg, h=self._volume_handler: self.mass.create_task(
-                            h.handle_message(mt, msg)
-                        ),
-                    ),
-                )
-
-            self._state_reporter = StateReporter(
-                player=ma_player_as_any,
-                queue=self._queue,
-                send_callback=cast("Any", self._send_state_report),
-            )
-            self._player.set_state_reporter(self._state_reporter)
-
-            await self._ws_manager.start()
-            await self._state_reporter.start()
-            await self._player.broadcast_current_volume()
+            self._session.set_tokens(tokens)
+            await self._session.start()
+            await self._broadcast_current_volume()
+            await self._session.send_quality_reports(self._max_quality)
             self.logger.info("Qobuz Connect WebSocket connected")
 
     async def _on_quality_change(self, new_quality: int) -> None:
         """Remember quality selected in Qobuz app."""
         self.logger.info("Qobuz Connect quality changed: %s -> %s", self._max_quality, new_quality)
         self._max_quality = new_quality
+        self._device_config.max_quality = new_quality
 
-    async def _send_state_report(self, report: PlaybackStateReport) -> None:
-        """Send playback state to Qobuz Connect."""
-        if not self._ws_manager:
+    async def _on_volume_command(self, volume: int) -> None:
+        """Handle absolute or delta volume command from Qobuz."""
+        await self._sync.set_volume(volume)
+
+    async def _on_volume_delta_command(self, delta: int) -> None:
+        """Handle relative volume command from Qobuz."""
+        await self._sync.set_volume_delta(delta)
+
+    async def _broadcast_current_volume(self) -> None:
+        """Report current MA player volume to Qobuz."""
+        if not self._session:
             return
-        playing_state = report.playing_state
-        if playing_state in (PlaybackState.LOADING, PlaybackState.ERROR):
-            playing_state = PlaybackState.STOPPED
-        await self._ws_manager.send_state_update(
-            playing_state=int(playing_state),
-            buffer_state=int(report.buffer_state),
-            position_ms=report.position_value_ms,
-            position_timestamp_ms=report.position_timestamp_ms,
-            duration_ms=report.duration_ms,
-            queue_item_id=report.current_queue_item_id,
-            queue_version_major=report.queue_version_major,
-            queue_version_minor=report.queue_version_minor,
-        )
-
-
-class MAQueueBackedQobuzPlayer:
-    """Small adapter with the QobuzPlayer surface expected by qobuz-proxy handlers."""
-
-    def __init__(self, provider: QobuzConnectProvider) -> None:
-        """Initialize adapter."""
-        self.provider = provider
-        self.mass = provider.mass
-        self.queue = provider.qobuz_queue
-        self.backend = self
-        self._current_track: QueueTrack | None = None
-        self._duration_ms = 0
-        self._state = PlaybackState.STOPPED
-        self._position_value_ms = 0
-        self._position_timestamp_ms = int(time.time() * 1000)
-        self._state_reporter: StateReporter | None = None
-        self._volume_initialized = False
-        self._last_volume = provider._initial_volume
-
-    async def start(self) -> None:
-        """Start adapter."""
-
-    async def stop(self) -> None:
-        """Stop adapter."""
-        await self.stop_playback()
-
-    def set_state_reporter(self, reporter: StateReporter) -> None:
-        """Set Qobuz Connect state reporter."""
-        self._state_reporter = reporter
-
-    async def broadcast_current_volume(self) -> None:
-        """Report the target player's current volume to the Qobuz app on connect."""
-        if not self.provider._ws_manager:
-            return
-        if self._volume_initialized:
-            volume = await self.get_volume()
-        else:
-            volume = self.provider._initial_volume
-            player_id = self.provider.get_target_player_id()
-            if player_id and (player := self.mass.players.get_player(player_id)):
-                if player.state.volume_level is not None:
-                    volume = player.state.volume_level
-            self._last_volume = volume
-            self._volume_initialized = True
-        await self.provider._ws_manager.send_volume_changed(volume)
-
-    async def set_volume(self, level: int) -> int:
-        """Set MA player volume from Qobuz app."""
-        player_id = self._require_target_player_id()
-        volume = max(0, min(100, int(level)))
-        await self.mass.players.cmd_volume_set(player_id, volume)
-        self._last_volume = volume
-        self._volume_initialized = True
-        if self.provider._ws_manager:
-            await self.provider._ws_manager.send_volume_changed(volume)
-        return volume
-
-    async def set_volume_delta(self, delta: int) -> int:
-        """Adjust MA player volume from Qobuz app."""
-        return await self.set_volume(await self.get_volume() + int(delta))
-
-    async def get_volume(self) -> int:
-        """Return current MA player volume."""
-        player_id = self.provider.get_target_player_id()
+        volume = self._initial_volume
+        player_id = self.get_target_player_id()
         if player_id and (player := self.mass.players.get_player(player_id)):
-            volume = player.state.volume_level
-            if volume is not None:
-                self._last_volume = volume
-                return volume
-        return self._last_volume
+            if player.state.volume_level is not None:
+                volume = player.state.volume_level
+        await self._session.send_volume_changed(volume)
 
-    async def set_loop_mode(self, mode: int) -> None:
-        """Accept Qobuz loop-mode commands for now."""
-        self.provider.logger.debug("Qobuz Connect loop mode ignored by prototype: %s", mode)
+    async def _on_ma_queue_event(self, event: MassEvent) -> None:
+        """Forward MA queue updates into the Qobuz sync engine."""
+        await self._sync.handle_ma_queue_event(event)
 
-    async def set_shuffle_mode(self, shuffle_on: bool) -> None:
-        """Accept Qobuz shuffle-mode commands for now."""
-        self.provider.logger.debug(
-            "Qobuz Connect shuffle mode ignored by prototype: %s", shuffle_on
-        )
+    def get_qobuz_track_id_from_queue_item(self, queue_item: Any) -> str | None:
+        """Extract a Qobuz provider track id from an MA QueueItem."""
+        media_item = getattr(queue_item, "media_item", None)
+        if media_item is None or getattr(media_item, "media_type", None) is None:
+            return None
+        media_type = getattr(media_item.media_type, "value", media_item.media_type)
+        if media_type != "track":
+            return None
 
-    async def set_autoplay_mode(self, autoplay_on: bool) -> None:
-        """Accept Qobuz autoplay-mode commands for now."""
-        self.provider.logger.debug(
-            "Qobuz Connect autoplay mode ignored by prototype: %s", autoplay_on
-        )
+        qobuz_provider = self.get_qobuz_provider()
+        provider = getattr(media_item, "provider", None)
+        if provider in (qobuz_provider.instance_id, "qobuz"):
+            return str(media_item.item_id)
 
-    async def load_track(self, queue_item_id: int, track_id: str) -> bool:
-        """Load current Qobuz track metadata without starting playback."""
-        track = QueueTrack(queue_item_id=queue_item_id, track_id=track_id)
-        ma_track = await self._get_ma_track(track_id)
-        track.metadata = {
-            "title": ma_track.name,
-            "artist": ma_track.artist_str,
-            "album": ma_track.album.name if ma_track.album else "",
-            "duration_ms": (ma_track.duration or 0) * 1000,
-        }
-        track.duration_ms = track.metadata["duration_ms"]
-        self._current_track = track
-        self._duration_ms = track.duration_ms
-        self._set_position(0)
-        await self._send_state_update()
-        return True
-
-    async def play(self, position_ms: int = 0) -> bool:
-        """Start or resume MA native Qobuz playback."""
-        player_id = self._require_target_player_id()
-        if self._state == PlaybackState.PAUSED:
-            await self.mass.player_queues.play(player_id)
-            self._state = PlaybackState.PLAYING
-            self._set_position(position_ms or self._position_value_ms)
-            await self._send_state_update()
-            return True
-
-        if not self._current_track:
-            track = await self.queue.get_current_track()
-            if not track:
-                track = await self.queue.advance_to_next()
-            if not track:
-                return False
-            await self.load_track(track.queue_item_id, track.track_id)
-
-        assert self._current_track is not None
-        self._state = PlaybackState.LOADING
-        await self._send_state_update()
-
-        tracks = await self._build_ma_queue_tracks()
-        current_ma_track = await self._get_ma_track(self._current_track.track_id)
-        await self.mass.player_queues.play_media(
-            queue_id=player_id,
-            media=cast("Any", tracks or current_ma_track),
-            option=QueueOption.REPLACE,
-            start_item=current_ma_track,
-        )
-        # Apply the handoff position via play_index rather than seek(): seek()
-        # requires queue.active=True, which is only flipped on by an async
-        # player-state callback after the source switch completes — so it races
-        # with the play_media that just kicked off the switch. play_index has no
-        # such check and threads seek_position through the same start path.
-        if (
-            position_ms > 0
-            and (queue := self.mass.player_queues.get(player_id)) is not None
-            and queue.current_index is not None
-        ):
-            await self.mass.player_queues.play_index(
-                player_id,
-                queue.current_index,
-                seek_position=position_ms // 1000,
-            )
-        self._state = PlaybackState.PLAYING
-        self._set_position(position_ms)
-        await self._send_state_update()
-        return True
-
-    async def pause(self) -> bool:
-        """Pause MA queue playback."""
-        player_id = self._require_target_player_id()
-        if self._state == PlaybackState.PLAYING:
-            await self.mass.player_queues.pause(player_id)
-            self._state = PlaybackState.PAUSED
-            self._set_position(self.current_position_ms)
-            await self._send_state_update()
-        return True
-
-    async def stop_playback(self) -> None:
-        """Stop MA queue playback."""
-        player_id = self.provider.get_target_player_id()
-        if player_id:
-            with contextlib.suppress(Exception):
-                await self.mass.player_queues.stop(player_id)
-        self._state = PlaybackState.STOPPED
-        self._set_position(0)
-        await self._send_state_update()
-
-    async def seek(self, position_ms: int) -> bool:
-        """Seek MA native queue playback."""
-        if not self._current_track:
-            return False
-        if self._state not in (PlaybackState.PLAYING, PlaybackState.PAUSED):
-            self._set_position(position_ms)
-            await self._send_state_update()
-            return True
-        player_id = self._require_target_player_id()
-        await self.mass.player_queues.seek(player_id, position_ms // 1000)
-        self._set_position(position_ms)
-        await self._send_state_update()
-        return True
-
-    async def next_track(self) -> bool:
-        """Skip to next MA queue track."""
-        player_id = self._require_target_player_id()
-        await self.mass.player_queues.next(player_id)
-        track = await self.queue.advance_to_next()
-        if track:
-            self._current_track = track
-            self._duration_ms = track.duration_ms
-        self._set_position(0)
-        await self._send_state_update()
-        return True
-
-    async def previous_track(self) -> bool:
-        """Skip to previous MA queue track."""
-        player_id = self._require_target_player_id()
-        await self.mass.player_queues.previous(player_id)
-        track = await self.queue.go_to_previous()
-        if track:
-            self._current_track = track
-            self._duration_ms = track.duration_ms
-        self._set_position(0)
-        await self._send_state_update()
-        return True
-
-    async def get_buffer_status(self) -> BufferStatus:
-        """Return buffer status for Qobuz state reporting."""
-        return BufferStatus.OK
-
-    async def _build_ma_queue_tracks(self) -> list[Track]:
-        """Build MA Track list from current Qobuz Connect queue snapshot."""
-        tracks: list[Track] = []
-        async with self.queue._lock:
-            qobuz_tracks = list(self.queue._tracks)
-        for q_track in qobuz_tracks:
-            tracks.append(await self._get_ma_track(q_track.track_id))
-        return tracks
-
-    async def _get_ma_track(self, track_id: str) -> Track:
-        """Fetch a Qobuz track through the configured MA Qobuz provider."""
-        return await self.provider.get_qobuz_provider().get_track(track_id)
-
-    def _require_target_player_id(self) -> str:
-        """Return target player id or raise."""
-        player_id = self.provider.get_target_player_id()
-        if not player_id:
-            raise PlayerUnavailableError("No Music Assistant player available for Qobuz Connect")
-        return player_id
-
-    def _set_position(self, position_ms: int) -> None:
-        """Update local timestamp-based position."""
-        self._position_value_ms = max(0, position_ms)
-        self._position_timestamp_ms = int(time.time() * 1000)
-
-    async def _send_state_update(self) -> None:
-        """Send Qobuz state update."""
-        if self._state_reporter:
-            await self._state_reporter.report_now()
-
-    @property
-    def current_position_ms(self) -> int:
-        """Return current position in ms."""
-        if self._state != PlaybackState.PLAYING:
-            return self._position_value_ms
-        return self._position_value_ms + int(time.time() * 1000) - self._position_timestamp_ms
-
-    @property
-    def current_track(self) -> QueueTrack | None:
-        """Return current Qobuz queue track."""
-        return self._current_track
-
-    @property
-    def duration_ms(self) -> int:
-        """Return current track duration in ms."""
-        return self._duration_ms
-
-    @property
-    def state(self) -> PlaybackState:
-        """Return current playback state."""
-        return self._state
+        for mapping in getattr(media_item, "provider_mappings", ()) or ():
+            provider_domain = getattr(mapping, "provider_domain", None)
+            provider_instance = getattr(mapping, "provider_instance", None)
+            if provider_domain == "qobuz" or provider_instance == qobuz_provider.instance_id:
+                return str(mapping.item_id)
+        return None
