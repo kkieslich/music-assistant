@@ -6,6 +6,7 @@ import uuid
 from typing import Any
 
 from music_assistant.providers.qobuz_connect.models import (
+    BufferState,
     OuterMessageType,
     PlayingState,
     QConnectMessageType,
@@ -40,6 +41,7 @@ def test_encode_renderer_state_update() -> None:
     msg = _first_inner_message(
         codec.encode_renderer_state(
             playing_state=PlayingState.PLAYING,
+            buffer_state=BufferState.BUFFERING,
             position_ms=42_000,
             position_timestamp_ms=1_700_000_000_000,
             duration_ms=180_000,
@@ -51,6 +53,7 @@ def test_encode_renderer_state_update() -> None:
     assert msg.messageType == QConnectMessageType.RNDR_SRVR_STATE_UPDATED
     state = msg.rndrSrvrStateUpdated.state
     assert state.playingState == PlayingState.PLAYING
+    assert state.bufferState == BufferState.BUFFERING
     assert state.currentPosition.value == 42_000
     assert state.currentPosition.timestamp == 1_700_000_000_000
     assert state.duration == 180_000

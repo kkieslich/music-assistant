@@ -11,8 +11,10 @@ from typing import TYPE_CHECKING, Any, cast
 from music_assistant_models.enums import PlaybackState as MAPlaybackState
 from music_assistant_models.enums import QueueOption
 from music_assistant_models.errors import PlayerUnavailableError
+from music_assistant_models.queue_item import QueueItem
 
 from .models import (
+    BufferState,
     Origin,
     PlayingState,
     QobuzMirror,
@@ -28,6 +30,9 @@ if TYPE_CHECKING:
     from music_assistant_models.media_items import Track
 
 SEEK_TOLERANCE_MS = 750
+SEEK_DEBOUNCE_MS = 350
+SEEK_CONFIRM_OVERSHOOT_MS = 5_000
+BUFFERING_REPORT_INTERVAL = 1.0
 MA_QUEUE_LOAD_ACK_TIMEOUT = 3.0
 STATE_REPORT_INTERVAL = 5.0
 
@@ -51,6 +56,13 @@ class QobuzConnectSyncEngine:
         ] = {}
         self._last_ma_origin_track_id: str | None = None
         self._pending_qobuz_position_ms: int | None = None
+        self._pending_qobuz_position_ref: str | None = None
+        self._pending_qobuz_position_source_ms: int | None = None
+        self._pending_qobuz_position_timestamp_ms: int | None = None
+        self._pending_seek_position_ms: int | None = None
+        self._pending_seek_ref: str | None = None
+        self._pending_seek_task: asyncio.Task[None] | None = None
+        self._buffering_report_task: asyncio.Task[None] | None = None
         self._unresolvable_qobuz_track_ids: set[str] = set()
 
     async def start(self) -> None:
@@ -65,6 +77,31 @@ class QobuzConnectSyncEngine:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._heartbeat_task
             self._heartbeat_task = None
+        self._cancel_pending_seek()
+        self._cancel_buffering_reporter()
+
+    def reset_for_deactivation(self) -> None:
+        """
+        Clear sync state after the cloud told us we are no longer the active renderer.
+
+        Keeps the heartbeat running so we can resume cleanly when the cloud
+        reactivates us, but drops anything that was specific to the previous
+        playback session.
+        """
+        self.qobuz_state = QobuzMirror()
+        self.pending_paused_seek_ms = None
+        self._pending_qobuz_position_ms = None
+        self._pending_qobuz_position_ref = None
+        self._pending_qobuz_position_source_ms = None
+        self._pending_qobuz_position_timestamp_ms = None
+        self._pending_seek_position_ms = None
+        self._pending_seek_ref = None
+        self._cancel_pending_seek()
+        self._cancel_buffering_reporter()
+        self._prequeued_qobuz_items.clear()
+        self._last_prequeued_next_ref = None
+        self._last_ma_origin_track_id = None
+        self._unresolvable_qobuz_track_ids.clear()
 
     async def handle_qobuz_set_state(self, event: SetStateEvent) -> None:
         """Apply a full Qobuz SET_STATE event to MA."""
@@ -72,6 +109,9 @@ class QobuzConnectSyncEngine:
         self.origin = Origin.QOBUZ
         try:
             self._update_qobuz_mirror(event)
+            if should_report:
+                self._prepare_immediate_command_report(event)
+                await self.report_state(sync_from_ma=False)
             if event.current_item:
                 await self._try_ensure_qobuz_track_metadata(event.current_item)
             if not self._pending_queue_loads:
@@ -105,6 +145,11 @@ class QobuzConnectSyncEngine:
             return
         track_id = self.provider.get_qobuz_track_id_from_queue_item(queue.current_item)
         if not track_id:
+            return
+
+        if self.qobuz_state.next_item and track_id == self.qobuz_state.next_item.track_id:
+            await self._sync_mirror_from_ma_queue(queue)
+            await self.report_state(sync_from_ma=False)
             return
 
         if self.qobuz_state.current_item and self.qobuz_state.current_item.track_id == track_id:
@@ -179,11 +224,30 @@ class QobuzConnectSyncEngine:
         current_item = self.qobuz_state.current_item
         if current_item is None:
             return
-        position_ms = self._current_qobuz_position_ms()
+        # The Qobuz client interpolates position itself from
+        # (position_timestamp_ms, position_ms). For PLAYING we send the raw
+        # anchor pair so the client interpolates exactly once — sending an
+        # already-interpolated value with the original anchor would let the
+        # client interpolate on top, doubling the drift. For non-PLAYING we
+        # send a frozen snapshot (timestamp = now) since there is nothing to
+        # interpolate forward.
+        if self.qobuz_state.buffer_state == BufferState.BUFFERING:
+            wire_position_ms = self.qobuz_state.position_ms
+            wire_timestamp_ms = int(time.time() * 1000)
+        elif self.qobuz_state.playing_state == PlayingState.PLAYING:
+            wire_position_ms = self.qobuz_state.position_ms
+            wire_timestamp_ms = self.qobuz_state.position_timestamp_ms or int(time.time() * 1000)
+        else:
+            wire_position_ms = self.qobuz_state.position_ms
+            wire_timestamp_ms = int(time.time() * 1000)
+        wire_buffer_state = self._wire_buffer_state()
         self.provider.logger.debug(
-            "Qobuz report state=%s pos=%sms item=%s:%s qv=%s.%s sync_from_ma=%s",
+            "Qobuz report state=%s buffer=%s wire_buffer=%s pos=%sms (anchor ts=%s) item=%s:%s qv=%s.%s sync_from_ma=%s",
             self.qobuz_state.playing_state,
-            position_ms,
+            self.qobuz_state.buffer_state,
+            wire_buffer_state,
+            wire_position_ms,
+            wire_timestamp_ms,
             current_item.queue_item_id,
             current_item.track_id,
             self.qobuz_state.queue_version.major,
@@ -192,10 +256,9 @@ class QobuzConnectSyncEngine:
         )
         await session.send_renderer_state(
             playing_state=self.qobuz_state.playing_state,
-            position_ms=position_ms,
-            position_timestamp_ms=(
-                self.qobuz_state.position_timestamp_ms or int(time.time() * 1000)
-            ),
+            buffer_state=wire_buffer_state,
+            position_ms=wire_position_ms,
+            position_timestamp_ms=wire_timestamp_ms,
             duration_ms=self.qobuz_state.duration_ms,
             queue_item_id=current_item.queue_item_id,
             queue_version=self.qobuz_state.queue_version,
@@ -227,6 +290,8 @@ class QobuzConnectSyncEngine:
         if event.queue_version:
             self.qobuz_state.queue_version = event.queue_version
         if event.current_item:
+            if not self._same_queue_ref(self.qobuz_state.current_item, event.current_item):
+                self._clear_pending_position()
             self.qobuz_state.current_item = event.current_item
         if event.next_item:
             self.qobuz_state.next_item = event.next_item
@@ -239,8 +304,30 @@ class QobuzConnectSyncEngine:
             self.qobuz_state.position_timestamp_ms = int(time.time() * 1000)
         if event.playing_state:
             self.qobuz_state.playing_state = event.playing_state
+            if event.playing_state == PlayingState.PLAYING:
+                self._set_buffering()
+            else:
+                self.qobuz_state.buffer_state = BufferState.BUFFERING
         if event.position_ms is not None:
             self.qobuz_state.position_ms = max(0, event.position_ms)
+            self.qobuz_state.position_timestamp_ms = int(time.time() * 1000)
+            if self.qobuz_state.playing_state == PlayingState.PLAYING:
+                self._set_buffering()
+
+    def _prepare_immediate_command_report(self, event: SetStateEvent) -> None:
+        """Make the mirror reportable before slow MA queue/track operations run."""
+        if (
+            self.qobuz_state.current_item is None
+            and event.playing_state == PlayingState.PLAYING
+            and self.qobuz_state.next_item is not None
+        ):
+            self.qobuz_state.current_item = self.qobuz_state.next_item
+            self.qobuz_state.next_item = None
+        if (
+            event.playing_state == PlayingState.PAUSED
+            and event.position_ms is None
+            and self.qobuz_state.position_timestamp_ms == 0
+        ):
             self.qobuz_state.position_timestamp_ms = int(time.time() * 1000)
 
     async def _handle_qobuz_play(self, event: SetStateEvent) -> None:
@@ -272,7 +359,11 @@ class QobuzConnectSyncEngine:
         if start_position_ms is not None:
             self.qobuz_state.position_ms = max(0, start_position_ms)
             self.qobuz_state.position_timestamp_ms = int(time.time() * 1000)
-            self._pending_qobuz_position_ms = start_position_ms
+            self._set_pending_qobuz_position(
+                position_ms=start_position_ms,
+                item=item,
+                source_ms=0,
+            )
 
         player_id = self._require_target_player_id()
         queue = self.mass.player_queues.get(player_id)
@@ -332,8 +423,20 @@ class QobuzConnectSyncEngine:
         if self.qobuz_state.playing_state == PlayingState.PLAYING:
             player_id = self.provider.get_target_player_id()
             if player_id:
-                self._pending_qobuz_position_ms = max(0, position_ms)
-                await self._seek_playing_if_needed(player_id, position_ms)
+                queue = self.mass.player_queues.get(player_id)
+                local_ms = (
+                    int(getattr(queue, "corrected_elapsed_time", 0) * 1000)
+                    if queue and queue.state == MAPlaybackState.PLAYING
+                    else None
+                )
+                if (
+                    self._pending_qobuz_position_ms is None
+                    and local_ms is not None
+                    and abs(local_ms - position_ms) < SEEK_TOLERANCE_MS
+                ):
+                    self._set_buffer_ok()
+                    return
+                self._schedule_playing_seek(player_id, max(0, position_ms))
 
     async def _replace_ma_queue_from_qobuz(
         self,
@@ -352,21 +455,28 @@ class QobuzConnectSyncEngine:
         if self.qobuz_state.next_item:
             with contextlib.suppress(Exception):
                 tracks.append(await self._get_ma_track(self.qobuz_state.next_item.track_id))
-        await self.mass.player_queues.play_media(
-            queue_id=player_id,
-            media=cast("Any", tracks),
-            option=QueueOption.REPLACE,
-            start_item=tracks[0],
+        queue = self.mass.player_queues.get(player_id)
+        if queue and queue.state != MAPlaybackState.IDLE:
+            with contextlib.suppress(Exception):
+                await self.mass.player_queues.stop(player_id)
+        queue_items = [QueueItem.from_media_item(player_id, track) for track in tracks]
+        self.mass.player_queues.clear(player_id, skip_stop=True)
+        await self.mass.player_queues.load(
+            player_id,
+            queue_items=queue_items,
+            keep_remaining=False,
+            keep_played=False,
         )
-        if start_position_ms > 0:
-            self._pending_qobuz_position_ms = start_position_ms
-            queue = self.mass.player_queues.get(player_id)
-            if queue and queue.current_index is not None:
-                await self.mass.player_queues.play_index(
-                    player_id,
-                    queue.current_index,
-                    seek_position=start_position_ms // 1000,
-                )
+        self._set_pending_qobuz_position(
+            position_ms=start_position_ms,
+            item=current_item,
+            source_ms=0,
+        )
+        await self.mass.player_queues.play_index(
+            player_id,
+            0,
+            seek_position=start_position_ms // 1000,
+        )
 
     async def _seek_playing_if_needed(self, player_id: str, position_ms: int) -> None:
         queue = self.mass.player_queues.get(player_id)
@@ -374,8 +484,49 @@ class QobuzConnectSyncEngine:
             return
         local_ms = int(getattr(queue, "corrected_elapsed_time", 0) * 1000)
         if abs(local_ms - position_ms) >= SEEK_TOLERANCE_MS:
-            self._pending_qobuz_position_ms = position_ms
+            self._set_pending_qobuz_position(
+                position_ms=position_ms,
+                item=self.qobuz_state.current_item,
+                source_ms=local_ms,
+            )
             await self.mass.player_queues.seek(player_id, position_ms // 1000)
+
+    def _schedule_playing_seek(self, player_id: str, position_ms: int) -> None:
+        """Coalesce playing seek commands before asking MA to restart the stream."""
+        current_ref = self._queue_ref_key(self.qobuz_state.current_item)
+        self._set_buffering()
+        self._set_pending_qobuz_position(
+            position_ms=position_ms,
+            item=self.qobuz_state.current_item,
+            source_ms=None,
+        )
+        self._pending_seek_position_ms = position_ms
+        self._pending_seek_ref = current_ref
+        self._cancel_pending_seek()
+        self._pending_seek_task = asyncio.create_task(
+            self._run_debounced_playing_seek(player_id, current_ref)
+        )
+
+    async def _run_debounced_playing_seek(self, player_id: str, expected_ref: str | None) -> None:
+        """Run the latest playing seek after Qobuz scrub/echo traffic settles."""
+        try:
+            await asyncio.sleep(SEEK_DEBOUNCE_MS / 1000)
+            position_ms = self._pending_seek_position_ms
+            if position_ms is None:
+                return
+            if expected_ref != self._pending_seek_ref:
+                return
+            if expected_ref != self._queue_ref_key(self.qobuz_state.current_item):
+                return
+            await self._seek_playing_if_needed(player_id, position_ms)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if asyncio.current_task() is self._pending_seek_task:
+                self._pending_seek_task = None
+                if expected_ref == self._pending_seek_ref:
+                    self._pending_seek_position_ms = None
+                    self._pending_seek_ref = None
 
     async def _prequeue_next_item(self, item: QueueTrackRef | None) -> None:
         if item is None:
@@ -457,6 +608,7 @@ class QobuzConnectSyncEngine:
                 if queue.state == MAPlaybackState.PLAYING
                 else PlayingState.PAUSED
             )
+            self._set_buffer_ok()
             await self.report_state()
         elif isinstance(result, QueueError):
             if result.message != "Le tableau d'octets doit avoir une longueur de 16":
@@ -514,24 +666,181 @@ class QobuzConnectSyncEngine:
         return uuid.uuid4().bytes
 
     async def _sync_mirror_from_ma_queue(self, queue: Any) -> None:
-        if queue.state == MAPlaybackState.PLAYING:
-            self.qobuz_state.playing_state = PlayingState.PLAYING
-        elif queue.state == MAPlaybackState.PAUSED:
-            self.qobuz_state.playing_state = PlayingState.PAUSED
-        else:
-            self.qobuz_state.playing_state = PlayingState.STOPPED
+        ma_track_id = self.provider.get_qobuz_track_id_from_queue_item(queue.current_item)
+        if (
+            ma_track_id
+            and self.qobuz_state.next_item
+            and ma_track_id == self.qobuz_state.next_item.track_id
+            and (
+                self.qobuz_state.current_item is None
+                or ma_track_id != self.qobuz_state.current_item.track_id
+            )
+        ):
+            self.provider.logger.debug(
+                "Promoting Qobuz next item to current after MA advanced: %s:%s",
+                self.qobuz_state.next_item.queue_item_id,
+                self.qobuz_state.next_item.track_id,
+            )
+            self.qobuz_state.current_item = self.qobuz_state.next_item
+            self.qobuz_state.next_item = None
+            self._last_prequeued_next_ref = None
+            self.pending_paused_seek_ms = None
+            self._clear_pending_position()
+            self.qobuz_state.position_ms = 0
+            self.qobuz_state.position_timestamp_ms = int(time.time() * 1000)
+        ma_playing_state = self._playing_state_from_ma_queue(queue)
+        target_state = self.qobuz_state.playing_state
+        is_confirmed = self._ma_state_confirms_qobuz_target(ma_playing_state, target_state)
+        if self.qobuz_state.buffer_state == BufferState.BUFFERING and not is_confirmed:
+            self.provider.logger.debug(
+                "Keeping Qobuz command state %s while MA is still %s",
+                target_state,
+                ma_playing_state,
+            )
+            return
+        if target_state == PlayingState.PAUSED and ma_playing_state == PlayingState.STOPPED:
+            self._set_buffer_ok()
+            self._clear_pending_position()
+            return
         ma_position_ms = int(getattr(queue, "corrected_elapsed_time", 0) * 1000)
         if self._pending_qobuz_position_ms is not None:
-            if abs(ma_position_ms - self._pending_qobuz_position_ms) >= SEEK_TOLERANCE_MS:
+            if self._pending_qobuz_position_ref != self._queue_ref_key(
+                self.qobuz_state.current_item
+            ):
+                self._clear_pending_position()
+            elif not self._pending_position_confirmed(ma_position_ms):
                 self.provider.logger.debug(
                     "Holding Qobuz position at %sms until MA reaches it; MA currently %sms",
                     self._pending_qobuz_position_ms,
                     ma_position_ms,
                 )
                 return
-            self._pending_qobuz_position_ms = None
+            else:
+                self._clear_pending_position()
+        self._set_buffer_ok()
+        self.qobuz_state.playing_state = ma_playing_state
         self.qobuz_state.position_ms = ma_position_ms
         self.qobuz_state.position_timestamp_ms = int(time.time() * 1000)
+
+    def _clear_pending_position(self) -> None:
+        """Clear a pending Qobuz seek/position confirmation."""
+        self._pending_qobuz_position_ms = None
+        self._pending_qobuz_position_ref = None
+        self._pending_qobuz_position_source_ms = None
+        self._pending_qobuz_position_timestamp_ms = None
+        self._pending_seek_position_ms = None
+        self._pending_seek_ref = None
+        self._cancel_pending_seek()
+
+    def _set_pending_qobuz_position(
+        self,
+        *,
+        position_ms: int,
+        item: QueueTrackRef | None,
+        source_ms: int | None,
+    ) -> None:
+        """Remember the target position MA must confirm before Qobuz can free-run."""
+        self._pending_qobuz_position_ms = max(0, position_ms)
+        self._pending_qobuz_position_ref = self._queue_ref_key(item)
+        self._pending_qobuz_position_source_ms = source_ms
+        self._pending_qobuz_position_timestamp_ms = int(time.time() * 1000)
+
+    def _pending_position_confirmed(self, ma_position_ms: int) -> bool:
+        """Return whether MA's position plausibly confirms the pending Qobuz target."""
+        target_ms = self._pending_qobuz_position_ms
+        if target_ms is None:
+            return True
+        source_ms = self._pending_qobuz_position_source_ms
+        elapsed_ms = 0
+        if self._pending_qobuz_position_timestamp_ms is not None:
+            elapsed_ms = max(
+                0,
+                int(time.time() * 1000) - self._pending_qobuz_position_timestamp_ms,
+            )
+        lower_bound = max(0, target_ms - SEEK_TOLERANCE_MS)
+        upper_bound = target_ms + elapsed_ms + SEEK_CONFIRM_OVERSHOOT_MS
+        if source_ms is not None and source_ms < target_ms:
+            return ma_position_ms >= lower_bound and ma_position_ms <= upper_bound
+        return lower_bound <= ma_position_ms <= upper_bound
+
+    def _cancel_pending_seek(self) -> None:
+        """Cancel a queued playing seek if it has not been sent to MA yet."""
+        if self._pending_seek_task and not self._pending_seek_task.done():
+            self._pending_seek_task.cancel()
+        self._pending_seek_task = None
+
+    def _set_buffering(self) -> None:
+        """Mark transport as buffering and refresh clients while MA catches up."""
+        self.qobuz_state.buffer_state = BufferState.BUFFERING
+        self._ensure_buffering_reporter()
+
+    def _set_buffer_ok(self) -> None:
+        """Mark transport as ready and stop the temporary buffering reporter."""
+        self.qobuz_state.buffer_state = BufferState.OK
+        self._cancel_buffering_reporter()
+
+    def _ensure_buffering_reporter(self) -> None:
+        """Start a short-interval reporter while Qobuz is waiting on MA audio readiness."""
+        if self._buffering_report_task and not self._buffering_report_task.done():
+            return
+        self._buffering_report_task = asyncio.create_task(self._buffering_report_loop())
+
+    def _cancel_buffering_reporter(self) -> None:
+        """Cancel the short-interval buffering reporter."""
+        if self._buffering_report_task and not self._buffering_report_task.done():
+            if asyncio.current_task() is not self._buffering_report_task:
+                self._buffering_report_task.cancel()
+        self._buffering_report_task = None
+
+    async def _buffering_report_loop(self) -> None:
+        """Refresh Qobuz with a frozen position while MA prepares audio."""
+        try:
+            while True:
+                if self.qobuz_state.buffer_state != BufferState.BUFFERING:
+                    return
+                await asyncio.sleep(BUFFERING_REPORT_INTERVAL)
+                with contextlib.suppress(Exception):
+                    await self.report_state()
+        except asyncio.CancelledError:
+            pass
+
+    def _wire_buffer_state(self) -> BufferState:
+        """Return the buffer state we expose to Qobuz clients."""
+        if (
+            self.qobuz_state.playing_state == PlayingState.PLAYING
+            and self.qobuz_state.buffer_state == BufferState.BUFFERING
+        ):
+            return BufferState.BUFFERING
+        return BufferState.OK
+
+    @staticmethod
+    def _queue_ref_key(item: QueueTrackRef | None) -> str | None:
+        """Return a stable queue-item key for pending seek ownership."""
+        if item is None:
+            return None
+        return f"{item.queue_item_id}:{item.track_id}"
+
+    def _same_queue_ref(self, first: QueueTrackRef | None, second: QueueTrackRef | None) -> bool:
+        """Return whether two queue refs point at the same Qobuz queue item."""
+        return self._queue_ref_key(first) == self._queue_ref_key(second)
+
+    @staticmethod
+    def _playing_state_from_ma_queue(queue: Any) -> PlayingState:
+        """Map MA queue state to Qobuz playing state."""
+        if queue.state == MAPlaybackState.PLAYING:
+            return PlayingState.PLAYING
+        if queue.state == MAPlaybackState.PAUSED:
+            return PlayingState.PAUSED
+        return PlayingState.STOPPED
+
+    @staticmethod
+    def _ma_state_confirms_qobuz_target(
+        ma_playing_state: PlayingState, target_state: PlayingState
+    ) -> bool:
+        """Return whether MA has caught up with the latest Qobuz command."""
+        return ma_playing_state == target_state or (
+            target_state == PlayingState.PAUSED and ma_playing_state == PlayingState.STOPPED
+        )
 
     async def _ensure_qobuz_track_metadata(self, item: QueueTrackRef) -> None:
         ma_track = await self._get_ma_track(item.track_id)
