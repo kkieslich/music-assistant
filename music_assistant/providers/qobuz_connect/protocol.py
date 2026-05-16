@@ -132,6 +132,7 @@ class QobuzConnectCodec:
         self,
         *,
         playing_state: PlayingState,
+        buffer_state: BufferState,
         position_ms: int,
         position_timestamp_ms: int,
         duration_ms: int,
@@ -141,7 +142,7 @@ class QobuzConnectCodec:
         """Encode renderer state update for the Qobuz app."""
         state = common_pb2.QueueRendererState()
         state.playingState = int(playing_state)
-        state.bufferState = int(BufferState.OK)
+        state.bufferState = int(buffer_state)
         state.currentPosition.timestamp = position_timestamp_ms
         state.currentPosition.value = position_ms
         state.duration = duration_ms
