@@ -304,6 +304,7 @@ class QobuzConnectProvider(PluginProvider):
                     on_autoplay_mode=self._sync.handle_autoplay_mode,
                     on_state_request=self._sync.report_state,
                     on_set_active=self._on_set_active,
+                    on_session_state=self._sync.handle_session_state,
                 ),
             )
             self._session.set_tokens(tokens)
