@@ -364,15 +364,19 @@ class QobuzConnectSyncEngine:
         )
 
     async def _emit_clear_queue(self, session: Any) -> None:
-        """Send ``CTRL_SRVR_CLEAR_QUEUE`` and update the mirror optimistically."""
-        new_version = QueueVersion(
-            self.qobuz_state.queue_version.major,
-            self.qobuz_state.queue_version.minor + 1,
-        )
-        self.register_outbound_action(OutboundActionKind.CLEAR, new_version)
-        self.qobuz_state.queue_version = new_version
+        """Send ``CTRL_SRVR_CLEAR_QUEUE`` and update the mirror optimistically.
+
+        ``queue_version`` is sent as the *current* value — the cloud increments
+        and broadcasts the new version itself via ``SRVR_CTRL_QUEUE_VERSION_CHANGED``.
+        Sending a pre-bumped version is rejected with
+        ``ERROR_QUEUE_REMOVE_TRACKS Queue version mismatch`` (the cloud expects
+        the request to assert the version it's operating on, not the
+        post-mutation version).
+        """
+        current_version = self.qobuz_state.queue_version
+        self.register_outbound_action(OutboundActionKind.CLEAR, current_version)
         self.qobuz_state.tracks = []
-        await session.send_clear_queue(queue_version=new_version)
+        await session.send_clear_queue(queue_version=current_version)
 
     async def _emit_remove_tracks(
         self,
@@ -380,49 +384,41 @@ class QobuzConnectSyncEngine:
         removed_track_ids: set[str],
         mirror_qid_by_track_id: dict[str, list[int]],
     ) -> None:
-        """Send ``CTRL_SRVR_QUEUE_REMOVE_TRACKS`` for items the user dropped in MA."""
+        """Send ``CTRL_SRVR_QUEUE_REMOVE_TRACKS`` with the current ``queue_version``."""
         queue_item_ids: list[int] = []
         for tid in removed_track_ids:
             qids = mirror_qid_by_track_id.get(tid, [])
             queue_item_ids.extend(qids)
         if not queue_item_ids:
             return
-        new_version = QueueVersion(
-            self.qobuz_state.queue_version.major,
-            self.qobuz_state.queue_version.minor + 1,
-        )
-        action_uuid = self.register_outbound_action(OutboundActionKind.REMOVE, new_version)
+        current_version = self.qobuz_state.queue_version
+        action_uuid = self.register_outbound_action(OutboundActionKind.REMOVE, current_version)
         removed_ids_set = set(queue_item_ids)
-        self.qobuz_state.queue_version = new_version
         self.qobuz_state.tracks = [
             ref for ref in self.qobuz_state.tracks if ref.queue_item_id not in removed_ids_set
         ]
         await session.send_queue_remove_tracks(
             action_uuid=action_uuid,
             queue_item_ids=queue_item_ids,
-            queue_version=new_version,
+            queue_version=current_version,
         )
 
     async def _emit_add_tracks(self, session: Any, new_track_ids: list[str]) -> None:
-        """Send ``CTRL_SRVR_QUEUE_ADD_TRACKS`` for tracks the user appended in MA."""
+        """Send ``CTRL_SRVR_QUEUE_ADD_TRACKS`` with the current ``queue_version``."""
         if not new_track_ids:
             return
-        new_version = QueueVersion(
-            self.qobuz_state.queue_version.major,
-            self.qobuz_state.queue_version.minor + 1,
-        )
-        action_uuid = self.register_outbound_action(OutboundActionKind.ADD, new_version)
+        current_version = self.qobuz_state.queue_version
+        action_uuid = self.register_outbound_action(OutboundActionKind.ADD, current_version)
         # The cloud will assign real queue_item_ids; we register placeholders
         # on the mirror so the next reconcile pass doesn't re-add them. The
         # echoed ``SRVR_CTRL_QUEUE_TRACKS_ADDED`` will overwrite these with
         # the cloud-assigned ids when it lands.
         placeholder_refs = [QueueTrackRef(queue_item_id=0, track_id=tid) for tid in new_track_ids]
-        self.qobuz_state.queue_version = new_version
         self.qobuz_state.tracks.extend(placeholder_refs)
         await session.send_queue_add_tracks(
             action_uuid=action_uuid,
             tracks=placeholder_refs,
-            queue_version=new_version,
+            queue_version=current_version,
         )
 
     async def handle_ma_queue_event(self, event: MassEvent) -> None:
