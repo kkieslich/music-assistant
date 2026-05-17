@@ -62,8 +62,12 @@ class QobuzConnectSyncEngine:
         self._pending_qobuz_position_timestamp_ms: int | None = None
         self._pending_seek_position_ms: int | None = None
         self._pending_seek_ref: str | None = None
+        self._pending_seek_generation: int | None = None
         self._pending_seek_task: asyncio.Task[None] | None = None
         self._buffering_report_task: asyncio.Task[None] | None = None
+        self._qobuz_command_generation = 0
+        self._reconcile_task: asyncio.Task[None] | None = None
+        self._metadata_task: asyncio.Task[None] | None = None
         self._unresolvable_qobuz_track_ids: set[str] = set()
 
     async def start(self) -> None:
@@ -78,6 +82,8 @@ class QobuzConnectSyncEngine:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._heartbeat_task
             self._heartbeat_task = None
+        self._cancel_reconcile_task()
+        self._cancel_metadata_task()
         self._cancel_pending_seek()
         self._cancel_buffering_reporter()
 
@@ -98,6 +104,10 @@ class QobuzConnectSyncEngine:
         self._pending_qobuz_position_timestamp_ms = None
         self._pending_seek_position_ms = None
         self._pending_seek_ref = None
+        self._pending_seek_generation = None
+        self._qobuz_command_generation += 1
+        self._cancel_reconcile_task()
+        self._cancel_metadata_task()
         self._cancel_pending_seek()
         self._cancel_buffering_reporter()
         self._prequeued_qobuz_items.clear()
@@ -110,26 +120,34 @@ class QobuzConnectSyncEngine:
         should_report = self._event_requires_renderer_report(event)
         self.origin = Origin.QOBUZ
         try:
+            if should_report:
+                self._qobuz_command_generation += 1
+            generation = self._qobuz_command_generation
             self._update_qobuz_mirror(event)
+            if event.playing_state == PlayingState.PAUSED:
+                self._set_pending_paused_seek(
+                    (
+                        max(0, event.position_ms)
+                        if event.position_ms is not None
+                        else self.qobuz_state.position_ms
+                    ),
+                    self.qobuz_state.current_item,
+                )
+            elif (
+                event.position_ms is not None
+                and event.playing_state is None
+                and self.qobuz_state.playing_state == PlayingState.PAUSED
+            ):
+                self._set_pending_paused_seek(
+                    max(0, event.position_ms),
+                    self.qobuz_state.current_item,
+                )
             if should_report:
                 self._prepare_immediate_command_report(event)
                 await self.report_state(sync_from_ma=False)
-            if event.current_item:
-                await self._try_ensure_qobuz_track_metadata(event.current_item)
-            if not self._pending_queue_loads:
-                await self._prequeue_next_item(event.next_item)
-
-            if event.playing_state == PlayingState.PLAYING:
-                await self._handle_qobuz_play(event)
-            elif event.playing_state == PlayingState.PAUSED:
-                await self._handle_qobuz_pause(event)
-            elif event.playing_state == PlayingState.STOPPED:
-                await self._handle_qobuz_stop()
-            elif event.position_ms is not None:
-                await self._handle_qobuz_position_only(event.position_ms)
-
-            if should_report:
-                await self.report_state(sync_from_ma=False)
+                self._schedule_reconcile(event, generation)
+            else:
+                self._schedule_metadata_update(event, generation)
         finally:
             self.origin = None
 
@@ -147,6 +165,8 @@ class QobuzConnectSyncEngine:
             return
         track_id = self.provider.get_qobuz_track_id_from_queue_item(queue.current_item)
         if not track_id:
+            return
+        if self._has_active_reconcile():
             return
 
         if self.qobuz_state.next_item and track_id == self.qobuz_state.next_item.track_id:
@@ -207,7 +227,7 @@ class QobuzConnectSyncEngine:
             return
         player_id = self.provider.get_target_player_id()
         queue = self.mass.player_queues.get(player_id) if player_id else None
-        if sync_from_ma and queue:
+        if sync_from_ma and queue and not self._has_active_reconcile():
             ma_track_id = (
                 self.provider.get_qobuz_track_id_from_queue_item(queue.current_item)
                 if getattr(queue, "current_item", None)
@@ -340,7 +360,86 @@ class QobuzConnectSyncEngine:
         ):
             self.qobuz_state.position_timestamp_ms = int(time.time() * 1000)
 
-    async def _handle_qobuz_play(self, event: SetStateEvent) -> None:
+    def _schedule_reconcile(self, event: SetStateEvent, generation: int) -> None:
+        """Schedule latest-only MA reconciliation for a Qobuz command."""
+        self._cancel_reconcile_task()
+        self._reconcile_task = asyncio.create_task(self._run_reconcile(event, generation))
+
+    async def _run_reconcile(self, event: SetStateEvent, generation: int) -> None:
+        """Apply the latest Qobuz command to MA after the immediate mirror update."""
+        try:
+            if event.current_item and self._is_current_command(generation, event.current_item):
+                await self._try_ensure_qobuz_track_metadata(event.current_item)
+            if (
+                self._is_current_command(generation)
+                and not self._pending_queue_loads
+                and event.next_item
+            ):
+                await self._prequeue_next_item(event.next_item, generation)
+
+            if not self._is_current_command(generation):
+                return
+            if event.playing_state == PlayingState.PLAYING:
+                await self._handle_qobuz_play(event, generation)
+            elif event.playing_state == PlayingState.PAUSED:
+                await self._handle_qobuz_pause(event, generation)
+            elif event.playing_state == PlayingState.STOPPED:
+                await self._handle_qobuz_stop(generation)
+            elif event.position_ms is not None:
+                await self._handle_qobuz_position_only(event.position_ms, generation)
+
+            if self._is_current_command(generation):
+                await self._sync_latest_matching_ma_queue()
+                await self.report_state(sync_from_ma=False)
+        except asyncio.CancelledError:
+            raise
+        except PlayerUnavailableError as err:
+            if self._is_current_command(generation):
+                self.provider.logger.warning("Qobuz Connect target player unavailable: %s", err)
+        except Exception:
+            if self._is_current_command(generation):
+                self.provider.logger.exception("Failed to reconcile Qobuz Connect command")
+        finally:
+            if asyncio.current_task() is self._reconcile_task:
+                self._reconcile_task = None
+
+    def _schedule_metadata_update(self, event: SetStateEvent, generation: int) -> None:
+        """Schedule slow metadata/prequeue work for non-command Qobuz updates."""
+        self._cancel_metadata_task()
+        self._metadata_task = asyncio.create_task(self._run_metadata_update(event, generation))
+
+    async def _run_metadata_update(self, event: SetStateEvent, generation: int) -> None:
+        """Resolve metadata and next queue items without blocking websocket receive."""
+        try:
+            if event.current_item and self._is_current_command(generation, event.current_item):
+                await self._try_ensure_qobuz_track_metadata(event.current_item)
+            if (
+                self._is_current_command(generation)
+                and not self._pending_queue_loads
+                and event.next_item
+            ):
+                await self._prequeue_next_item(event.next_item, generation)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if self._is_current_command(generation):
+                self.provider.logger.exception("Failed to process Qobuz Connect metadata update")
+        finally:
+            if asyncio.current_task() is self._metadata_task:
+                self._metadata_task = None
+
+    async def _sync_latest_matching_ma_queue(self) -> None:
+        """Accept MA state after the latest reconcile has applied its command."""
+        player_id = self.provider.get_target_player_id()
+        queue = self.mass.player_queues.get(player_id) if player_id else None
+        current_item = self.qobuz_state.current_item
+        if not queue or not current_item or not getattr(queue, "current_item", None):
+            return
+        ma_track_id = self.provider.get_qobuz_track_id_from_queue_item(queue.current_item)
+        if ma_track_id == current_item.track_id:
+            await self._sync_mirror_from_ma_queue(queue)
+
+    async def _handle_qobuz_play(self, event: SetStateEvent, generation: int) -> None:
         item = event.current_item or self.qobuz_state.current_item
         if item is None and (event.next_item or self.qobuz_state.next_item):
             item = event.next_item or self.qobuz_state.next_item
@@ -357,8 +456,12 @@ class QobuzConnectSyncEngine:
                 item.track_id,
             )
             await self._try_ensure_qobuz_track_metadata(item)
+            if not self._is_current_command(generation, item):
+                return
         if item is None:
             self.provider.logger.debug("Ignoring Qobuz PLAYING without current or next queue item")
+            return
+        if not self._is_current_command(generation, item):
             return
         pending_paused_seek_ms = self._take_pending_paused_seek(item)
         start_position_ms = (
@@ -368,14 +471,14 @@ class QobuzConnectSyncEngine:
             if event.position_ms is not None
             else self.qobuz_state.position_ms
         )
-        if start_position_ms is not None:
-            self.qobuz_state.position_ms = max(0, start_position_ms)
-            self.qobuz_state.position_timestamp_ms = int(time.time() * 1000)
-            self._set_pending_qobuz_position(
-                position_ms=start_position_ms,
-                item=item,
-                source_ms=0,
-            )
+        start_position_ms = max(0, start_position_ms or 0)
+        self.qobuz_state.position_ms = start_position_ms
+        self.qobuz_state.position_timestamp_ms = int(time.time() * 1000)
+        self._set_pending_qobuz_position(
+            position_ms=start_position_ms,
+            item=item,
+            source_ms=0,
+        )
 
         player_id = self._require_target_player_id()
         queue = self.mass.player_queues.get(player_id)
@@ -385,31 +488,39 @@ class QobuzConnectSyncEngine:
             else None
         )
         if current_ma_track_id != item.track_id:
-            await self._replace_ma_queue_from_qobuz(item, start_position_ms)
+            await self._replace_ma_queue_from_qobuz(item, start_position_ms, generation)
             return
 
         if queue and queue.state == MAPlaybackState.PAUSED:
             if start_position_ms > 0 and queue.current_index is not None:
+                if not self._is_current_command(generation, item):
+                    return
                 await self.mass.player_queues.play_index(
                     player_id,
                     queue.current_index,
                     seek_position=start_position_ms // 1000,
                 )
             else:
+                if not self._is_current_command(generation, item):
+                    return
                 await self.mass.player_queues.play(player_id)
         elif queue and queue.state == MAPlaybackState.PLAYING:
-            await self._seek_playing_if_needed(player_id, start_position_ms)
+            await self._seek_playing_if_needed(player_id, start_position_ms, generation)
         elif queue and queue.current_item:
             if start_position_ms > 0 and queue.current_index is not None:
+                if not self._is_current_command(generation, item):
+                    return
                 await self.mass.player_queues.play_index(
                     player_id,
                     queue.current_index,
                     seek_position=start_position_ms // 1000,
                 )
             else:
+                if not self._is_current_command(generation, item):
+                    return
                 await self.mass.player_queues.play(player_id)
 
-    async def _handle_qobuz_pause(self, event: SetStateEvent) -> None:
+    async def _handle_qobuz_pause(self, event: SetStateEvent, generation: int) -> None:
         self._set_pending_paused_seek(
             (
                 max(0, event.position_ms)
@@ -423,15 +534,17 @@ class QobuzConnectSyncEngine:
         if queue and queue.state == MAPlaybackState.PLAYING:
             if not player_id:
                 return
+            if not self._is_current_command(generation):
+                return
             await self.mass.player_queues.pause(player_id)
 
-    async def _handle_qobuz_stop(self) -> None:
+    async def _handle_qobuz_stop(self, generation: int) -> None:
         player_id = self.provider.get_target_player_id()
-        if player_id:
+        if player_id and self._is_current_command(generation):
             with contextlib.suppress(Exception):
                 await self.mass.player_queues.stop(player_id)
 
-    async def _handle_qobuz_position_only(self, position_ms: int) -> None:
+    async def _handle_qobuz_position_only(self, position_ms: int, generation: int) -> None:
         if self.qobuz_state.playing_state == PlayingState.PAUSED:
             self._set_pending_paused_seek(max(0, position_ms), self.qobuz_state.current_item)
             return
@@ -451,15 +564,18 @@ class QobuzConnectSyncEngine:
                 ):
                     self._set_buffer_ok()
                     return
-                self._schedule_playing_seek(player_id, max(0, position_ms))
+                self._schedule_playing_seek(player_id, max(0, position_ms), generation)
 
     async def _replace_ma_queue_from_qobuz(
         self,
         current_item: QueueTrackRef,
         start_position_ms: int,
+        generation: int,
     ) -> None:
         player_id = self._require_target_player_id()
         current_track = await self._get_ma_track_or_none(current_item.track_id)
+        if not self._is_current_command(generation, current_item):
+            return
         if current_track is None:
             self.provider.logger.debug(
                 "Ignoring Qobuz PLAYING for unresolved cloud track %s",
@@ -470,18 +586,26 @@ class QobuzConnectSyncEngine:
         if self.qobuz_state.next_item:
             with contextlib.suppress(Exception):
                 tracks.append(await self._get_ma_track(self.qobuz_state.next_item.track_id))
+        if not self._is_current_command(generation, current_item):
+            return
         queue = self.mass.player_queues.get(player_id)
         if queue and queue.state != MAPlaybackState.IDLE:
             with contextlib.suppress(Exception):
                 await self.mass.player_queues.stop(player_id)
+        if not self._is_current_command(generation, current_item):
+            return
         queue_items = [QueueItem.from_media_item(player_id, track) for track in tracks]
         self.mass.player_queues.clear(player_id, skip_stop=True)
+        if not self._is_current_command(generation, current_item):
+            return
         await self.mass.player_queues.load(
             player_id,
             queue_items=queue_items,
             keep_remaining=False,
             keep_played=False,
         )
+        if not self._is_current_command(generation, current_item):
+            return
         self._set_pending_qobuz_position(
             position_ms=start_position_ms,
             item=current_item,
@@ -493,9 +617,16 @@ class QobuzConnectSyncEngine:
             seek_position=start_position_ms // 1000,
         )
 
-    async def _seek_playing_if_needed(self, player_id: str, position_ms: int) -> None:
+    async def _seek_playing_if_needed(
+        self,
+        player_id: str,
+        position_ms: int,
+        generation: int | None = None,
+    ) -> None:
         queue = self.mass.player_queues.get(player_id)
         if not queue or not queue.current_item or queue.state != MAPlaybackState.PLAYING:
+            return
+        if generation is not None and not self._is_current_command(generation):
             return
         local_ms = int(getattr(queue, "corrected_elapsed_time", 0) * 1000)
         if abs(local_ms - position_ms) >= SEEK_TOLERANCE_MS:
@@ -504,9 +635,16 @@ class QobuzConnectSyncEngine:
                 item=self.qobuz_state.current_item,
                 source_ms=local_ms,
             )
+            if generation is not None and not self._is_current_command(generation):
+                return
             await self.mass.player_queues.seek(player_id, position_ms // 1000)
 
-    def _schedule_playing_seek(self, player_id: str, position_ms: int) -> None:
+    def _schedule_playing_seek(
+        self,
+        player_id: str,
+        position_ms: int,
+        generation: int | None = None,
+    ) -> None:
         """Coalesce playing seek commands before asking MA to restart the stream."""
         current_ref = self._queue_ref_key(self.qobuz_state.current_item)
         self._set_buffering()
@@ -517,35 +655,55 @@ class QobuzConnectSyncEngine:
         )
         self._pending_seek_position_ms = position_ms
         self._pending_seek_ref = current_ref
+        self._pending_seek_generation = generation
         self._cancel_pending_seek()
         self._pending_seek_task = asyncio.create_task(
-            self._run_debounced_playing_seek(player_id, current_ref)
+            self._run_debounced_playing_seek(player_id, current_ref, generation)
         )
 
-    async def _run_debounced_playing_seek(self, player_id: str, expected_ref: str | None) -> None:
+    async def _run_debounced_playing_seek(
+        self,
+        player_id: str,
+        expected_ref: str | None,
+        generation: int | None,
+    ) -> None:
         """Run the latest playing seek after Qobuz scrub/echo traffic settles."""
         try:
             await asyncio.sleep(SEEK_DEBOUNCE_MS / 1000)
             position_ms = self._pending_seek_position_ms
             if position_ms is None:
                 return
+            if generation is not None and not self._is_current_command(generation):
+                return
+            if generation != self._pending_seek_generation:
+                return
             if expected_ref != self._pending_seek_ref:
                 return
             if expected_ref != self._queue_ref_key(self.qobuz_state.current_item):
                 return
-            await self._seek_playing_if_needed(player_id, position_ms)
+            await self._seek_playing_if_needed(player_id, position_ms, generation)
         except asyncio.CancelledError:
             pass
         finally:
             if asyncio.current_task() is self._pending_seek_task:
                 self._pending_seek_task = None
-                if expected_ref == self._pending_seek_ref:
+                if (
+                    expected_ref == self._pending_seek_ref
+                    and generation == self._pending_seek_generation
+                ):
                     self._pending_seek_position_ms = None
                     self._pending_seek_ref = None
+                    self._pending_seek_generation = None
 
-    async def _prequeue_next_item(self, item: QueueTrackRef | None) -> None:
+    async def _prequeue_next_item(
+        self,
+        item: QueueTrackRef | None,
+        generation: int | None = None,
+    ) -> None:
         if item is None:
             self._last_prequeued_next_ref = None
+            return
+        if generation is not None and not self._is_current_command(generation):
             return
         current_item = self.qobuz_state.current_item
         if current_item is None:
@@ -564,6 +722,8 @@ class QobuzConnectSyncEngine:
             return
         ma_track = await self._get_ma_track_or_none(item.track_id)
         if ma_track is None:
+            return
+        if generation is not None and not self._is_current_command(generation):
             return
         await self.mass.player_queues.play_media(
             queue_id=player_id,
@@ -746,6 +906,7 @@ class QobuzConnectSyncEngine:
         self._pending_qobuz_position_timestamp_ms = None
         self._pending_seek_position_ms = None
         self._pending_seek_ref = None
+        self._pending_seek_generation = None
         self._cancel_pending_seek()
 
     def _set_pending_paused_seek(
@@ -806,6 +967,34 @@ class QobuzConnectSyncEngine:
         if self._pending_seek_task and not self._pending_seek_task.done():
             self._pending_seek_task.cancel()
         self._pending_seek_task = None
+
+    def _cancel_reconcile_task(self) -> None:
+        """Cancel in-flight MA reconciliation for an older Qobuz command."""
+        if self._reconcile_task and not self._reconcile_task.done():
+            self._reconcile_task.cancel()
+        self._reconcile_task = None
+
+    def _cancel_metadata_task(self) -> None:
+        """Cancel slow metadata/prequeue work for an obsolete Qobuz update."""
+        if self._metadata_task and not self._metadata_task.done():
+            self._metadata_task.cancel()
+        self._metadata_task = None
+
+    def _has_active_reconcile(self) -> bool:
+        """Return whether MA is still catching up to a Qobuz command."""
+        return self._reconcile_task is not None and not self._reconcile_task.done()
+
+    def _is_current_command(
+        self,
+        generation: int,
+        item: QueueTrackRef | None = None,
+    ) -> bool:
+        """Return whether a slow operation still belongs to the newest Qobuz command."""
+        if generation != self._qobuz_command_generation:
+            return False
+        return item is None or self._queue_ref_key(item) == self._queue_ref_key(
+            self.qobuz_state.current_item
+        )
 
     def _set_buffering(self) -> None:
         """Mark transport as buffering and refresh clients while MA catches up."""
