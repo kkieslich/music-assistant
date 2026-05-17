@@ -12,6 +12,7 @@ from music_assistant.providers.qobuz_connect.models import (
     OuterMessageType,
     PlayingState,
     QConnectMessageType,
+    QueueTrackRef,
     QueueVersion,
 )
 from music_assistant.providers.qobuz_connect.proto import qconnect_envelope_pb2 as _envelope_pb2
@@ -448,6 +449,97 @@ def test_encode_subscribe_channels_session_uuid() -> None:
     subscribe = envelope_pb2.Subscribe()
     subscribe.ParseFromString(frame[offset : offset + length])
     assert list(subscribe.channels) == [SESSION_UUID]
+
+
+def test_encode_clear_queue_round_trip() -> None:
+    """CTRL_SRVR_CLEAR_QUEUE encodes the current queue version so the cloud can reject stale clears."""
+    codec = QobuzConnectCodec(DEVICE_UUID)
+    inner = _first_inner_message(codec.encode_clear_queue(QueueVersion(major=5, minor=2)))
+    assert inner.messageType == QConnectMessageType.CTRL_SRVR_CLEAR_QUEUE
+    assert inner.HasField("ctrlSrvrClearQueue")
+    assert inner.ctrlSrvrClearQueue.queueVersion.major == 5
+    assert inner.ctrlSrvrClearQueue.queueVersion.minor == 2
+
+
+def test_encode_queue_add_tracks_round_trip() -> None:
+    """CTRL_SRVR_QUEUE_ADD_TRACKS carries the tracks to append with their queue_item_ids."""
+    codec = QobuzConnectCodec(DEVICE_UUID)
+    tracks = [
+        QueueTrackRef(queue_item_id=101, track_id="376286112"),
+        QueueTrackRef(queue_item_id=102, track_id="402777208", context_uuid=SESSION_UUID),
+    ]
+    inner = _first_inner_message(
+        codec.encode_queue_add_tracks(
+            action_uuid=ACTION_UUID,
+            tracks=tracks,
+            queue_version=QueueVersion(major=7, minor=4),
+        )
+    )
+    assert inner.messageType == QConnectMessageType.CTRL_SRVR_QUEUE_ADD_TRACKS
+    add = inner.ctrlSrvrQueueAddTracks
+    assert add.actionUuid == ACTION_UUID
+    assert add.queueVersion.major == 7
+    assert add.queueVersion.minor == 4
+    assert [t.queueItemId for t in add.tracks] == [101, 102]
+    assert [t.trackId for t in add.tracks] == [376286112, 402777208]
+    assert add.tracks[1].contextUuid == SESSION_UUID
+
+
+def test_encode_queue_insert_tracks_round_trip() -> None:
+    """CTRL_SRVR_QUEUE_INSERT_TRACKS includes the insert_after anchor."""
+    codec = QobuzConnectCodec(DEVICE_UUID)
+    tracks = [QueueTrackRef(queue_item_id=201, track_id="376286112")]
+    inner = _first_inner_message(
+        codec.encode_queue_insert_tracks(
+            action_uuid=ACTION_UUID,
+            tracks=tracks,
+            insert_after=3,
+            queue_version=QueueVersion(major=9, minor=1),
+        )
+    )
+    assert inner.messageType == QConnectMessageType.CTRL_SRVR_QUEUE_INSERT_TRACKS
+    insert = inner.ctrlSrvrQueueInsertTracks
+    assert insert.actionUuid == ACTION_UUID
+    assert insert.insertAfter == 3
+    assert insert.queueVersion.major == 9
+    assert [t.trackId for t in insert.tracks] == [376286112]
+
+
+def test_encode_queue_remove_tracks_round_trip() -> None:
+    """CTRL_SRVR_QUEUE_REMOVE_TRACKS names the queue_item_ids to drop."""
+    codec = QobuzConnectCodec(DEVICE_UUID)
+    inner = _first_inner_message(
+        codec.encode_queue_remove_tracks(
+            action_uuid=ACTION_UUID,
+            queue_item_ids=[7, 9, 11],
+            queue_version=QueueVersion(major=4, minor=8),
+        )
+    )
+    assert inner.messageType == QConnectMessageType.CTRL_SRVR_QUEUE_REMOVE_TRACKS
+    remove = inner.ctrlSrvrQueueRemoveTracks
+    assert remove.actionUuid == ACTION_UUID
+    assert list(remove.queueItemIds) == [7, 9, 11]
+    assert remove.queueVersion.major == 4
+    assert remove.queueVersion.minor == 8
+
+
+def test_encode_queue_reorder_tracks_round_trip() -> None:
+    """CTRL_SRVR_QUEUE_REORDER_TRACKS specifies which items move after which anchor."""
+    codec = QobuzConnectCodec(DEVICE_UUID)
+    inner = _first_inner_message(
+        codec.encode_queue_reorder_tracks(
+            action_uuid=ACTION_UUID,
+            queue_item_ids=[12, 13],
+            insert_after=5,
+            queue_version=QueueVersion(major=10, minor=0),
+        )
+    )
+    assert inner.messageType == QConnectMessageType.CTRL_SRVR_QUEUE_REORDER_TRACKS
+    reorder = inner.ctrlSrvrQueueReorderTracks
+    assert reorder.actionUuid == ACTION_UUID
+    assert list(reorder.queueItemIds) == [12, 13]
+    assert reorder.insertAfter == 5
+    assert reorder.queueVersion.major == 10
 
 
 def test_encode_ask_for_queue_state_round_trip() -> None:

@@ -55,6 +55,7 @@ from .models import (
     QueueError,
     QueueLoadAck,
     QueueStateSnapshot,
+    QueueTrackRef,
     QueueTracksAddedEvent,
     QueueTracksInsertedEvent,
     QueueTracksRemovedEvent,
@@ -228,6 +229,90 @@ class QobuzConnectSession:
                 autoplay_reset=autoplay_reset,
                 context_uuid=context_uuid,
                 qweb_track_session=qweb_track_session,
+            )
+        )
+
+    async def send_clear_queue(self, *, queue_version: QueueVersion) -> bool:
+        """Tell the Qobuz cloud to drop every queue item."""
+        return await self.send_message(self._codec.encode_clear_queue(queue_version))
+
+    async def send_queue_add_tracks(
+        self,
+        *,
+        action_uuid: bytes,
+        tracks: list[QueueTrackRef],
+        queue_version: QueueVersion,
+        context_uuid: bytes | None = None,
+        autoplay_reset: bool = False,
+    ) -> bool:
+        """Append tracks to the Qobuz cloud queue (mirrors MA-side append)."""
+        return await self.send_message(
+            self._codec.encode_queue_add_tracks(
+                action_uuid=action_uuid,
+                tracks=tracks,
+                queue_version=queue_version,
+                context_uuid=context_uuid,
+                autoplay_reset=autoplay_reset,
+            )
+        )
+
+    async def send_queue_insert_tracks(
+        self,
+        *,
+        action_uuid: bytes,
+        tracks: list[QueueTrackRef],
+        insert_after: int,
+        queue_version: QueueVersion,
+        context_uuid: bytes | None = None,
+        autoplay_reset: bool = False,
+    ) -> bool:
+        """Insert tracks into the Qobuz cloud queue after ``insert_after``."""
+        return await self.send_message(
+            self._codec.encode_queue_insert_tracks(
+                action_uuid=action_uuid,
+                tracks=tracks,
+                insert_after=insert_after,
+                queue_version=queue_version,
+                context_uuid=context_uuid,
+                autoplay_reset=autoplay_reset,
+            )
+        )
+
+    async def send_queue_remove_tracks(
+        self,
+        *,
+        action_uuid: bytes,
+        queue_item_ids: list[int],
+        queue_version: QueueVersion,
+        autoplay_reset: bool = False,
+    ) -> bool:
+        """Remove items from the Qobuz cloud queue by their ``queue_item_id``s."""
+        return await self.send_message(
+            self._codec.encode_queue_remove_tracks(
+                action_uuid=action_uuid,
+                queue_item_ids=queue_item_ids,
+                queue_version=queue_version,
+                autoplay_reset=autoplay_reset,
+            )
+        )
+
+    async def send_queue_reorder_tracks(
+        self,
+        *,
+        action_uuid: bytes,
+        queue_item_ids: list[int],
+        insert_after: int,
+        queue_version: QueueVersion,
+        autoplay_reset: bool = False,
+    ) -> bool:
+        """Move items in the Qobuz cloud queue to after ``insert_after``."""
+        return await self.send_message(
+            self._codec.encode_queue_reorder_tracks(
+                action_uuid=action_uuid,
+                queue_item_ids=queue_item_ids,
+                insert_after=insert_after,
+                queue_version=queue_version,
+                autoplay_reset=autoplay_reset,
             )
         )
 
