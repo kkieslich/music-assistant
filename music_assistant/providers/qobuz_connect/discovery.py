@@ -1,4 +1,26 @@
-"""Provider-local Qobuz Connect mDNS and HTTP discovery."""
+"""
+Local Qobuz Connect discovery: mDNS advertisement + HTTP handshake.
+
+Owns:
+- Registering this MA instance on the local network as a
+  ``_qobuz-connect._tcp.local.`` service so the Qobuz app can find it.
+- A small aiohttp app on ``CONF_HTTP_PORT`` that exposes the
+  ``/streamcore/*`` endpoints the Qobuz app POSTs to during handshake.
+- Parsing the JWT auth tokens + session_id out of the POST body and
+  handing them to the provider via the ``on_connect`` callback as a
+  ``ConnectTokens``.
+
+Exposes:
+- ``QobuzConnectDiscovery(device, on_connect, quality_getter)``
+
+Depends on:
+- :mod:`.models` only (``ConnectTokens``, ``DeviceConfig``, ``JWTApiToken``,
+  ``JWTConnectToken``, ``OAUTH_APP_ID``, ``QUALITY_TO_HTTP``).
+- No imports from MA or from the protobuf layer — this module could be
+  lifted into a standalone Qobuz Connect SDK without modification.
+
+See :doc:`ARCHITECTURE` for where this fits in the end-to-end flow.
+"""
 
 from __future__ import annotations
 

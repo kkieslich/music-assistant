@@ -1,4 +1,34 @@
-"""Qobuz Connect websocket session management."""
+"""
+Qobuz Connect WebSocket transport.
+
+Owns:
+- The cloud WebSocket lifecycle: connect, AUTHENTICATE, SUBSCRIBE,
+  send JOIN_SESSION, reconnect on disconnect (with exponential backoff),
+  graceful close on shutdown.
+- JWT token refresh: ``set_tokens()`` swaps the credentials and the
+  ``token_version`` counter ticks so a stale reconnect attempt knows
+  to wait for fresh tokens.
+- Inbound frame loop: decode an outer envelope, unpack the inner
+  ``QConnectBatch``, dispatch each message to the appropriate callback
+  the provider registered at construction time.
+- A small set of typed ``send_*`` helpers (renderer_state, volume,
+  quality, queue_load_tracks, autoplay_load_tracks, player_state) that
+  marshal via :mod:`.protocol` and write to the socket.
+
+Exposes:
+- ``QobuzConnectSession`` (callback-style interface).
+
+Depends on:
+- :mod:`.protocol` for encode/decode, :mod:`.models` for enums + DTOs.
+- The ``websockets`` library (network transport).
+- **No MA imports.** The session has no awareness of the player queue
+  or any MA concept; everything domain-specific is routed via the
+  provider-supplied callbacks (``on_set_state``, ``on_volume``,
+  ``on_set_active``, ``on_queue_load_ack``, ...).
+
+See :doc:`ARCHITECTURE` for the inbound dispatch table and the steady-state
+message loop diagram.
+"""
 
 from __future__ import annotations
 
