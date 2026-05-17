@@ -37,12 +37,15 @@ from .models import (
     QUALITY_AUDIO_PROPERTIES,
     QUALITY_TO_PROTOCOL,
     BufferState,
+    LoopMode,
     OuterMessageType,
     PlayingState,
     QConnectMessageType,
     QueueError,
     QueueLoadAck,
+    QueueStateSnapshot,
     QueueTrackRef,
+    QueueTracksAddedEvent,
     QueueVersion,
     SetStateEvent,
 )
@@ -445,6 +448,76 @@ class QobuzConnectCodec:
             return None
         version = message.srvrCtrlQueueVersionChanged.queueVersion
         return QueueVersion(version.major, version.minor)
+
+    @staticmethod
+    def parse_queue_state(message: Any) -> QueueStateSnapshot | None:
+        """Parse a full ``SRVR_CTRL_QUEUE_STATE`` queue snapshot."""
+        if not message.HasField("srvrCtrlQueueState"):
+            return None
+        state = message.srvrCtrlQueueState
+        return QueueStateSnapshot(
+            queue_version=QueueVersion(state.queueVersion.major, state.queueVersion.minor),
+            action_uuid=state.actionUuid,
+            tracks=[ref for track in state.tracks if (ref := _parse_track_ref(track)) is not None],
+            shuffle_mode=state.shuffleMode if state.HasField("shuffleMode") else False,
+            autoplay_mode=state.autoplayMode if state.HasField("autoplayMode") else False,
+            autoplay_tracks=[
+                ref
+                for track in state.autoplayTracks
+                if (ref := _parse_track_ref(track)) is not None
+            ],
+        )
+
+    @staticmethod
+    def parse_queue_tracks_added(message: Any) -> QueueTracksAddedEvent | None:
+        """Parse a ``SRVR_CTRL_QUEUE_TRACKS_ADDED`` queue-delta."""
+        if not message.HasField("srvrCtrlQueueTracksAdded"):
+            return None
+        evt = message.srvrCtrlQueueTracksAdded
+        return QueueTracksAddedEvent(
+            queue_version=QueueVersion(evt.queueVersion.major, evt.queueVersion.minor),
+            action_uuid=evt.actionUuid,
+            tracks=[ref for track in evt.tracks if (ref := _parse_track_ref(track)) is not None],
+            context_uuid=evt.contextUuid if evt.HasField("contextUuid") else None,
+        )
+
+    @staticmethod
+    def parse_set_loop_mode(message: Any) -> LoopMode | None:
+        """Parse a ``SRVR_RNDR_SET_LOOP_MODE`` renderer command."""
+        if not message.HasField("srvrRndrSetLoopMode"):
+            return None
+        mode = message.srvrRndrSetLoopMode
+        if not mode.HasField("mode"):
+            return None
+        try:
+            return LoopMode(mode.mode)
+        except ValueError:
+            return LoopMode.UNKNOWN
+
+    @staticmethod
+    def parse_set_shuffle_mode(message: Any) -> bool | None:
+        """Parse a ``SRVR_RNDR_SET_SHUFFLE_MODE`` renderer command."""
+        if not message.HasField("srvrRndrSetShuffleMode"):
+            return None
+        evt = message.srvrRndrSetShuffleMode
+        return evt.shuffleOn if evt.HasField("shuffleOn") else None
+
+    @staticmethod
+    def parse_set_autoplay_mode(message: Any) -> bool | None:
+        """Parse a ``SRVR_RNDR_SET_AUTOPLAY_MODE`` renderer command."""
+        if not message.HasField("srvrRndrSetAutoplayMode"):
+            return None
+        evt = message.srvrRndrSetAutoplayMode
+        return evt.autoplayOn if evt.HasField("autoplayOn") else None
+
+    def encode_volume_muted(self, muted: bool) -> bytes:
+        """Encode a renderer ``RNDR_SRVR_VOLUME_MUTED`` event for the Qobuz app."""
+        body = payload_pb2.RndrSrvrVolumeMuted()
+        body.value = muted
+        msg = payload_pb2.QConnectMessage()
+        msg.messageType = QConnectMessageType.RNDR_SRVR_VOLUME_MUTED
+        msg.rndrSrvrVolumeMuted.CopyFrom(body)
+        return self._encode_batch(msg)
 
     def _encode_batch(self, *messages: Any) -> bytes:
         batch = payload_pb2.QConnectBatch()

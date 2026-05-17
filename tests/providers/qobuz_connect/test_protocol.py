@@ -8,6 +8,7 @@ from typing import Any
 from music_assistant.providers.qobuz_connect import _normalize_quality_id
 from music_assistant.providers.qobuz_connect.models import (
     BufferState,
+    LoopMode,
     OuterMessageType,
     PlayingState,
     QConnectMessageType,
@@ -240,6 +241,94 @@ def test_parse_autoplay_ack() -> None:
     assert parsed_autoplay_ack.queue_version == QueueVersion(8, 1)
     assert [track.queue_item_id for track in parsed_autoplay_ack.tracks] == [23]
     assert [track.track_id for track in parsed_autoplay_ack.tracks] == ["376286112"]
+
+
+def test_parse_queue_state_snapshot() -> None:
+    """Full queue-state snapshots surface the canonical track list + flags."""
+    state_msg = payload_pb2.QConnectMessage()
+    state_msg.messageType = QConnectMessageType.SRVR_CTRL_QUEUE_STATE
+    state = state_msg.srvrCtrlQueueState
+    state.queueVersion.major = 23
+    state.queueVersion.minor = 1
+    state.actionUuid = ACTION_UUID
+    # Verified shape from capture queue_mutations__client_b frame 5: the
+    # snapshot opens with a track whose queueItemId is unset (current track,
+    # idx 0) and continues with explicit queueItemIds for the rest.
+    state.tracks.add(trackId=1065476, contextUuid=b"ctx-uuid-16-byte")
+    state.tracks.add(queueItemId=1, trackId=1065477, contextUuid=b"ctx-uuid-16-byte")
+    state.tracks.add(queueItemId=2, trackId=1065478, contextUuid=b"ctx-uuid-16-byte")
+    state.shuffleMode = False
+    state.autoplayMode = True
+    state.autoplayTracks.add(queueItemId=99, trackId=2000001)
+
+    parsed = QobuzConnectCodec.parse_queue_state(state_msg)
+
+    assert parsed is not None
+    assert parsed.queue_version == QueueVersion(23, 1)
+    assert parsed.action_uuid == ACTION_UUID
+    assert [t.queue_item_id for t in parsed.tracks] == [0, 1, 2]
+    assert [t.track_id for t in parsed.tracks] == ["1065476", "1065477", "1065478"]
+    assert all(t.context_uuid == b"ctx-uuid-16-byte" for t in parsed.tracks)
+    assert parsed.shuffle_mode is False
+    assert parsed.autoplay_mode is True
+    assert [t.track_id for t in parsed.autoplay_tracks] == ["2000001"]
+
+
+def test_parse_queue_tracks_added_delta() -> None:
+    """Tracks-added delta carries the appended refs + a context UUID."""
+    msg = payload_pb2.QConnectMessage()
+    msg.messageType = QConnectMessageType.SRVR_CTRL_QUEUE_TRACKS_ADDED
+    evt = msg.srvrCtrlQueueTracksAdded
+    evt.queueVersion.major = 24
+    evt.queueVersion.minor = 2
+    evt.actionUuid = ACTION_UUID
+    evt.tracks.add(queueItemId=16, trackId=1065478)
+    evt.contextUuid = b"add-context-16-b"
+
+    parsed = QobuzConnectCodec.parse_queue_tracks_added(msg)
+
+    assert parsed is not None
+    assert parsed.queue_version == QueueVersion(24, 2)
+    assert parsed.action_uuid == ACTION_UUID
+    assert [(t.queue_item_id, t.track_id) for t in parsed.tracks] == [(16, "1065478")]
+    assert parsed.context_uuid == b"add-context-16-b"
+
+
+def test_parse_set_loop_mode_maps_proto_enum() -> None:
+    """LOOP_MODE deserializes to our locale-stable ``LoopMode`` enum."""
+    for proto_value, expected in [
+        (1, LoopMode.OFF),
+        (2, LoopMode.REPEAT_ONE),
+        (3, LoopMode.REPEAT_ALL),
+    ]:
+        msg = payload_pb2.QConnectMessage()
+        msg.messageType = QConnectMessageType.SRVR_RNDR_SET_LOOP_MODE
+        msg.srvrRndrSetLoopMode.mode = proto_value
+        assert QobuzConnectCodec.parse_set_loop_mode(msg) == expected
+
+
+def test_parse_set_shuffle_and_autoplay_mode() -> None:
+    """SHUFFLE_MODE / AUTOPLAY_MODE surface the toggled boolean."""
+    shuffle_msg = payload_pb2.QConnectMessage()
+    shuffle_msg.messageType = QConnectMessageType.SRVR_RNDR_SET_SHUFFLE_MODE
+    shuffle_msg.srvrRndrSetShuffleMode.shuffleOn = True
+
+    autoplay_msg = payload_pb2.QConnectMessage()
+    autoplay_msg.messageType = QConnectMessageType.SRVR_RNDR_SET_AUTOPLAY_MODE
+    autoplay_msg.srvrRndrSetAutoplayMode.autoplayOn = False
+
+    assert QobuzConnectCodec.parse_set_shuffle_mode(shuffle_msg) is True
+    assert QobuzConnectCodec.parse_set_autoplay_mode(autoplay_msg) is False
+
+
+def test_encode_volume_muted_round_trip() -> None:
+    """Mute reports encode as a one-bool payload the cloud can re-decode."""
+    codec = QobuzConnectCodec(DEVICE_UUID)
+
+    for muted in (True, False):
+        msg = _first_inner_message(codec.encode_volume_muted(muted))
+        assert msg.messageType == QConnectMessageType.RNDR_SRVR_VOLUME_MUTED
+        assert msg.rndrSrvrVolumeMuted.value is muted
 
 
 def test_parse_queue_error_and_version_change() -> None:

@@ -12,10 +12,13 @@ from music_assistant_models.enums import MediaType, PlaybackState
 
 from music_assistant.providers.qobuz_connect.models import (
     BufferState,
+    LoopMode,
     PlayingState,
     QueueError,
     QueueLoadAck,
+    QueueStateSnapshot,
     QueueTrackRef,
+    QueueTracksAddedEvent,
     QueueVersion,
     SetStateEvent,
 )
@@ -956,4 +959,65 @@ async def test_playing_position_command_reports_buffering_until_confirmed() -> N
 
     assert session.renderer_states[0]["playing_state"] == PlayingState.PLAYING
     assert session.renderer_states[0]["buffer_state"] == BufferState.BUFFERING
+    await engine.stop()
+
+
+async def test_handle_queue_state_replaces_mirror_tracks_and_flags() -> None:
+    """SRVR_CTRL_QUEUE_STATE snapshots replace the mirror's authoritative queue."""
+    provider = _FakeProvider(_queue(PlaybackState.PLAYING))
+    engine = QobuzConnectSyncEngine(provider)
+    # Pre-populate with stale state to prove the snapshot wins.
+    engine.qobuz_state.tracks = [QueueTrackRef(queue_item_id=99, track_id="stale")]
+    engine.qobuz_state.shuffle_mode = True
+
+    snapshot = QueueStateSnapshot(
+        queue_version=QueueVersion(23, 1),
+        action_uuid=b"\x00" * 16,
+        tracks=[
+            QueueTrackRef(queue_item_id=0, track_id="1065476"),
+            QueueTrackRef(queue_item_id=1, track_id="1065477"),
+        ],
+        shuffle_mode=False,
+        autoplay_mode=True,
+    )
+    await engine.handle_queue_state(snapshot)
+
+    assert engine.qobuz_state.queue_version == QueueVersion(23, 1)
+    assert [t.track_id for t in engine.qobuz_state.tracks] == ["1065476", "1065477"]
+    assert engine.qobuz_state.shuffle_mode is False
+    assert engine.qobuz_state.autoplay_mode is True
+    await engine.stop()
+
+
+async def test_handle_queue_tracks_added_appends_to_mirror() -> None:
+    """Per-op TRACKS_ADDED delta extends the mirror's track list."""
+    provider = _FakeProvider(_queue(PlaybackState.PLAYING))
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.queue_version = QueueVersion(24, 1)
+    engine.qobuz_state.tracks = [QueueTrackRef(queue_item_id=10, track_id="existing")]
+
+    delta = QueueTracksAddedEvent(
+        queue_version=QueueVersion(24, 2),
+        action_uuid=b"\x00" * 16,
+        tracks=[QueueTrackRef(queue_item_id=16, track_id="1065478")],
+    )
+    await engine.handle_queue_tracks_added(delta)
+
+    assert engine.qobuz_state.queue_version == QueueVersion(24, 2)
+    assert [t.track_id for t in engine.qobuz_state.tracks] == ["existing", "1065478"]
+    await engine.stop()
+
+
+async def test_handle_mode_setters_update_mirror() -> None:
+    """SET_LOOP/SHUFFLE/AUTOPLAY mode commands flip the corresponding mirror fields."""
+    provider = _FakeProvider(_queue(PlaybackState.PLAYING))
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_loop_mode(LoopMode.REPEAT_ALL)
+    await engine.handle_shuffle_mode(True)
+    await engine.handle_autoplay_mode(False)
+
+    assert engine.qobuz_state.loop_mode == LoopMode.REPEAT_ALL
+    assert engine.qobuz_state.shuffle_mode is True
+    assert engine.qobuz_state.autoplay_mode is False
     await engine.stop()

@@ -6,11 +6,12 @@ Owns:
   ``QUALITY_TO_HTTP`` / ``QUALITY_AUDIO_PROPERTIES`` (Qobuz quality-id
   mappings for the three places Qobuz expects them).
 - Wire-level enums: ``OuterMessageType``, ``QConnectMessageType``,
-  ``PlayingState``, ``BufferState``, ``Origin``.
+  ``PlayingState``, ``BufferState``, ``LoopMode``, ``Origin``.
 - Discovery-side DTOs: ``DeviceConfig``, ``JWTApiToken``,
   ``JWTConnectToken``, ``ConnectTokens``.
 - State DTOs: ``QueueVersion``, ``QueueTrackRef``, ``SetStateEvent``,
-  ``QueueLoadAck``, ``QueueError``, ``QobuzMirror`` (the canonical
+  ``QueueLoadAck``, ``QueueError``, ``QueueStateSnapshot``,
+  ``QueueTracksAddedEvent``, ``QobuzMirror`` (the canonical
   remote-state snapshot held by the sync engine).
 
 Exposes:
@@ -69,6 +70,7 @@ class QConnectMessageType(IntEnum):
     RNDR_SRVR_FILE_AUDIO_QUALITY_CHANGED = 26
     RNDR_SRVR_DEVICE_AUDIO_QUALITY_CHANGED = 27
     RNDR_SRVR_MAX_AUDIO_QUALITY_CHANGED = 28
+    RNDR_SRVR_VOLUME_MUTED = 29
     SRVR_RNDR_SET_STATE = 41
     SRVR_RNDR_SET_VOLUME = 42
     SRVR_RNDR_SET_ACTIVE = 43
@@ -83,6 +85,7 @@ class QConnectMessageType(IntEnum):
     SRVR_CTRL_QUEUE_ERROR_MESSAGE = 88
     SRVR_CTRL_QUEUE_STATE = 90
     SRVR_CTRL_QUEUE_TRACKS_LOADED = 91
+    SRVR_CTRL_QUEUE_TRACKS_ADDED = 93
     SRVR_CTRL_AUTOPLAY_TRACKS_LOADED = 103
     SRVR_CTRL_QUEUE_VERSION_CHANGED = 105
 
@@ -103,6 +106,15 @@ class BufferState(IntEnum):
     OK = 2
     ERROR = 3
     UNDERRUN = 4
+
+
+class LoopMode(IntEnum):
+    """Qobuz loop / repeat mode (mirrors ``LoopMode`` in qconnect_common.proto)."""
+
+    UNKNOWN = 0
+    OFF = 1
+    REPEAT_ONE = 2
+    REPEAT_ALL = 3
 
 
 class Origin(StrEnum):
@@ -198,6 +210,34 @@ class QueueLoadAck:
 
 
 @dataclass(slots=True)
+class QueueStateSnapshot:
+    """
+    Full queue snapshot pushed by the cloud (``SRVR_CTRL_QUEUE_STATE``).
+
+    Authoritative state — replaces the mirror's queue when received.
+    Emitted on every fresh connect / resync (``CTRL_SRVR_ASK_FOR_QUEUE_STATE``)
+    and whenever the cloud needs to re-broadcast canonical state.
+    """
+
+    queue_version: QueueVersion
+    action_uuid: bytes
+    tracks: list[QueueTrackRef] = field(default_factory=list)
+    shuffle_mode: bool = False
+    autoplay_mode: bool = False
+    autoplay_tracks: list[QueueTrackRef] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class QueueTracksAddedEvent:
+    """Server delta: tracks appended to the queue (``SRVR_CTRL_QUEUE_TRACKS_ADDED``)."""
+
+    queue_version: QueueVersion
+    action_uuid: bytes
+    tracks: list[QueueTrackRef] = field(default_factory=list)
+    context_uuid: bytes | None = None
+
+
+@dataclass(slots=True)
 class QueueError:
     """Server queue command error."""
 
@@ -219,3 +259,10 @@ class QobuzMirror:
     position_ms: int = 0
     position_timestamp_ms: int = 0
     duration_ms: int = 0
+    # Populated from SRVR_CTRL_QUEUE_STATE snapshots + SRVR_CTRL_QUEUE_TRACKS_*
+    # delta messages. Phase B populates this; Phase C will use it to drive
+    # MA-side queue reconciliation.
+    tracks: list[QueueTrackRef] = field(default_factory=list)
+    loop_mode: LoopMode = LoopMode.OFF
+    shuffle_mode: bool = False
+    autoplay_mode: bool = False
