@@ -1,8 +1,38 @@
-"""Experimental Qobuz Connect receiver for Music Assistant.
+"""
+Experimental Qobuz Connect receiver for Music Assistant.
 
 This provider implements enough of Qobuz Connect locally to expose Music
-Assistant as a Qobuz Connect target while keeping playback inside MA's native
-Qobuz provider and player queue.
+Assistant as a Qobuz Connect target while keeping playback inside MA's
+native Qobuz provider and player queue.
+
+Owns:
+- ``QobuzConnectProvider`` (a ``PluginProvider``): config schema,
+  lifecycle hooks (``loaded_in_mass`` / ``unload`` / ``update_config``),
+  target-player resolution (the ``__auto__`` heuristic vs. a pinned
+  player), and persisting the user's quality choice from the Qobuz app
+  back into both this provider's config *and* the native ``qobuz``
+  music provider's ``CONF_QUALITY``.
+- The wiring between the four collaborators: it owns the
+  ``QobuzConnectDiscovery``, ``QobuzConnectSession`` and
+  ``QobuzConnectSyncEngine`` instances and threads callbacks between
+  them.
+- The device-identity derivation that keeps the mDNS serial and the
+  Qobuz cloud device UUID stable across restarts (``uuid5`` over
+  ``instance_id``).
+
+Exposes:
+- ``setup``, ``get_config_entries`` (the provider-protocol hooks).
+- ``QobuzConnectProvider`` for typing.
+- Module-level constants ``CONF_TARGET_PLAYER`` / ``CONF_PUBLISH_NAME``
+  / ``CONF_HTTP_PORT`` / ``CONF_MAX_QUALITY`` / ``CONF_INITIAL_VOLUME``.
+
+Depends on:
+- :mod:`.discovery`, :mod:`.session`, :mod:`.sync`, :mod:`.models`.
+- The native ``qobuz`` music provider (``mass.get_provider("qobuz")``)
+  must be configured — looked up lazily via ``get_qobuz_provider()``,
+  which raises ``InvalidDataError`` if absent.
+
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the end-to-end flow.
 """
 
 from __future__ import annotations
