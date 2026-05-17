@@ -117,6 +117,38 @@ class MABridge:
         """Replace the target player's queue with the given items."""
         await self._provider.mass.player_queues.load(player_id, queue_items, **kwargs)
 
+    async def insert_items(
+        self,
+        player_id: str,
+        items: list[Any],
+        *,
+        insert_at_index: int,
+        keep_played: bool = True,
+        keep_remaining: bool = True,
+    ) -> None:
+        """
+        Insert ``items`` at ``insert_at_index`` without disrupting playback.
+
+        Thin wrapper over :py:meth:`mass.player_queues.load` with the defaults
+        the reconciler always wants — keeping played items above the insert
+        point and the remainder below.
+        """
+        await self._provider.mass.player_queues.load(
+            player_id,
+            items,
+            insert_at_index=insert_at_index,
+            keep_played=keep_played,
+            keep_remaining=keep_remaining,
+        )
+
+    def delete_item(self, player_id: str, queue_item_id_or_index: int | str) -> None:
+        """Delete a single item from the target player's queue."""
+        self._provider.mass.player_queues.delete_item(player_id, queue_item_id_or_index)
+
+    def update_items(self, player_id: str, items: list[Any]) -> None:
+        """Replace the ordered queue-items list for a player without restarting playback."""
+        self._provider.mass.player_queues.update_items(player_id, items)
+
     def clear_queue(self, player_id: str, *, skip_stop: bool = False) -> None:
         """Clear the target player's queue."""
         self._provider.mass.player_queues.clear(player_id, skip_stop=skip_stop)

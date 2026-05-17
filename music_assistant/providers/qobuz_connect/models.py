@@ -33,6 +33,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import asyncio
+    from typing import Any
 
 OAUTH_APP_ID = "304027809"
 
@@ -80,7 +85,12 @@ class QConnectMessageType(IntEnum):
     SRVR_RNDR_SET_LOOP_MODE = 45
     SRVR_RNDR_SET_SHUFFLE_MODE = 46
     SRVR_RNDR_SET_AUTOPLAY_MODE = 47
+    CTRL_SRVR_CLEAR_QUEUE = 65
     CTRL_SRVR_QUEUE_LOAD_TRACKS = 66
+    CTRL_SRVR_QUEUE_INSERT_TRACKS = 67
+    CTRL_SRVR_QUEUE_ADD_TRACKS = 68
+    CTRL_SRVR_QUEUE_REMOVE_TRACKS = 69
+    CTRL_SRVR_QUEUE_REORDER_TRACKS = 70
     CTRL_SRVR_SET_PLAYER_STATE = 62
     CTRL_SRVR_ASK_FOR_QUEUE_STATE = 76
     CTRL_SRVR_ASK_FOR_RENDERER_STATE = 77
@@ -328,3 +338,33 @@ class QobuzMirror:
     loop_mode: LoopMode = LoopMode.OFF
     shuffle_mode: bool = False
     autoplay_mode: bool = False
+
+
+class OutboundActionKind(StrEnum):
+    """Kind of queue mutation we sent to the Qobuz cloud and now expect to echo back."""
+
+    LOAD = "load"
+    ADD = "add"
+    INSERT = "insert"
+    REMOVE = "remove"
+    REORDER = "reorder"
+    CLEAR = "clear"
+
+
+@dataclass(slots=True)
+class OutboundActionMeta:
+    """
+    Ledger entry for a queue-mutation command we initiated.
+
+    The cloud echoes ``CTRL_SRVR_QUEUE_*`` commands back as their
+    ``SRVR_CTRL_QUEUE_*`` counterpart with the same ``action_uuid``.
+    When we see our own action_uuid come back we still update the
+    mirror (the cloud assigns ``queue_item_id``s on add/insert) but
+    skip the inbound MA reconciler — MA's queue already reflects
+    the change because we originated it.
+    """
+
+    kind: OutboundActionKind
+    queue_version: QueueVersion
+    expires_at: float
+    future: asyncio.Future[Any] | None = None
