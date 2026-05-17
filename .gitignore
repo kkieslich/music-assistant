@@ -44,3 +44,11 @@ devenv.local.yaml
 
 # VS Code
 .vscode/launch.json
+
+# Qobuz Connect protocol-capture harness — Playwright auth + working captures
+tests/providers/qobuz_connect/protocol_capture/.auth/
+tests/providers/qobuz_connect/protocol_capture/.runs/
+
+# qobuz_connect playground data
+.mass-data/
+.mass-cache/
