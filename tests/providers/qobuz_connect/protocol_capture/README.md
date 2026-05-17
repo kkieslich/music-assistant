@@ -81,6 +81,7 @@ Captures land in `.runs/<scenario>__client_a.json` and `…__client_b.json`.
 | `controller_paused_scrub_then_skip`   | A controls + B renders → pause → scrub-while-paused → skip-next BEFORE resume     | Does the reference renderer get a paused-seek command at all?        |
 | `controller_burst_skip_throttled`     | Same as `controller_burst_skip` with B throttled (200ms RTT + 100kbps both ways)  | Burst under slow renderer (out-of-order arrivals; reconcile stress)  |
 | `controller_play_pause_rapid`         | A controls + B renders → 6× rapid play/pause toggles                              | State-flapping reconciliation                                        |
+| `controller_skip_then_seek`           | A controls + B renders → A skips next, waits ~150ms, then seeks to 60%           | Track-change reconcile vs. immediately-following playing seek        |
 
 `.runs/` is gitignored — captures contain personal Qobuz JWT auth tokens.
 If you ever need to commit a capture as a fixture, strip the auth bytes
