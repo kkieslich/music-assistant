@@ -11,8 +11,10 @@ Owns:
   ``JWTConnectToken``, ``ConnectTokens``.
 - State DTOs: ``QueueVersion``, ``QueueTrackRef``, ``SetStateEvent``,
   ``QueueLoadAck``, ``QueueError``, ``QueueStateSnapshot``,
-  ``QueueTracksAddedEvent``, ``QobuzMirror`` (the canonical
-  remote-state snapshot held by the sync engine).
+  ``QueueTracksAddedEvent``, ``QueueTracksInsertedEvent``,
+  ``QueueTracksRemovedEvent``, ``QueueTracksReorderedEvent``,
+  ``QueueClearedEvent``, ``QobuzMirror`` (the canonical remote-state
+  snapshot held by the sync engine).
 
 Exposes:
 - All of the above as importable names.
@@ -83,9 +85,13 @@ class QConnectMessageType(IntEnum):
     CTRL_SRVR_ASK_FOR_RENDERER_STATE = 77
     CTRL_SRVR_AUTOPLAY_ADD_TRACKS = 79
     SRVR_CTRL_QUEUE_ERROR_MESSAGE = 88
+    SRVR_CTRL_QUEUE_CLEARED = 89
     SRVR_CTRL_QUEUE_STATE = 90
     SRVR_CTRL_QUEUE_TRACKS_LOADED = 91
+    SRVR_CTRL_QUEUE_TRACKS_INSERTED = 92
     SRVR_CTRL_QUEUE_TRACKS_ADDED = 93
+    SRVR_CTRL_QUEUE_TRACKS_REMOVED = 94
+    SRVR_CTRL_QUEUE_TRACKS_REORDERED = 95
     SRVR_CTRL_AUTOPLAY_TRACKS_LOADED = 103
     SRVR_CTRL_QUEUE_VERSION_CHANGED = 105
 
@@ -235,6 +241,44 @@ class QueueTracksAddedEvent:
     action_uuid: bytes
     tracks: list[QueueTrackRef] = field(default_factory=list)
     context_uuid: bytes | None = None
+
+
+@dataclass(slots=True)
+class QueueTracksInsertedEvent:
+    """Server delta: tracks inserted after a given position (``SRVR_CTRL_QUEUE_TRACKS_INSERTED``)."""
+
+    queue_version: QueueVersion
+    action_uuid: bytes
+    tracks: list[QueueTrackRef] = field(default_factory=list)
+    insert_after: int = 0
+    context_uuid: bytes | None = None
+
+
+@dataclass(slots=True)
+class QueueTracksRemovedEvent:
+    """Server delta: tracks removed by queue-item id (``SRVR_CTRL_QUEUE_TRACKS_REMOVED``)."""
+
+    queue_version: QueueVersion
+    action_uuid: bytes
+    queue_item_ids: list[int] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class QueueTracksReorderedEvent:
+    """Server delta: queue items moved after a given position (``SRVR_CTRL_QUEUE_TRACKS_REORDERED``)."""
+
+    queue_version: QueueVersion
+    action_uuid: bytes
+    queue_item_ids: list[int] = field(default_factory=list)
+    insert_after: int = 0
+
+
+@dataclass(slots=True)
+class QueueClearedEvent:
+    """Server notification: queue cleared (``SRVR_CTRL_QUEUE_CLEARED``)."""
+
+    queue_version: QueueVersion
+    action_uuid: bytes
 
 
 @dataclass(slots=True)

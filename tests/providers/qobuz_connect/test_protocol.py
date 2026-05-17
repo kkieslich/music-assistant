@@ -274,6 +274,80 @@ def test_parse_queue_state_snapshot() -> None:
     assert [t.track_id for t in parsed.autoplay_tracks] == ["2000001"]
 
 
+def test_parse_queue_tracks_inserted_delta() -> None:
+    """INSERTED carries an insert-after anchor + new tracks + optional context UUID."""
+    msg = payload_pb2.QConnectMessage()
+    msg.messageType = QConnectMessageType.SRVR_CTRL_QUEUE_TRACKS_INSERTED
+    evt = msg.srvrCtrlQueueTracksInserted
+    evt.queueVersion.major = 25
+    evt.queueVersion.minor = 1
+    evt.actionUuid = ACTION_UUID
+    evt.tracks.add(queueItemId=42, trackId=2002)
+    evt.tracks.add(queueItemId=43, trackId=2003)
+    evt.insertAfter = 5
+    evt.contextUuid = b"ins-context-16-b"
+
+    parsed = QobuzConnectCodec.parse_queue_tracks_inserted(msg)
+
+    assert parsed is not None
+    assert parsed.queue_version == QueueVersion(25, 1)
+    assert parsed.insert_after == 5
+    assert [(t.queue_item_id, t.track_id) for t in parsed.tracks] == [(42, "2002"), (43, "2003")]
+    assert parsed.context_uuid == b"ins-context-16-b"
+
+
+def test_parse_queue_tracks_removed_delta() -> None:
+    """REMOVED surfaces the list of queue-item ids to drop."""
+    msg = payload_pb2.QConnectMessage()
+    msg.messageType = QConnectMessageType.SRVR_CTRL_QUEUE_TRACKS_REMOVED
+    evt = msg.srvrCtrlQueueTracksRemoved
+    evt.queueVersion.major = 26
+    evt.queueVersion.minor = 0
+    evt.actionUuid = ACTION_UUID
+    evt.queueItemIds.extend([10, 11, 12])
+
+    parsed = QobuzConnectCodec.parse_queue_tracks_removed(msg)
+
+    assert parsed is not None
+    assert parsed.queue_version == QueueVersion(26, 0)
+    assert parsed.queue_item_ids == [10, 11, 12]
+
+
+def test_parse_queue_tracks_reordered_delta() -> None:
+    """REORDERED carries an insert-after anchor + the moved queue-item ids."""
+    msg = payload_pb2.QConnectMessage()
+    msg.messageType = QConnectMessageType.SRVR_CTRL_QUEUE_TRACKS_REORDERED
+    evt = msg.srvrCtrlQueueTracksReordered
+    evt.queueVersion.major = 27
+    evt.queueVersion.minor = 4
+    evt.actionUuid = ACTION_UUID
+    evt.queueItemIds.extend([5, 6])
+    evt.insertAfter = 8
+
+    parsed = QobuzConnectCodec.parse_queue_tracks_reordered(msg)
+
+    assert parsed is not None
+    assert parsed.queue_version == QueueVersion(27, 4)
+    assert parsed.queue_item_ids == [5, 6]
+    assert parsed.insert_after == 8
+
+
+def test_parse_queue_cleared_notification() -> None:
+    """QUEUE_CLEARED carries only the version + action UUID."""
+    msg = payload_pb2.QConnectMessage()
+    msg.messageType = QConnectMessageType.SRVR_CTRL_QUEUE_CLEARED
+    evt = msg.srvrCtrlQueueCleared
+    evt.queueVersion.major = 28
+    evt.queueVersion.minor = 0
+    evt.actionUuid = ACTION_UUID
+
+    parsed = QobuzConnectCodec.parse_queue_cleared(msg)
+
+    assert parsed is not None
+    assert parsed.queue_version == QueueVersion(28, 0)
+    assert parsed.action_uuid == ACTION_UUID
+
+
 def test_parse_queue_tracks_added_delta() -> None:
     """Tracks-added delta carries the appended refs + a context UUID."""
     msg = payload_pb2.QConnectMessage()

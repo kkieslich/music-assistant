@@ -40,7 +40,6 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
 
 import websockets
 from websockets import ClientConnection
@@ -52,40 +51,20 @@ from .models import (
     JWTConnectToken,
     LoopMode,
     PlayingState,
-    QConnectMessageType,
+    QueueClearedEvent,
     QueueError,
     QueueLoadAck,
     QueueStateSnapshot,
     QueueTracksAddedEvent,
+    QueueTracksInsertedEvent,
+    QueueTracksRemovedEvent,
+    QueueTracksReorderedEvent,
     QueueVersion,
     SetStateEvent,
 )
 from .protocol import QobuzConnectCodec
 
 LOGGER = logging.getLogger(__name__)
-
-# Message types that Qobuz broadcasts to controllers about state changes
-# on *other* renderers (or session-wide concerns). They reach us because of
-# how subscription routing works in Qobuz Connect, but a renderer needs to
-# take no action — they're explicitly acknowledged here so they don't fall
-# through to the "Unhandled" warning. Numeric values are inlined because
-# these types aren't in QConnectMessageType (Phase B Tier 3, see
-# ARCHITECTURE.md).
-_KNOWN_IGNORED_MESSAGE_TYPES: frozenset[int] = frozenset(
-    {
-        81,  # SRVR_CTRL_SESSION_STATE
-        82,  # SRVR_CTRL_RENDERER_STATE_UPDATED
-        83,  # SRVR_CTRL_ADD_RENDERER
-        84,  # SRVR_CTRL_UPDATE_RENDERER
-        85,  # SRVR_CTRL_REMOVE_RENDERER
-        86,  # SRVR_CTRL_ACTIVE_RENDERER_CHANGED
-        87,  # SRVR_CTRL_VOLUME_CHANGED
-        97,  # SRVR_CTRL_LOOP_MODE_SET
-        98,  # SRVR_CTRL_VOLUME_MUTED
-        99,  # SRVR_CTRL_MAX_AUDIO_QUALITY_CHANGED
-        100,  # SRVR_CTRL_FILE_AUDIO_QUALITY_CHANGED
-    }
-)
 
 PING_INTERVAL = 10.0
 PONG_TIMEOUT = 30.0
@@ -108,10 +87,10 @@ class SessionCallbacks:
     """
     Typed bundle of every callback the provider supplies to the session.
 
-    Bundling avoids the 15-argument constructor explosion that grew as
-    Phase B added handlers for the queue-state / tracks-added / mode-set
-    message types. Phase C will move these into an
-    ``InboundDispatcher`` collaborator.
+    The :class:`.inbound_dispatcher.InboundDispatcher` consumes these
+    when it routes a decoded inner message; the session itself only
+    holds the bundle so it can hand it to the dispatcher at construction
+    time.
     """
 
     on_set_state: Callable[[SetStateEvent], Awaitable[None]]
@@ -120,6 +99,10 @@ class SessionCallbacks:
     on_queue_version: Callable[[QueueVersion], Awaitable[None]]
     on_queue_state: Callable[[QueueStateSnapshot], Awaitable[None]]
     on_queue_tracks_added: Callable[[QueueTracksAddedEvent], Awaitable[None]]
+    on_queue_tracks_inserted: Callable[[QueueTracksInsertedEvent], Awaitable[None]]
+    on_queue_tracks_removed: Callable[[QueueTracksRemovedEvent], Awaitable[None]]
+    on_queue_tracks_reordered: Callable[[QueueTracksReorderedEvent], Awaitable[None]]
+    on_queue_cleared: Callable[[QueueClearedEvent], Awaitable[None]]
     on_volume: Callable[[int], Awaitable[None]]
     on_volume_delta: Callable[[int], Awaitable[None]]
     on_quality: Callable[[int], Awaitable[None]]
@@ -149,6 +132,11 @@ class QobuzConnectSession:
         self._pending_messages: list[bytes] = []
         self._reconnect_delay = INITIAL_RECONNECT_DELAY
         self._cb = callbacks
+        # Local import: inbound_dispatcher imports from this module
+        # (SessionCallbacks), so we defer the import to break the cycle.
+        from .inbound_dispatcher import InboundDispatcher  # noqa: PLC0415
+
+        self._dispatcher = InboundDispatcher(self._codec, callbacks)
 
     @property
     def is_connected(self) -> bool:
@@ -397,101 +385,7 @@ class QobuzConnectSession:
         if not batch:
             return
         for msg in batch.messages:
-            await self._dispatch_inner_message(msg)
-
-    async def _dispatch_inner_message(self, msg: Any) -> None:  # noqa: PLR0915
-        # Inherently statement-heavy: one branch per known inner message
-        # type. Phase C of the qobuz_connect redesign replaces this with a
-        # proper dispatcher table (see ARCHITECTURE.md).
-        msg_type = msg.messageType
-        if msg_type == QConnectMessageType.SRVR_RNDR_SET_STATE:
-            if event := self._codec.parse_set_state(msg):
-                LOGGER.debug(
-                    "Qobuz SET_STATE state=%s pos=%s current=%s next=%s qv=%s",
-                    event.playing_state,
-                    event.position_ms,
-                    _format_track_ref(event.current_item),
-                    _format_track_ref(event.next_item),
-                    event.queue_version,
-                )
-                await self._cb.on_set_state(event)
-        elif msg_type == QConnectMessageType.SRVR_RNDR_SET_VOLUME:
-            if msg.HasField("srvrRndrSetVolume"):
-                vol = msg.srvrRndrSetVolume
-                if vol.HasField("volume"):
-                    await self._cb.on_volume(vol.volume)
-                elif vol.HasField("volumeDelta"):
-                    await self._cb.on_volume_delta(vol.volumeDelta)
-        elif msg_type == QConnectMessageType.SRVR_RNDR_SET_MAX_AUDIO_QUALITY:
-            if msg.HasField("srvrRndrSetMaxAudioQuality"):
-                await self._cb.on_quality(msg.srvrRndrSetMaxAudioQuality.maxAudioQuality)
-        elif msg_type == QConnectMessageType.SRVR_RNDR_SET_ACTIVE:
-            if msg.HasField("srvrRndrSetActive"):
-                active = bool(msg.srvrRndrSetActive.active)
-                LOGGER.debug("Qobuz SET_ACTIVE active=%s", active)
-                await self._cb.on_set_active(active)
-        elif msg_type == QConnectMessageType.SRVR_CTRL_QUEUE_TRACKS_LOADED:
-            if ack := self._codec.parse_queue_load_ack(msg):
-                LOGGER.debug(
-                    "Qobuz queue-load ACK qv=%s tracks=%s",
-                    ack.queue_version,
-                    [_format_track_ref(track) for track in ack.tracks],
-                )
-                await self._cb.on_queue_load_ack(ack)
-        elif msg_type == QConnectMessageType.SRVR_CTRL_AUTOPLAY_TRACKS_LOADED:
-            if ack := self._codec.parse_autoplay_load_ack(msg):
-                LOGGER.debug(
-                    "Qobuz autoplay-load ACK qv=%s tracks=%s",
-                    ack.queue_version,
-                    [_format_track_ref(track) for track in ack.tracks],
-                )
-                await self._cb.on_queue_load_ack(ack)
-        elif msg_type == QConnectMessageType.SRVR_CTRL_QUEUE_ERROR_MESSAGE:
-            if error := self._codec.parse_queue_error(msg):
-                await self._cb.on_queue_error(error)
-        elif msg_type == QConnectMessageType.SRVR_CTRL_QUEUE_VERSION_CHANGED:
-            if version := self._codec.parse_queue_version_changed(msg):
-                await self._cb.on_queue_version(version)
-        elif msg_type == QConnectMessageType.SRVR_CTRL_QUEUE_STATE:
-            if snapshot := self._codec.parse_queue_state(msg):
-                LOGGER.debug(
-                    "Qobuz QUEUE_STATE qv=%s tracks=%d shuffle=%s autoplay=%s",
-                    snapshot.queue_version,
-                    len(snapshot.tracks),
-                    snapshot.shuffle_mode,
-                    snapshot.autoplay_mode,
-                )
-                await self._cb.on_queue_state(snapshot)
-        elif msg_type == QConnectMessageType.SRVR_CTRL_QUEUE_TRACKS_ADDED:
-            if added := self._codec.parse_queue_tracks_added(msg):
-                LOGGER.debug(
-                    "Qobuz QUEUE_TRACKS_ADDED qv=%s tracks=%s",
-                    added.queue_version,
-                    [_format_track_ref(track) for track in added.tracks],
-                )
-                await self._cb.on_queue_tracks_added(added)
-        elif msg_type == QConnectMessageType.SRVR_RNDR_SET_LOOP_MODE:
-            if (mode := self._codec.parse_set_loop_mode(msg)) is not None:
-                LOGGER.debug("Qobuz SET_LOOP_MODE mode=%s", mode)
-                await self._cb.on_loop_mode(mode)
-        elif msg_type == QConnectMessageType.SRVR_RNDR_SET_SHUFFLE_MODE:
-            if (shuffle := self._codec.parse_set_shuffle_mode(msg)) is not None:
-                LOGGER.debug("Qobuz SET_SHUFFLE_MODE on=%s", shuffle)
-                await self._cb.on_shuffle_mode(shuffle)
-        elif msg_type == QConnectMessageType.SRVR_RNDR_SET_AUTOPLAY_MODE:
-            if (autoplay := self._codec.parse_set_autoplay_mode(msg)) is not None:
-                LOGGER.debug("Qobuz SET_AUTOPLAY_MODE on=%s", autoplay)
-                await self._cb.on_autoplay_mode(autoplay)
-        elif msg_type == QConnectMessageType.CTRL_SRVR_ASK_FOR_RENDERER_STATE:
-            LOGGER.debug("Qobuz requested renderer state")
-            await self._cb.on_state_request()
-        elif msg_type in _KNOWN_IGNORED_MESSAGE_TYPES:
-            # Broadcasts about other renderers / session-wide state
-            # the renderer takes no action on. See ARCHITECTURE.md
-            # Tier-3 notes.
-            LOGGER.debug("Qobuz broadcast ignored: type=%s", msg_type)
-        else:
-            LOGGER.debug("Unhandled Qobuz Connect message type: %s", msg_type)
+            await self._dispatcher.dispatch(msg)
 
     async def _flush_pending_messages(self) -> None:
         if not self._pending_messages or not self._ws:
@@ -540,9 +434,3 @@ def _uuid_to_bytes(uuid_str: str) -> bytes:
         return uuid.UUID(uuid_str).bytes
     except ValueError:
         return hashlib.md5(uuid_str.encode(), usedforsecurity=False).digest()
-
-
-def _format_track_ref(track_ref: object | None) -> str:
-    if track_ref is None:
-        return "-"
-    return f"{getattr(track_ref, 'queue_item_id', '?')}:{getattr(track_ref, 'track_id', '?')}"

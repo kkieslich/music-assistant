@@ -41,11 +41,15 @@ from .models import (
     OuterMessageType,
     PlayingState,
     QConnectMessageType,
+    QueueClearedEvent,
     QueueError,
     QueueLoadAck,
     QueueStateSnapshot,
     QueueTrackRef,
     QueueTracksAddedEvent,
+    QueueTracksInsertedEvent,
+    QueueTracksRemovedEvent,
+    QueueTracksReorderedEvent,
     QueueVersion,
     SetStateEvent,
 )
@@ -479,6 +483,56 @@ class QobuzConnectCodec:
             action_uuid=evt.actionUuid,
             tracks=[ref for track in evt.tracks if (ref := _parse_track_ref(track)) is not None],
             context_uuid=evt.contextUuid if evt.HasField("contextUuid") else None,
+        )
+
+    @staticmethod
+    def parse_queue_tracks_inserted(message: Any) -> QueueTracksInsertedEvent | None:
+        """Parse a ``SRVR_CTRL_QUEUE_TRACKS_INSERTED`` queue-delta."""
+        if not message.HasField("srvrCtrlQueueTracksInserted"):
+            return None
+        evt = message.srvrCtrlQueueTracksInserted
+        return QueueTracksInsertedEvent(
+            queue_version=QueueVersion(evt.queueVersion.major, evt.queueVersion.minor),
+            action_uuid=evt.actionUuid,
+            tracks=[ref for track in evt.tracks if (ref := _parse_track_ref(track)) is not None],
+            insert_after=evt.insertAfter if evt.HasField("insertAfter") else 0,
+            context_uuid=evt.contextUuid if evt.HasField("contextUuid") else None,
+        )
+
+    @staticmethod
+    def parse_queue_tracks_removed(message: Any) -> QueueTracksRemovedEvent | None:
+        """Parse a ``SRVR_CTRL_QUEUE_TRACKS_REMOVED`` queue-delta."""
+        if not message.HasField("srvrCtrlQueueTracksRemoved"):
+            return None
+        evt = message.srvrCtrlQueueTracksRemoved
+        return QueueTracksRemovedEvent(
+            queue_version=QueueVersion(evt.queueVersion.major, evt.queueVersion.minor),
+            action_uuid=evt.actionUuid,
+            queue_item_ids=list(evt.queueItemIds),
+        )
+
+    @staticmethod
+    def parse_queue_tracks_reordered(message: Any) -> QueueTracksReorderedEvent | None:
+        """Parse a ``SRVR_CTRL_QUEUE_TRACKS_REORDERED`` queue-delta."""
+        if not message.HasField("srvrCtrlQueueTracksReordered"):
+            return None
+        evt = message.srvrCtrlQueueTracksReordered
+        return QueueTracksReorderedEvent(
+            queue_version=QueueVersion(evt.queueVersion.major, evt.queueVersion.minor),
+            action_uuid=evt.actionUuid,
+            queue_item_ids=list(evt.queueItemIds),
+            insert_after=evt.insertAfter if evt.HasField("insertAfter") else 0,
+        )
+
+    @staticmethod
+    def parse_queue_cleared(message: Any) -> QueueClearedEvent | None:
+        """Parse a ``SRVR_CTRL_QUEUE_CLEARED`` notification."""
+        if not message.HasField("srvrCtrlQueueCleared"):
+            return None
+        evt = message.srvrCtrlQueueCleared
+        return QueueClearedEvent(
+            queue_version=QueueVersion(evt.queueVersion.major, evt.queueVersion.minor),
+            action_uuid=evt.actionUuid,
         )
 
     @staticmethod
