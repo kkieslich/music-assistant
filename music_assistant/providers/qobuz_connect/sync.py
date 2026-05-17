@@ -80,6 +80,7 @@ from .models import (
     QueueVersion,
     SetStateEvent,
 )
+from .outbound_reporter import OutboundReporter
 from .state import (
     PausedSeek,
     PendingPlayingSeek,
@@ -95,9 +96,7 @@ if TYPE_CHECKING:
 SEEK_TOLERANCE_MS = 750
 SEEK_DEBOUNCE_MS = 350
 SEEK_CONFIRM_OVERSHOOT_MS = 5_000
-BUFFERING_REPORT_INTERVAL = 1.0
 MA_QUEUE_LOAD_ACK_TIMEOUT = 3.0
-STATE_REPORT_INTERVAL = 5.0
 
 
 class QobuzConnectSyncEngine:
@@ -111,6 +110,9 @@ class QobuzConnectSyncEngine:
         # Direct ``self.mass``/``self.provider`` use has been retired
         # from this file in favour of the bridge.
         self.bridge = MABridge(provider)
+        # All renderer→cloud emission (heartbeat, buffering reporter,
+        # the canonical ``RNDR_SRVR_STATE_UPDATED`` frame) lives here.
+        self.reporter = OutboundReporter(self)
         self.qobuz_state = QobuzMirror()
         # Pending-action ephemeral state, grouped into typed dataclasses
         # (see state.py). Each ``None`` means "no pending action of this
@@ -119,7 +121,6 @@ class QobuzConnectSyncEngine:
         self.playing_seek: PendingPlayingSeek | None = None
         self.qobuz_position: PendingQobuzPosition | None = None
         self.origin: Origin | None = None
-        self._heartbeat_task: asyncio.Task[None] | None = None
         self._last_prequeued_next_ref: TrackRefKey | None = None
         self._prequeued_qobuz_items: dict[str, list[int]] = {}
         self._synthetic_queue_item_id = 1_000_000
@@ -127,7 +128,6 @@ class QobuzConnectSyncEngine:
             bytes, asyncio.Future[QueueLoadAck | QueueError | None]
         ] = {}
         self._last_ma_origin_track_id: str | None = None
-        self._buffering_report_task: asyncio.Task[None] | None = None
         self._qobuz_command_generation = 0
         self._reconcile_task: asyncio.Task[None] | None = None
         self._metadata_task: asyncio.Task[None] | None = None
@@ -139,21 +139,19 @@ class QobuzConnectSyncEngine:
         return self.paused_seek.position_ms if self.paused_seek else None
 
     async def start(self) -> None:
-        """Start state heartbeat."""
-        if self._heartbeat_task is None:
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        """Start the outbound heartbeat."""
+        await self.reporter.start()
 
     async def stop(self) -> None:
-        """Stop state heartbeat."""
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._heartbeat_task
-            self._heartbeat_task = None
+        """Stop heartbeats + cancel any in-flight async work."""
+        await self.reporter.stop()
         self._cancel_reconcile_task()
         self._cancel_metadata_task()
         self._cancel_pending_seek()
-        self._cancel_buffering_reporter()
+
+    async def report_state(self, *, sync_from_ma: bool = True) -> None:
+        """Report canonical renderer state to the Qobuz app (delegates)."""
+        await self.reporter.report_state(sync_from_ma=sync_from_ma)
 
     def reset_for_deactivation(self) -> None:
         """
@@ -171,7 +169,7 @@ class QobuzConnectSyncEngine:
         self._cancel_reconcile_task()
         self._cancel_metadata_task()
         self._cancel_pending_seek()
-        self._cancel_buffering_reporter()
+        self.reporter.cancel_buffering_reporter()
         self._prequeued_qobuz_items.clear()
         self._last_prequeued_next_ref = None
         self._last_ma_origin_track_id = None
@@ -362,72 +360,6 @@ class QobuzConnectSyncEngine:
     async def handle_autoplay_mode(self, autoplay_on: bool) -> None:
         """Record a renderer ``SET_AUTOPLAY_MODE`` command in the mirror."""
         self.qobuz_state.autoplay_mode = autoplay_on
-
-    async def report_state(self, *, sync_from_ma: bool = True) -> None:
-        """Report canonical renderer state to the Qobuz app."""
-        session = self.bridge.session
-        if not session:
-            return
-        player_id = self.bridge.target_player_id()
-        queue = self.bridge.get_queue(player_id) if player_id else None
-        if sync_from_ma and queue and not self._has_active_reconcile():
-            ma_track_id = (
-                self.bridge.qobuz_track_id_for(queue.current_item)
-                if getattr(queue, "current_item", None)
-                else None
-            )
-            if (
-                self.qobuz_state.current_item
-                and ma_track_id == self.qobuz_state.current_item.track_id
-            ):
-                await self._sync_mirror_from_ma_queue(queue)
-            elif ma_track_id is None and queue.state in (
-                MAPlaybackState.PLAYING,
-                MAPlaybackState.PAUSED,
-            ):
-                self.qobuz_state.playing_state = PlayingState.STOPPED
-        current_item = self.qobuz_state.current_item
-        if current_item is None:
-            return
-        # The Qobuz client interpolates position itself from
-        # (position_timestamp_ms, position_ms). For PLAYING we send the raw
-        # anchor pair so the client interpolates exactly once — sending an
-        # already-interpolated value with the original anchor would let the
-        # client interpolate on top, doubling the drift. For non-PLAYING we
-        # send a frozen snapshot (timestamp = now) since there is nothing to
-        # interpolate forward.
-        if self.qobuz_state.buffer_state == BufferState.BUFFERING:
-            wire_position_ms = self.qobuz_state.position_ms
-            wire_timestamp_ms = int(time.time() * 1000)
-        elif self.qobuz_state.playing_state == PlayingState.PLAYING:
-            wire_position_ms = self.qobuz_state.position_ms
-            wire_timestamp_ms = self.qobuz_state.position_timestamp_ms or int(time.time() * 1000)
-        else:
-            wire_position_ms = self.qobuz_state.position_ms
-            wire_timestamp_ms = int(time.time() * 1000)
-        wire_buffer_state = self._wire_buffer_state()
-        self.bridge.logger.debug(
-            "Qobuz report state=%s buffer=%s wire_buffer=%s pos=%sms (anchor ts=%s) item=%s:%s qv=%s.%s sync_from_ma=%s",
-            self.qobuz_state.playing_state,
-            self.qobuz_state.buffer_state,
-            wire_buffer_state,
-            wire_position_ms,
-            wire_timestamp_ms,
-            current_item.queue_item_id,
-            current_item.track_id,
-            self.qobuz_state.queue_version.major,
-            self.qobuz_state.queue_version.minor,
-            sync_from_ma,
-        )
-        await session.send_renderer_state(
-            playing_state=self.qobuz_state.playing_state,
-            buffer_state=wire_buffer_state,
-            position_ms=wire_position_ms,
-            position_timestamp_ms=wire_timestamp_ms,
-            duration_ms=self.qobuz_state.duration_ms,
-            queue_item_id=current_item.queue_item_id,
-            queue_version=self.qobuz_state.queue_version,
-        )
 
     async def set_volume(self, level: int) -> int:
         """Set MA player volume from Qobuz app."""
@@ -1134,48 +1066,12 @@ class QobuzConnectSyncEngine:
         )
 
     def _set_buffering(self) -> None:
-        """Mark transport as buffering and refresh clients while MA catches up."""
-        self.qobuz_state.buffer_state = BufferState.BUFFERING
-        self._ensure_buffering_reporter()
+        """Delegate to ``self.reporter.set_buffering`` — kept as a sync helper."""
+        self.reporter.set_buffering()
 
     def _set_buffer_ok(self) -> None:
-        """Mark transport as ready and stop the temporary buffering reporter."""
-        self.qobuz_state.buffer_state = BufferState.OK
-        self._cancel_buffering_reporter()
-
-    def _ensure_buffering_reporter(self) -> None:
-        """Start a short-interval reporter while Qobuz is waiting on MA audio readiness."""
-        if self._buffering_report_task and not self._buffering_report_task.done():
-            return
-        self._buffering_report_task = asyncio.create_task(self._buffering_report_loop())
-
-    def _cancel_buffering_reporter(self) -> None:
-        """Cancel the short-interval buffering reporter."""
-        if self._buffering_report_task and not self._buffering_report_task.done():
-            if asyncio.current_task() is not self._buffering_report_task:
-                self._buffering_report_task.cancel()
-        self._buffering_report_task = None
-
-    async def _buffering_report_loop(self) -> None:
-        """Refresh Qobuz with a frozen position while MA prepares audio."""
-        try:
-            while True:
-                if self.qobuz_state.buffer_state != BufferState.BUFFERING:
-                    return
-                await asyncio.sleep(BUFFERING_REPORT_INTERVAL)
-                with contextlib.suppress(Exception):
-                    await self.report_state()
-        except asyncio.CancelledError:
-            pass
-
-    def _wire_buffer_state(self) -> BufferState:
-        """Return the buffer state we expose to Qobuz clients."""
-        if (
-            self.qobuz_state.playing_state == PlayingState.PLAYING
-            and self.qobuz_state.buffer_state == BufferState.BUFFERING
-        ):
-            return BufferState.BUFFERING
-        return BufferState.OK
+        """Delegate to ``self.reporter.set_buffer_ok`` — kept as a sync helper."""
+        self.reporter.set_buffer_ok()
 
     @staticmethod
     def _same_queue_ref(first: QueueTrackRef | None, second: QueueTrackRef | None) -> bool:
@@ -1247,9 +1143,3 @@ class QobuzConnectSyncEngine:
         if not player_id:
             raise PlayerUnavailableError("No Music Assistant player available for Qobuz Connect")
         return player_id
-
-    async def _heartbeat_loop(self) -> None:
-        while True:
-            await asyncio.sleep(STATE_REPORT_INTERVAL)
-            with contextlib.suppress(Exception):
-                await self.report_state()
