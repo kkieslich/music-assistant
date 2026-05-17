@@ -103,7 +103,7 @@ class OutboundReporter:
             return
         player_id = engine.bridge.target_player_id()
         queue = engine.bridge.get_queue(player_id) if player_id else None
-        if sync_from_ma and queue is not None and not engine._has_active_reconcile():
+        if sync_from_ma and queue is not None and not engine.command_handler.is_reconciling():
             await self._sync_mirror_from_ma_if_aligned(queue)
         current_item = engine.qobuz_state.current_item
         if current_item is None:
