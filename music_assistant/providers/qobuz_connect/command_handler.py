@@ -244,6 +244,17 @@ class CommandHandler:
         finally:
             if asyncio.current_task() is self._reconcile_task:
                 self._reconcile_task = None
+            # Now that the SET_STATE reconcile is done, fire the MA→mirror
+            # reconciler if a snapshot already landed during our run (it
+            # would have been skipped by the in-flight guard inside
+            # ``schedule_reconcile_ma_to_mirror``). Skip if the mirror is
+            # still empty — without tracks the schedule call would just
+            # latch the dedup gate at the current qv and silently swallow
+            # the snapshot's own schedule call when it arrives moments
+            # later.
+            if engine._is_current_command(generation) and engine.qobuz_state.tracks:
+                with contextlib.suppress(Exception):
+                    await self.schedule_reconcile_ma_to_mirror()
 
     def _schedule_position_only(self, position_ms: int, generation: int) -> None:
         """
@@ -596,6 +607,22 @@ class CommandHandler:
         if current_item is None:
             return
         if engine.qobuz_state.playing_state != PlayingState.PLAYING:
+            return
+        # If a SET_STATE reconcile is in flight, defer. That task may run
+        # ``_replace_ma_queue_from_qobuz`` and wholesale-replace MA's queue
+        # with just the current track at its tail — anything we add here
+        # would be wiped. ``_run_reconcile``'s ``finally`` block re-fires us
+        # once the SET_STATE work has finished. (The bootstrap race observed
+        # in production on May 17 22:02: snapshot reconciler started adding
+        # 1600 tracks, then ``_replace`` finished its slow metadata fetch
+        # and stop+clear+load(current_only) wiped them, then a second
+        # reconciler restarted from scratch — the flickering the user saw.)
+        if self._reconcile_task is not None and not self._reconcile_task.done():
+            logger.debug(
+                "Deferring MA reconcile at qv=%d.%d — SET_STATE reconcile still in flight",
+                engine.qobuz_state.queue_version.major,
+                engine.qobuz_state.queue_version.minor,
+            )
             return
         snapshot_qv = (
             engine.qobuz_state.queue_version.major,

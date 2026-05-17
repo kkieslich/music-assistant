@@ -1706,6 +1706,76 @@ async def test_replace_falls_back_to_current_next_without_snapshot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_snapshot_arriving_during_set_state_bootstrap_runs_once() -> None:
+    """Snapshot arriving mid-SET_STATE-bootstrap must not double-trigger the reconciler.
+
+    Production race (May 17 22:02): SET_STATE arrives, ``_reconcile_task``
+    spawns, ``_replace_ma_queue_from_qobuz`` awaits metadata. Snapshot
+    arrives while ``_replace`` is still awaiting; ``handle_queue_state``
+    schedules the MA reconciler which starts adding tracks. Then ``_replace``
+    finishes its metadata await, runs ``stop+clear+load(current_only)+
+    play_index``, wiping the partial work the reconciler had done. Tail
+    schedules a SECOND reconciler — flicker, log shows two "Reconciling"
+    lines at the same qv.
+
+    Guard: while ``_reconcile_task`` is in flight, ``schedule_reconcile_ma_to_mirror``
+    defers. ``_run_reconcile``'s finally block re-fires it once the SET_STATE
+    work has finished, by which point the mirror is settled.
+    """
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+
+    # SET_STATE + handle_queue_state arrive back-to-back. Both schedule
+    # reconcile work; only one reconciler task should actually run.
+    set_state_task = asyncio.create_task(
+        engine.handle_qobuz_set_state(
+            SetStateEvent(
+                playing_state=PlayingState.PLAYING,
+                queue_version=QueueVersion(major=62, minor=1),
+                current_item=QueueTrackRef(queue_item_id=3, track_id="t3"),
+                next_item=QueueTrackRef(queue_item_id=4, track_id="t4"),
+            )
+        )
+    )
+    queue_state_task = asyncio.create_task(
+        engine.handle_queue_state(
+            QueueStateSnapshot(
+                queue_version=QueueVersion(major=62, minor=1),
+                action_uuid=b"\x00" * 16,
+                tracks=[
+                    QueueTrackRef(queue_item_id=1, track_id="t1"),
+                    QueueTrackRef(queue_item_id=2, track_id="t2"),
+                    QueueTrackRef(queue_item_id=3, track_id="t3"),
+                    QueueTrackRef(queue_item_id=4, track_id="t4"),
+                    QueueTrackRef(queue_item_id=5, track_id="t5"),
+                ],
+                shuffle_mode=False,
+                autoplay_mode=False,
+            )
+        )
+    )
+    await asyncio.gather(set_state_task, queue_state_task)
+    await _wait_for_reconcile(engine)
+    await _wait_for_preload(engine)
+
+    # Final state should be MA mirror-aligned with one current_index pointing
+    # at the playing track. No oscillating clear/load/clear/load cycle.
+    ma_ids = [
+        engine.bridge.qobuz_track_id_for(item) for item in provider.mass.player_queues.queue_items
+    ]
+    assert "t3" in ma_ids
+    assert "t1" in ma_ids, "history must be loaded"
+    assert "t2" in ma_ids, "history must be loaded"
+    assert "t4" in ma_ids, "tail must be loaded"
+    assert "t5" in ma_ids, "tail must be loaded"
+    # No more than one clear should have happened — the SET_STATE bootstrap's
+    # initial clear. The deferred reconciler must not clear again.
+    clears = [c for c in provider.mass.player_queues.calls if c[0] == "clear"]
+    assert len(clears) == 1, f"Bootstrap race must not produce repeated clears; got clears={clears}"
+
+
+@pytest.mark.asyncio
 async def test_queue_state_snapshot_schedules_background_preload() -> None:
     """Snapshot landing after SET_STATE must extend MA in the background, not restart it.
 
