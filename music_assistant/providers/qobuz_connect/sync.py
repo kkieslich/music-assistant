@@ -190,7 +190,7 @@ class QobuzConnectSyncEngine:
         self.playing_seek = None
         self._command_generation += 1
         self.command_handler.cancel_tasks()
-        self.command_handler.reset_prequeue_dedup()
+        self.command_handler.reset_reconcile_dedup()
         self.seek_pipeline.cancel_pending_seek()
         self.reporter.cancel_buffering_reporter()
         self._last_ma_origin_track_id = None
@@ -365,51 +365,37 @@ class QobuzConnectSyncEngine:
         self.qobuz_state.tracks = list(snapshot.tracks)
         self.qobuz_state.shuffle_mode = snapshot.shuffle_mode
         self.qobuz_state.autoplay_mode = snapshot.autoplay_mode
-        await self.command_handler.maybe_preload_remaining_tracks()
+        await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     async def handle_queue_tracks_added(self, event: QueueTracksAddedEvent) -> None:
-        """
-        Apply a ``SRVR_CTRL_QUEUE_TRACKS_ADDED`` delta to the mirror.
-
-        Phase B: appends to the mirror's track list and updates the queue
-        version. MA-side queue mutation is deferred to Phase C.
-        """
+        """Apply a ``SRVR_CTRL_QUEUE_TRACKS_ADDED`` delta, then reconcile MA."""
         self.qobuz_state.queue_version = event.queue_version
         self.qobuz_state.tracks.extend(event.tracks)
+        await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     async def handle_queue_tracks_inserted(self, event: QueueTracksInsertedEvent) -> None:
-        """
-        Apply a ``SRVR_CTRL_QUEUE_TRACKS_INSERTED`` delta to the mirror.
-
-        Inserts the new tracks immediately after the queue position
-        identified by ``event.insert_after`` (0 = before the first
-        track). Phase B: protocol-layer tracking only.
-        """
+        """Apply a ``SRVR_CTRL_QUEUE_TRACKS_INSERTED`` delta, then reconcile MA."""
         self.qobuz_state.queue_version = event.queue_version
         insert_index = max(0, min(event.insert_after, len(self.qobuz_state.tracks)))
         self.qobuz_state.tracks[insert_index:insert_index] = event.tracks
+        await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     async def handle_queue_tracks_removed(self, event: QueueTracksRemovedEvent) -> None:
-        """
-        Apply a ``SRVR_CTRL_QUEUE_TRACKS_REMOVED`` delta to the mirror.
-
-        Drops every track whose ``queue_item_id`` is in
-        ``event.queue_item_ids``. Phase B: protocol-layer tracking only.
-        """
+        """Apply a ``SRVR_CTRL_QUEUE_TRACKS_REMOVED`` delta, then reconcile MA."""
         self.qobuz_state.queue_version = event.queue_version
         removed_ids = set(event.queue_item_ids)
         self.qobuz_state.tracks = [
             track for track in self.qobuz_state.tracks if track.queue_item_id not in removed_ids
         ]
+        await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     async def handle_queue_tracks_reordered(self, event: QueueTracksReorderedEvent) -> None:
-        """
-        Apply a ``SRVR_CTRL_QUEUE_TRACKS_REORDERED`` delta to the mirror.
+        """Apply a ``SRVR_CTRL_QUEUE_TRACKS_REORDERED`` delta, then reconcile MA.
 
-        Moves every track whose ``queue_item_id`` is in
-        ``event.queue_item_ids`` (preserving their original relative
-        order) to sit immediately after ``event.insert_after``. Phase B:
-        protocol-layer tracking only.
+        Note: the reconciler currently only adds missing items and removes
+        stale ones — pure-reorder events (same set, different order) leave
+        MA's queue order untouched in Pass 2a. Full position alignment lands
+        with the positional-insert pass.
         """
         self.qobuz_state.queue_version = event.queue_version
         ids_to_move = list(event.queue_item_ids)
@@ -422,11 +408,17 @@ class QobuzConnectSyncEngine:
         ]
         target = max(0, min(event.insert_after, len(remaining)))
         self.qobuz_state.tracks = remaining[:target] + moving + remaining[target:]
+        await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     async def handle_queue_cleared(self, _event: QueueClearedEvent) -> None:
-        """Apply a ``SRVR_CTRL_QUEUE_CLEARED`` notification to the mirror."""
+        """Apply a ``SRVR_CTRL_QUEUE_CLEARED`` notification, then reconcile MA.
+
+        Empties the mirror; the reconciler then removes every MA item that
+        isn't the currently-playing one. Audio continues uninterrupted.
+        """
         self.qobuz_state.queue_version = _event.queue_version
         self.qobuz_state.tracks = []
+        await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     async def handle_loop_mode(self, mode: LoopMode) -> None:
         """Record a renderer ``SET_LOOP_MODE`` command in the mirror."""
@@ -476,7 +468,7 @@ class QobuzConnectSyncEngine:
             )
             self.qobuz_state.current_item = self.qobuz_state.next_item
             self.qobuz_state.next_item = None
-            self.command_handler.reset_prequeue_dedup()
+            self.command_handler.reset_reconcile_dedup()
             self.paused_seek = None
             self.seek_pipeline.clear_pending_position()
             self.qobuz_state.position_ms = 0
