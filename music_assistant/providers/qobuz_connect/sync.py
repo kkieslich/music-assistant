@@ -162,14 +162,14 @@ class QobuzConnectSyncEngine:
         # to register with the cloud once a session opens.
         self._is_active = True
         # Whether we've already fired ``CTRL_SRVR_ASK_FOR_QUEUE_STATE`` for
-        # the currently-active Qobuz session. The cloud only emits
-        # ``SRVR_CTRL_QUEUE_STATE`` in response to that explicit ask — and,
-        # unlike the reference Web Client (a controller+renderer combo),
-        # we as a renderer-only never receive ``SRVR_CTRL_SESSION_STATE``
-        # to trigger from. So instead we fire the ask the first time *any*
-        # inbound message lands a non-empty ``queue_version`` on the mirror.
-        # Reset on deactivation / reactivation so reconnects re-ask.
-        self._asked_queue_state = False
+        # the currently-active Qobuz session, keyed by the ``queue_version``
+        # we asked for last. The cloud only emits ``SRVR_CTRL_QUEUE_STATE``
+        # in response to that explicit ask — and every queue mutation in
+        # the Qobuz app bumps ``queue_version``, so we need to re-ask each
+        # time to keep the mirror's track order current. ``None`` means
+        # "haven't asked yet"; reset on deactivation / reactivation so
+        # reconnects re-ask.
+        self._last_asked_qv: tuple[int, int] | None = None
 
     @property
     def pending_paused_seek_ms(self) -> int | None:
@@ -211,7 +211,7 @@ class QobuzConnectSyncEngine:
         self.seek_pipeline.cancel_pending_seek()
         self.reporter.cancel_buffering_reporter()
         self._last_ma_origin_track_id = None
-        self._asked_queue_state = False
+        self._last_asked_qv = None
         self.metadata.clear_unresolvable_cache()
 
     def set_active(self, *, active: bool) -> None:
@@ -221,7 +221,7 @@ class QobuzConnectSyncEngine:
             # Fresh activation — next inbound queueVersion should re-ask the
             # cloud for the full snapshot, even if the underlying session
             # hasn't reconnected.
-            self._asked_queue_state = False
+            self._last_asked_qv = None
 
     async def release_target_player(self) -> None:
         """
@@ -508,26 +508,35 @@ class QobuzConnectSyncEngine:
         like us (device-session JWT from ``/connect``) don't receive it,
         so :meth:`maybe_ask_for_queue_state` is also wired into
         ``handle_qobuz_set_state`` / ``handle_queue_version`` —
-        ``_asked_queue_state`` coalesces all entry points into one ask.
+        ``_last_asked_qv`` coalesces all entry points and re-asks on qv bumps.
         """
         self.qobuz_state.queue_version = event.queue_version
         await self.maybe_ask_for_queue_state()
 
     async def maybe_ask_for_queue_state(self) -> None:
-        """Send ``CTRL_SRVR_ASK_FOR_QUEUE_STATE`` if we haven't already this session."""
-        if self._asked_queue_state:
-            return
+        """Send ``CTRL_SRVR_ASK_FOR_QUEUE_STATE`` whenever the cloud advances ``queue_version``.
+
+        The cloud only emits ``SRVR_CTRL_QUEUE_STATE`` in response to an
+        explicit ask. Every queue mutation in the Qobuz app bumps
+        ``queue_version`` — without re-asking, the mirror keeps the stale
+        track list and the reconciler has nothing new to apply. Tracking
+        the last-asked version (rather than a single boolean) makes us
+        re-fetch the snapshot on every cloud-side mutation.
+        """
         # QobuzMirror's default factory returns QueueVersion(0, 0); skip
         # asking until the cloud has actually told us a real version.
         version = self.qobuz_state.queue_version
         if version.major == 0 and version.minor == 0:
+            return
+        current_qv = (version.major, version.minor)
+        if current_qv == self._last_asked_qv:
             return
         session = self.bridge.session
         if session is None:
             return
         import uuid as _uuid  # noqa: PLC0415 — defer the import; only used here
 
-        self._asked_queue_state = True
+        self._last_asked_qv = current_qv
         self.bridge.logger.debug(
             "Asking Qobuz cloud for full queue snapshot at qv=%s.%s",
             self.qobuz_state.queue_version.major,
