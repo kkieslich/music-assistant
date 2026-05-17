@@ -60,6 +60,7 @@ from .models import (
     QueueTracksRemovedEvent,
     QueueTracksReorderedEvent,
     QueueVersion,
+    SessionStateEvent,
     SetStateEvent,
 )
 from .protocol import QobuzConnectCodec
@@ -111,6 +112,7 @@ class SessionCallbacks:
     on_autoplay_mode: Callable[[bool], Awaitable[None]]
     on_state_request: Callable[[], Awaitable[None]]
     on_set_active: Callable[[bool], Awaitable[None]]
+    on_session_state: Callable[[SessionStateEvent], Awaitable[None]]
 
 
 class QobuzConnectSession:
@@ -226,6 +228,20 @@ class QobuzConnectSession:
                 autoplay_reset=autoplay_reset,
                 context_uuid=context_uuid,
                 qweb_track_session=qweb_track_session,
+            )
+        )
+
+    async def send_ask_for_queue_state(
+        self,
+        *,
+        queue_version: QueueVersion,
+        queue_uuid: bytes,
+    ) -> bool:
+        """Request the full queue snapshot from the Qobuz cloud."""
+        return await self.send_message(
+            self._codec.encode_ask_for_queue_state(
+                queue_version=queue_version,
+                queue_uuid=queue_uuid,
             )
         )
 

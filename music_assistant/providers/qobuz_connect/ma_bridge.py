@@ -83,6 +83,10 @@ class MABridge:
             return None
         return self._provider.mass.player_queues.get(player_id)
 
+    def queue_items(self, player_id: str) -> list[Any]:
+        """Return the full ordered ``QueueItem`` list for ``player_id``."""
+        return cast("list[Any]", self._provider.mass.player_queues.items(player_id))
+
     async def play(self, player_id: str) -> None:
         """Resume playback on the target player."""
         await self._provider.mass.player_queues.play(player_id)

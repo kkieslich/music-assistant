@@ -44,7 +44,6 @@ LOGGER = logging.getLogger(__name__)
 # See ARCHITECTURE.md (Tier-3).
 _KNOWN_IGNORED_MESSAGE_TYPES: frozenset[int] = frozenset(
     {
-        81,  # SRVR_CTRL_SESSION_STATE
         82,  # SRVR_CTRL_RENDERER_STATE_UPDATED
         83,  # SRVR_CTRL_ADD_RENDERER
         84,  # SRVR_CTRL_UPDATE_RENDERER
@@ -220,6 +219,17 @@ class InboundDispatcher:
         LOGGER.debug("Qobuz requested renderer state")
         await self._cb.on_state_request()
 
+    async def _on_session_state(self, msg: Any) -> None:
+        if event := self._codec.parse_session_state(msg):
+            LOGGER.debug(
+                "Qobuz SESSION_STATE sessionId=%s qv=%s.%s trackIndex=%s",
+                event.session_id,
+                event.queue_version.major,
+                event.queue_version.minor,
+                event.track_index,
+            )
+            await self._cb.on_session_state(event)
+
     # Dispatch table — populated below at class scope (`__class_getitem__`
     # style with the methods just defined). Keeps each branch one line
     # long and makes adding a new type a single entry.
@@ -245,4 +255,5 @@ InboundDispatcher._HANDLER_TABLE = {
     QConnectMessageType.SRVR_CTRL_QUEUE_TRACKS_REORDERED: InboundDispatcher._on_queue_tracks_reordered,
     QConnectMessageType.SRVR_CTRL_QUEUE_CLEARED: InboundDispatcher._on_queue_cleared,
     QConnectMessageType.CTRL_SRVR_ASK_FOR_RENDERER_STATE: InboundDispatcher._on_state_request,
+    QConnectMessageType.SRVR_CTRL_SESSION_STATE: InboundDispatcher._on_session_state,
 }

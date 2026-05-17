@@ -51,6 +51,7 @@ from .models import (
     QueueTracksRemovedEvent,
     QueueTracksReorderedEvent,
     QueueVersion,
+    SessionStateEvent,
     SetStateEvent,
 )
 from .proto import qconnect_common_pb2 as _common_pb2
@@ -106,7 +107,17 @@ class QobuzConnectCodec:
         return self._pack_frame(OuterMessageType.AUTHENTICATE, msg.SerializeToString())
 
     def encode_subscribe(self, session_uuid: bytes) -> bytes:
-        """Encode websocket subscribe frame."""
+        """Encode websocket subscribe frame.
+
+        Note on the captures: the reference Web Client sends SUBSCRIBE with
+        empty channels, but it authenticates with a *user-login JWT* and
+        the cloud routes events to it as a *controller*. We authenticate
+        with a *device-session JWT* from ``/connect`` and the cloud routes
+        events to us as a *renderer*; that role apparently requires the
+        session UUID in the channel list — switching to empty channels
+        caused the cloud to reject the handshake with a type-1 ERROR
+        immediately on connect (May 2026 local test).
+        """
         msg = envelope_pb2.Subscribe()
         msg.msgId = self._next_msg_id()
         msg.msgDate = self.now_ms()
@@ -135,7 +146,13 @@ class QobuzConnectCodec:
         session_uuid: bytes,
         max_audio_quality: int,
     ) -> bytes:
-        """Encode renderer join-session message."""
+        """Encode renderer join-session message.
+
+        The Qobuz Web Client doesn't send this (it's a controller role
+        authenticating with a user JWT), but a renderer authenticating
+        with a device-session JWT from ``/connect`` must — otherwise the
+        cloud closes the WS with a type-1 ERROR after the SUBSCRIBE.
+        """
         device_info = common_pb2.DeviceInfo()
         device_info.deviceUuid = device_uuid
         device_info.friendlyName = friendly_name
@@ -220,6 +237,28 @@ class QobuzConnectCodec:
         msg = payload_pb2.QConnectMessage()
         msg.messageType = QConnectMessageType.CTRL_SRVR_QUEUE_LOAD_TRACKS
         msg.ctrlSrvrQueueLoadTracks.CopyFrom(queue_load)
+        return self._encode_batch(msg)
+
+    def encode_ask_for_queue_state(
+        self,
+        *,
+        queue_version: QueueVersion,
+        queue_uuid: bytes,
+    ) -> bytes:
+        """Encode ``CTRL_SRVR_ASK_FOR_QUEUE_STATE`` — request the full queue snapshot.
+
+        ``queue_uuid`` is generated locally as an action correlator (mirrors
+        the ``action_uuid`` pattern in :meth:`encode_queue_load_tracks`).
+        The cloud echoes it back in the resulting ``SRVR_CTRL_QUEUE_STATE``
+        message's ``actionUuid``.
+        """
+        ask = payload_pb2.CtrlSrvrAskForQueueState()
+        ask.queueVersion.major = queue_version.major
+        ask.queueVersion.minor = queue_version.minor
+        ask.queueUuid = queue_uuid
+        msg = payload_pb2.QConnectMessage()
+        msg.messageType = QConnectMessageType.CTRL_SRVR_ASK_FOR_QUEUE_STATE
+        msg.ctrlSrvrAskForQueueState.CopyFrom(ask)
         return self._encode_batch(msg)
 
     def encode_autoplay_load_tracks(
@@ -452,6 +491,19 @@ class QobuzConnectCodec:
             return None
         version = message.srvrCtrlQueueVersionChanged.queueVersion
         return QueueVersion(version.major, version.minor)
+
+    @staticmethod
+    def parse_session_state(message: Any) -> SessionStateEvent | None:
+        """Parse ``SRVR_CTRL_SESSION_STATE`` — the cloud's session-bound queue version."""
+        if not message.HasField("srvrCtrlSessionState"):
+            return None
+        state = message.srvrCtrlSessionState
+        return SessionStateEvent(
+            session_uuid=state.sessionUuid,
+            session_id=state.sessionId,
+            queue_version=QueueVersion(state.queueVersion.major, state.queueVersion.minor),
+            track_index=state.trackIndex,
+        )
 
     @staticmethod
     def parse_queue_state(message: Any) -> QueueStateSnapshot | None:

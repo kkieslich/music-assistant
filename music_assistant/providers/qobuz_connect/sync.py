@@ -80,6 +80,7 @@ from .models import (
     QueueTracksRemovedEvent,
     QueueTracksReorderedEvent,
     QueueVersion,
+    SessionStateEvent,
     SetStateEvent,
 )
 from .outbound_reporter import OutboundReporter
@@ -143,6 +144,15 @@ class QobuzConnectSyncEngine:
         # SET_ACTIVE arrives, and pre-Qobuz MA playback should still be able
         # to register with the cloud once a session opens.
         self._is_active = True
+        # Whether we've already fired ``CTRL_SRVR_ASK_FOR_QUEUE_STATE`` for
+        # the currently-active Qobuz session. The cloud only emits
+        # ``SRVR_CTRL_QUEUE_STATE`` in response to that explicit ask — and,
+        # unlike the reference Web Client (a controller+renderer combo),
+        # we as a renderer-only never receive ``SRVR_CTRL_SESSION_STATE``
+        # to trigger from. So instead we fire the ask the first time *any*
+        # inbound message lands a non-empty ``queue_version`` on the mirror.
+        # Reset on deactivation / reactivation so reconnects re-ask.
+        self._asked_queue_state = False
 
     @property
     def pending_paused_seek_ms(self) -> int | None:
@@ -184,11 +194,17 @@ class QobuzConnectSyncEngine:
         self.seek_pipeline.cancel_pending_seek()
         self.reporter.cancel_buffering_reporter()
         self._last_ma_origin_track_id = None
+        self._asked_queue_state = False
         self.metadata.clear_unresolvable_cache()
 
     def set_active(self, *, active: bool) -> None:
         """Toggle the engine's "Qobuz cloud says we're the active renderer" flag."""
         self._is_active = active
+        if active:
+            # Fresh activation — next inbound queueVersion should re-ask the
+            # cloud for the full snapshot, even if the underlying session
+            # hasn't reconnected.
+            self._asked_queue_state = False
 
     async def release_target_player(self) -> None:
         """
@@ -216,6 +232,12 @@ class QobuzConnectSyncEngine:
     async def handle_qobuz_set_state(self, event: SetStateEvent) -> None:
         """Apply a full Qobuz SET_STATE event to MA (delegates)."""
         await self.command_handler.handle_set_state(event)
+        # Renderer-role caveat: we authenticate with a device-session JWT and
+        # the cloud doesn't push us ``SRVR_CTRL_SESSION_STATE`` like it does
+        # to the controller-role Web Client. So the SET_STATE queueVersion
+        # is the first place we learn the right value to ask for queue
+        # state with.
+        await self.maybe_ask_for_queue_state()
 
     async def handle_ma_queue_event(self, event: MassEvent) -> None:
         """React to MA queue updates that were not caused by Qobuz commands."""
@@ -288,20 +310,62 @@ class QobuzConnectSyncEngine:
     async def handle_queue_version(self, version: QueueVersion) -> None:
         """Remember Qobuz queue version changes."""
         self.qobuz_state.queue_version = version
+        await self.maybe_ask_for_queue_state()
+
+    async def handle_session_state(self, event: SessionStateEvent) -> None:
+        """Apply a ``SRVR_CTRL_SESSION_STATE`` notification to the mirror + ask.
+
+        The cloud emits ``SRVR_CTRL_QUEUE_STATE`` in response to an explicit
+        ``CTRL_SRVR_ASK_FOR_QUEUE_STATE``. The Web Client captures show
+        ``SESSION_STATE`` as the natural trigger, but the cloud only pushes
+        it to clients in the controller role (user-login JWT). Renderers
+        like us (device-session JWT from ``/connect``) don't receive it,
+        so :meth:`maybe_ask_for_queue_state` is also wired into
+        ``handle_qobuz_set_state`` / ``handle_queue_version`` —
+        ``_asked_queue_state`` coalesces all entry points into one ask.
+        """
+        self.qobuz_state.queue_version = event.queue_version
+        await self.maybe_ask_for_queue_state()
+
+    async def maybe_ask_for_queue_state(self) -> None:
+        """Send ``CTRL_SRVR_ASK_FOR_QUEUE_STATE`` if we haven't already this session."""
+        if self._asked_queue_state:
+            return
+        # QobuzMirror's default factory returns QueueVersion(0, 0); skip
+        # asking until the cloud has actually told us a real version.
+        version = self.qobuz_state.queue_version
+        if version.major == 0 and version.minor == 0:
+            return
+        session = self.bridge.session
+        if session is None:
+            return
+        import uuid as _uuid  # noqa: PLC0415 — defer the import; only used here
+
+        self._asked_queue_state = True
+        self.bridge.logger.debug(
+            "Asking Qobuz cloud for full queue snapshot at qv=%s.%s",
+            self.qobuz_state.queue_version.major,
+            self.qobuz_state.queue_version.minor,
+        )
+        await session.send_ask_for_queue_state(
+            queue_version=self.qobuz_state.queue_version,
+            queue_uuid=_uuid.uuid4().bytes,
+        )
 
     async def handle_queue_state(self, snapshot: QueueStateSnapshot) -> None:
-        """
-        Apply a full ``SRVR_CTRL_QUEUE_STATE`` snapshot to the mirror.
+        """Apply a full ``SRVR_CTRL_QUEUE_STATE`` snapshot to the mirror + MA.
 
-        Phase B: protocol-layer tracking only — we record the authoritative
-        queue contents (replacing any prior list) so MA's mirror stops
-        drifting after a (re)connect. MA-side player-queue reconciliation
-        will land with the Phase C redesign.
+        The snapshot normally lands *after* an earlier ``SET_STATE`` reconcile
+        has already filled MA's queue with just current+next (because the
+        snapshot is the cloud's async response to our ask). Once the full
+        list is on the mirror, fire-and-forget the chunked background
+        preload that extends MA's queue without disrupting playback.
         """
         self.qobuz_state.queue_version = snapshot.queue_version
         self.qobuz_state.tracks = list(snapshot.tracks)
         self.qobuz_state.shuffle_mode = snapshot.shuffle_mode
         self.qobuz_state.autoplay_mode = snapshot.autoplay_mode
+        await self.command_handler.maybe_preload_remaining_tracks()
 
     async def handle_queue_tracks_added(self, event: QueueTracksAddedEvent) -> None:
         """

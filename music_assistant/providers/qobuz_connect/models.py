@@ -82,8 +82,10 @@ class QConnectMessageType(IntEnum):
     SRVR_RNDR_SET_AUTOPLAY_MODE = 47
     CTRL_SRVR_QUEUE_LOAD_TRACKS = 66
     CTRL_SRVR_SET_PLAYER_STATE = 62
+    CTRL_SRVR_ASK_FOR_QUEUE_STATE = 76
     CTRL_SRVR_ASK_FOR_RENDERER_STATE = 77
     CTRL_SRVR_AUTOPLAY_ADD_TRACKS = 79
+    SRVR_CTRL_SESSION_STATE = 81
     SRVR_CTRL_QUEUE_ERROR_MESSAGE = 88
     SRVR_CTRL_QUEUE_CLEARED = 89
     SRVR_CTRL_QUEUE_STATE = 90
@@ -202,6 +204,22 @@ class SetStateEvent:
     queue_version: QueueVersion | None = None
     current_item: QueueTrackRef | None = None
     next_item: QueueTrackRef | None = None
+
+
+@dataclass(slots=True)
+class SessionStateEvent:
+    """Decoded ``SRVR_CTRL_SESSION_STATE`` — the cloud's "you're connected" frame.
+
+    Carries the queue identity (``queue_version``) the receiver must echo
+    when sending ``CTRL_SRVR_ASK_FOR_QUEUE_STATE`` to obtain the full
+    track list, plus the session identifier the controller would need
+    if it ever explicitly asked for renderer state.
+    """
+
+    session_uuid: bytes
+    session_id: int
+    queue_version: QueueVersion
+    track_index: int = 0
 
 
 @dataclass(slots=True)

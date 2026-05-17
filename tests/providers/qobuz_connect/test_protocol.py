@@ -14,10 +14,12 @@ from music_assistant.providers.qobuz_connect.models import (
     QConnectMessageType,
     QueueVersion,
 )
+from music_assistant.providers.qobuz_connect.proto import qconnect_envelope_pb2 as _envelope_pb2
 from music_assistant.providers.qobuz_connect.proto import qconnect_payload_pb2 as _payload_pb2
 from music_assistant.providers.qobuz_connect.protocol import QobuzConnectCodec
 
 payload_pb2: Any = _payload_pb2
+envelope_pb2: Any = _envelope_pb2
 
 DEVICE_UUID = uuid.UUID("11111111-2222-3333-4444-555555555555").bytes
 SESSION_UUID = uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").bytes
@@ -430,3 +432,36 @@ def test_parse_queue_error_and_version_change() -> None:
     version_msg.srvrCtrlQueueVersionChanged.queueVersion.minor = 4
 
     assert QobuzConnectCodec.parse_queue_version_changed(version_msg) == QueueVersion(9, 4)
+
+
+def test_encode_subscribe_channels_session_uuid() -> None:
+    """SUBSCRIBE must carry the session_uuid in channels for the renderer role.
+
+    Empty channels works for controller-role Web Clients (user-login JWT) but
+    the cloud closes our device-session JWT WS with a type-1 ERROR if we
+    SUBSCRIBE with no channels. Confirmed locally May 2026.
+    """
+    codec = QobuzConnectCodec(DEVICE_UUID)
+    frame = codec.encode_subscribe(SESSION_UUID)
+    assert frame[0] == OuterMessageType.SUBSCRIBE.value
+    length, offset = QobuzConnectCodec._decode_varint(frame, 1)
+    subscribe = envelope_pb2.Subscribe()
+    subscribe.ParseFromString(frame[offset : offset + length])
+    assert list(subscribe.channels) == [SESSION_UUID]
+
+
+def test_encode_ask_for_queue_state_round_trip() -> None:
+    """The queue-state ask must echo the queue version + carry the action UUID."""
+    codec = QobuzConnectCodec(DEVICE_UUID)
+    inner = _first_inner_message(
+        codec.encode_ask_for_queue_state(
+            queue_version=QueueVersion(major=17, minor=1),
+            queue_uuid=ACTION_UUID,
+        )
+    )
+    assert inner.messageType == QConnectMessageType.CTRL_SRVR_ASK_FOR_QUEUE_STATE
+    assert inner.HasField("ctrlSrvrAskForQueueState")
+    ask = inner.ctrlSrvrAskForQueueState
+    assert ask.queueVersion.major == 17
+    assert ask.queueVersion.minor == 1
+    assert ask.queueUuid == ACTION_UUID
