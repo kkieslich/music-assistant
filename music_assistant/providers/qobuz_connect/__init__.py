@@ -239,6 +239,8 @@ class QobuzConnectProvider(PluginProvider):
         async with self._ws_setup_lock:
             if self._session is not None:
                 self._session.set_tokens(tokens)
+                await self._broadcast_current_volume()
+                await self._session.send_quality_reports(self._max_quality)
                 return
 
             self._session = QobuzConnectSession(
@@ -282,6 +284,9 @@ class QobuzConnectProvider(PluginProvider):
         """
         if active:
             self.logger.info("Qobuz Connect activated")
+            await self._broadcast_current_volume()
+            if self._session:
+                await self._session.send_quality_reports(self._max_quality)
             return
         self.logger.info("Qobuz Connect deactivated by cloud; releasing MA player")
         player_id = self.get_target_player_id()

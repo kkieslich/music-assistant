@@ -185,6 +185,7 @@ async def test_play_after_paused_seek_resumes_at_pending_position() -> None:
     provider = _FakeProvider(_queue(PlaybackState.PAUSED))
     engine = QobuzConnectSyncEngine(provider)
     engine.pending_paused_seek_ms = 50_000
+    cast("Any", engine)._pending_paused_seek_ref = "11:376286112"
 
     await engine.handle_qobuz_set_state(
         SetStateEvent(
@@ -198,6 +199,58 @@ async def test_play_after_paused_seek_resumes_at_pending_position() -> None:
     assert provider.mass.player_queues.calls == [
         ("play_index", ("player", 0), {"seek_position": 50})
     ]
+
+
+@pytest.mark.asyncio
+async def test_paused_seek_is_not_reused_for_new_track() -> None:
+    """A paused seek belongs to one Qobuz queue item, not the next selected track."""
+    provider = _FakeProvider(_queue(PlaybackState.PAUSED, track_id="old"))
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PAUSED,
+            position_ms=80_000,
+            current_item=QueueTrackRef(queue_item_id=1, track_id="old"),
+        )
+    )
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            current_item=QueueTrackRef(queue_item_id=2, track_id="new"),
+        )
+    )
+
+    assert cast("Any", engine).pending_paused_seek_ms is None
+    assert provider.mass.player_queues.calls[-1] == (
+        "play_index",
+        ("player", 0),
+        {"seek_position": 0},
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_current_item_without_position_starts_at_zero_not_old_position() -> None:
+    """Track changes without currentPosition must not inherit the previous track position."""
+    session = _FakeSession()
+    provider = _FakeProvider(_queue(PlaybackState.PAUSED, track_id="old"), session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=1, track_id="old")
+    engine.qobuz_state.position_ms = 92_000
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            current_item=QueueTrackRef(queue_item_id=2, track_id="new"),
+        )
+    )
+
+    assert session.renderer_states[0]["position_ms"] == 0
+    assert provider.mass.player_queues.calls[-1] == (
+        "play_index",
+        ("player", 0),
+        {"seek_position": 0},
+    )
 
 
 @pytest.mark.asyncio
