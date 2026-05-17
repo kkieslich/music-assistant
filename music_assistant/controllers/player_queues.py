@@ -610,7 +610,6 @@ class PlayerQueuesController(CoreController):
     def clear(self, queue_id: str, skip_stop: bool = False) -> None:
         """Clear all items in the queue."""
         queue = self._queues[queue_id]
-        queue_items = self._queue_items.get(queue_id, []).copy()
         queue.radio_source = []
         if queue.state != PlaybackState.IDLE and not skip_stop:
             self.mass.create_task(self.stop(queue_id))
@@ -619,7 +618,7 @@ class PlayerQueuesController(CoreController):
         queue.elapsed_time = 0
         queue.elapsed_time_last_updated = time.time()
         queue.index_in_buffer = None
-        self.mass.create_task(self._cleanup_queue_audio_data(queue_id, queue_items))
+        self.mass.create_task(self._cleanup_queue_audio_data(queue_id))
         self.update_items(queue_id, [])
 
     @api_command("player_queues/save_as_playlist")
@@ -665,9 +664,8 @@ class PlayerQueuesController(CoreController):
         # Use internal handler to avoid circular redirect:
         # public cmd_stop redirects to queue.stop when a queue is active,
         # which would loop back here indefinitely.
-        queue_items = self._queue_items.get(queue_id, []).copy()
         await self.mass.players._handle_cmd_stop(queue_id)
-        self.mass.create_task(self._cleanup_queue_audio_data(queue_id, queue_items))
+        self.mass.create_task(self._cleanup_queue_audio_data(queue_id))
 
     @api_command("player_queues/play")
     async def play(self, queue_id: str) -> None:
@@ -3259,11 +3257,7 @@ class PlayerQueuesController(CoreController):
                 cleanup_threshold + 1,
             )
 
-    async def _cleanup_queue_audio_data(
-        self,
-        queue_id: str,
-        queue_items: list[QueueItem] | None = None,
-    ) -> None:
+    async def _cleanup_queue_audio_data(self, queue_id: str) -> None:
         """Clean up all audio-related data for a queue when it is stopped or cleared.
 
         This clears:
@@ -3271,12 +3265,10 @@ class PlayerQueuesController(CoreController):
         - Any pending crossfade data for the queue
 
         :param queue_id: The queue ID to clean up.
-        :param queue_items: Optional snapshot of queue items to clean up.
         """
         self.mass.streams.audio.clear_crossfade_data(queue_id)
 
-        if queue_items is None:
-            queue_items = self._queue_items.get(queue_id, [])
+        queue_items = self._queue_items.get(queue_id, [])
         buffers_cleared = 0
 
         for item in queue_items:
