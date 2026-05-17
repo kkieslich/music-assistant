@@ -902,11 +902,19 @@ class CommandHandler:
         Loads the "history" portion of the Qobuz playlist (tracks the user
         has already passed, but which Qobuz still keeps in the queue) so a
         skip-backward inside the same playlist resolves instantly from MA's
-        loaded queue instead of triggering a fresh load. Each insert call
-        uses ``insert_at_index=0`` with ``keep_played=True`` /
-        ``keep_remaining=True``, which leaves the currently-playing item's
-        audio stream untouched — MA's ``current_index`` shifts up
-        internally as the front grows.
+        loaded queue.
+
+        Chunks are inserted **front-to-back**: chunk 1 goes in at index 0,
+        chunk 2 at index ``len(chunk1)``, etc. That gives a natural
+        left-to-right fill in MA's UI during the initial load (when the
+        Qobuz metadata cache is still cold) instead of the reverse
+        "items appearing from the end and pushing earlier items in front"
+        UX that back-to-front iteration produced.
+
+        Each insert call uses ``insert_at_index=<offset>`` with
+        ``keep_played=True`` / ``keep_remaining=True``, which leaves the
+        currently-playing item's audio stream untouched — MA's
+        ``current_index`` shifts up internally as the front grows.
         """
         engine = self._engine
         logger = engine.bridge.logger
@@ -926,15 +934,12 @@ class CommandHandler:
             track_id = engine.bridge.qobuz_track_id_for(item)
             if track_id:
                 existing_ids.add(track_id)
-        # Iterate chunks back-to-front so the final MA order matches the
-        # snapshot: each chunk goes in at index 0, so the *last* chunk
-        # processed (= snapshot[0..]) ends up at the absolute front.
-        for chunk_end in range(len(history), 0, -PRELOAD_CHUNK_SIZE):
+        inserted_so_far = 0
+        for chunk_start in range(0, len(history), PRELOAD_CHUNK_SIZE):
             if not engine._is_current_command(generation):
                 logger.debug("MA reconcile bailing during history-add: superseded")
                 return
-            chunk_start = max(0, chunk_end - PRELOAD_CHUNK_SIZE)
-            chunk_refs = history[chunk_start:chunk_end]
+            chunk_refs = history[chunk_start : chunk_start + PRELOAD_CHUNK_SIZE]
             pending_refs = [ref for ref in chunk_refs if ref.track_id not in existing_ids]
             if not pending_refs:
                 continue
@@ -954,8 +959,9 @@ class CommandHandler:
             await engine.bridge.insert_items(
                 player_id,
                 queue_items,
-                insert_at_index=0,
+                insert_at_index=inserted_so_far,
                 keep_played=True,
                 keep_remaining=True,
             )
+            inserted_so_far += len(queue_items)
             await asyncio.sleep(0)
