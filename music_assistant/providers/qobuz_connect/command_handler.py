@@ -738,25 +738,31 @@ class CommandHandler:
             )
             return
 
-        # Resolve metadata for tracks in mirror but not yet in MA. Chunked
-        # only to bound parallelism against the Qobuz API; the chunks
-        # accumulate in memory and there are no MA mutations between them.
-        missing_track_ids = [
-            ref.track_id for ref in mirror_tracks if not ma_by_track_id.get(ref.track_id)
+        # Count occurrences per track_id on both sides. Playlists can
+        # legitimately contain the same track at multiple positions, and
+        # each MA slot must be a separate ``QueueItem`` instance (MA's
+        # ``queue_item_id`` is unique per slot). Without this we'd silently
+        # drop every duplicate past the first — the user reported a
+        # ``mirror=504, ma=500`` divergence after reorders, which then
+        # made the outbound differ fall into the "complex reorder"
+        # branch and bail.
+        mirror_counts: dict[str, int] = {}
+        for ref in mirror_tracks:
+            mirror_counts[ref.track_id] = mirror_counts.get(ref.track_id, 0) + 1
+        ma_counts: dict[str, int] = {tid: len(items) for tid, items in ma_by_track_id.items()}
+
+        # One metadata fetch per unique track_id where mirror outnumbers
+        # MA — we'll mint duplicate ``QueueItem`` instances from the same
+        # resolved metadata.
+        unique_to_resolve = [
+            tid for tid, count in mirror_counts.items() if count > ma_counts.get(tid, 0)
         ]
         resolved_by_track_id: dict[str, Any] = {}
-        seen_missing: set[str] = set()
-        unique_missing: list[str] = []
-        for tid in missing_track_ids:
-            if tid in seen_missing:
-                continue
-            seen_missing.add(tid)
-            unique_missing.append(tid)
-        for chunk_start in range(0, len(unique_missing), PRELOAD_CHUNK_SIZE):
+        for chunk_start in range(0, len(unique_to_resolve), PRELOAD_CHUNK_SIZE):
             if not engine._is_current_command(generation):
                 logger.debug("MA reconcile bailing during metadata resolve: superseded")
                 return
-            chunk = unique_missing[chunk_start : chunk_start + PRELOAD_CHUNK_SIZE]
+            chunk = unique_to_resolve[chunk_start : chunk_start + PRELOAD_CHUNK_SIZE]
             resolved = await asyncio.gather(
                 *[engine.metadata.get_track_or_none(tid) for tid in chunk],
             )
