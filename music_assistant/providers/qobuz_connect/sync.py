@@ -53,7 +53,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-import uuid
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.enums import PlaybackState as MAPlaybackState
@@ -82,6 +81,7 @@ from .models import (
     SetStateEvent,
 )
 from .outbound_reporter import OutboundReporter
+from .queue_loader import QueueLoader
 from .seek_pipeline import SEEK_TOLERANCE_MS, SeekPipeline
 from .state import (
     PausedSeek,
@@ -115,6 +115,8 @@ class QobuzConnectSyncEngine:
         self.seek_pipeline = SeekPipeline(self)
         # MA-track-metadata lookups + fail-cache.
         self.metadata = MetadataResolver(self)
+        # MA→Qobuz queue-load round-trip.
+        self.queue_loader = QueueLoader(self)
         self.qobuz_state = QobuzMirror()
         # Pending-action ephemeral state, grouped into typed dataclasses
         # (see state.py). Each ``None`` means "no pending action of this
@@ -124,8 +126,6 @@ class QobuzConnectSyncEngine:
         self.qobuz_position: PendingQobuzPosition | None = None
         self.origin: Origin | None = None
         self._last_prequeued_next_ref: TrackRefKey | None = None
-        self._prequeued_qobuz_items: dict[str, list[int]] = {}
-        self._synthetic_queue_item_id = 1_000_000
         self._pending_queue_loads: dict[
             bytes, asyncio.Future[QueueLoadAck | QueueError | None]
         ] = {}
@@ -171,7 +171,6 @@ class QobuzConnectSyncEngine:
         self._cancel_metadata_task()
         self.seek_pipeline.cancel_pending_seek()
         self.reporter.cancel_buffering_reporter()
-        self._prequeued_qobuz_items.clear()
         self._last_prequeued_next_ref = None
         self._last_ma_origin_track_id = None
         self.metadata.clear_unresolvable_cache()
@@ -240,7 +239,7 @@ class QobuzConnectSyncEngine:
         if self._last_ma_origin_track_id == track_id:
             return
         self._last_ma_origin_track_id = track_id
-        await self._send_ma_origin_queue_load(track_id, queue)
+        await self.queue_loader.send_ma_origin_load(track_id, queue)
 
     async def handle_queue_load_ack(self, ack: QueueLoadAck) -> None:
         """Handle Qobuz queue-load acknowledgement."""
@@ -730,114 +729,6 @@ class QobuzConnectSyncEngine:
             option=QueueOption.REPLACE_NEXT,
         )
         self._last_prequeued_next_ref = next_ref
-        self._prequeued_qobuz_items.setdefault(item.track_id, []).append(item.queue_item_id)
-
-    async def _send_ma_origin_queue_load(self, track_id: str, queue: Any) -> None:
-        session = self.bridge.session
-        if not session:
-            return
-        queue_version = QueueVersion(
-            self.qobuz_state.queue_version.major,
-            self.qobuz_state.queue_version.minor,
-        )
-        action_uuid = uuid.uuid4().bytes
-        future: asyncio.Future[QueueLoadAck | QueueError | None] = (
-            asyncio.get_running_loop().create_future()
-        )
-        self._pending_queue_loads[action_uuid] = future
-        if self._try_parse_qobuz_id(track_id) is None:
-            self._pending_queue_loads.pop(action_uuid, None)
-            self._last_ma_origin_track_id = None
-            self.bridge.logger.debug(
-                "MA-to-Qobuz queue load unsupported for track %s: no numeric Qobuz track id",
-                track_id,
-            )
-            return
-        self.bridge.logger.debug(
-            "Trying MA-to-Qobuz QWeb-style queue load for track %s with queue version %s.%s",
-            track_id,
-            queue_version.major,
-            queue_version.minor,
-        )
-        await session.send_queue_load_tracks(
-            action_uuid=action_uuid,
-            track_id=track_id,
-            queue_version=queue_version,
-            context_uuid=self._context_uuid_for_ma_origin_load(),
-            qweb_track_session=True,
-        )
-        try:
-            result = await asyncio.wait_for(future, timeout=MA_QUEUE_LOAD_ACK_TIMEOUT)
-        except TimeoutError:
-            self._pending_queue_loads.pop(action_uuid, None)
-            self._last_ma_origin_track_id = None
-            self.bridge.logger.warning(
-                "MA-to-Qobuz queue load unsupported by current session for track %s",
-                track_id,
-            )
-            result = None
-        if isinstance(result, QueueLoadAck):
-            self.qobuz_state.playing_state = (
-                PlayingState.PLAYING
-                if queue.state == MAPlaybackState.PLAYING
-                else PlayingState.PAUSED
-            )
-            self._set_buffer_ok()
-            await self.report_state()
-        elif isinstance(result, QueueError):
-            if result.message != "Le tableau d'octets doit avoir une longueur de 16":
-                self._last_ma_origin_track_id = None
-
-    async def _qobuz_queue_item_id_for_track(self, track_id: str) -> int:
-        if queue_item_ids := self._prequeued_qobuz_items.get(track_id):
-            queue_item_id = queue_item_ids.pop(0)
-            if not queue_item_ids:
-                self._prequeued_qobuz_items.pop(track_id, None)
-            return queue_item_id
-        self._synthetic_queue_item_id += 1
-        return self._synthetic_queue_item_id
-
-    async def _qobuz_queue_load_context(self, track_id: str) -> tuple[int, int] | None:
-        """Resolve Qobuz queue load context reference and item position for a track."""
-        try:
-            track = await self.metadata.get_track(track_id)
-            album = getattr(track, "album", None)
-            album_id = getattr(album, "item_id", None)
-            if not (numeric_album_id := self._try_parse_qobuz_id(album_id)):
-                return None
-            album_tracks = await self.bridge.qobuz_music_provider().get_album_tracks(str(album_id))
-            for index, album_track in enumerate(album_tracks):
-                if str(album_track.item_id) == track_id:
-                    return numeric_album_id, index
-            position = max(0, int(getattr(track, "track_number", 1) or 1) - 1)
-            return numeric_album_id, position
-        except Exception:
-            self.bridge.logger.debug(
-                "Could not resolve Qobuz album context for MA-origin track %s",
-                track_id,
-                exc_info=True,
-            )
-            return None
-
-    @staticmethod
-    def _try_parse_qobuz_id(value: Any) -> int | None:
-        """Return an integer Qobuz id when the protocol can represent the value."""
-        if value is None:
-            return None
-        try:
-            return int(str(value))
-        except (TypeError, ValueError):
-            return None
-
-    def _context_uuid_for_ma_origin_load(self) -> bytes:
-        """Return a valid context UUID for controller queue-load commands."""
-        current_item = self.qobuz_state.current_item
-        if current_item and current_item.context_uuid and len(current_item.context_uuid) == 16:
-            return current_item.context_uuid
-        next_item = self.qobuz_state.next_item
-        if next_item and next_item.context_uuid and len(next_item.context_uuid) == 16:
-            return next_item.context_uuid
-        return uuid.uuid4().bytes
 
     async def _sync_mirror_from_ma_queue(self, queue: Any) -> None:
         ma_track_id = self.bridge.qobuz_track_id_for(queue.current_item)
