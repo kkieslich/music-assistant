@@ -2510,6 +2510,51 @@ async def test_ma_event_during_qobuz_origin_does_not_emit_to_cloud() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ma_items_event_during_active_reconcile_does_not_emit() -> None:
+    """While the MA-reconcile task is in flight, the outbound differ stays silent.
+
+    MA's queue diverges from the mirror mid-reconcile (we're surgically
+    adding/removing items to catch up). A ``QUEUE_ITEMS_UPDATED`` event in
+    that window must not be interpreted as a user edit — the version-
+    mismatch error the user saw in production traces back to this
+    feedback loop firing a stale-version ``REMOVE_TRACKS`` to the cloud.
+    """
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.queue_version = QueueVersion(major=60, minor=0)
+    engine.qobuz_state.tracks = [
+        QueueTrackRef(queue_item_id=1, track_id="t1"),
+        QueueTrackRef(queue_item_id=2, track_id="t2"),
+    ]
+    provider.mass.player_queues.queue_items = []
+
+    handler = cast("Any", engine).command_handler
+    never_completes: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    async def _stay_in_flight() -> None:
+        await never_completes
+
+    handler._preload_task = asyncio.create_task(_stay_in_flight())
+    try:
+        assert handler.is_reconciling() is True, (
+            "is_reconciling() must report True while a preload (MA-reconcile) task is in flight"
+        )
+        await engine.handle_ma_queue_items_updated(_ma_items_event("player", []))
+        assert session.queue_removes == [], (
+            "Outbound differ must skip MA events while the reconciler is in flight"
+        )
+        assert session.clear_queues == [], (
+            "Outbound differ must skip MA events while the reconciler is in flight"
+        )
+    finally:
+        never_completes.set_result(None)
+        with contextlib.suppress(asyncio.CancelledError):
+            await handler._preload_task
+
+
+@pytest.mark.asyncio
 async def test_outbound_action_uuid_echo_skips_reconciler() -> None:
     """Cloud echoing back our own action_uuid must not re-trigger MA reconcile."""
     session = _FakeSession()

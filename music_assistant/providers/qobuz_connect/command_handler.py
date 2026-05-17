@@ -122,8 +122,16 @@ class CommandHandler:
                 self._schedule_metadata_update(event, generation)
 
     def is_reconciling(self) -> bool:
-        """Return whether MA is still catching up to the latest Qobuz command."""
-        return self._reconcile_task is not None and not self._reconcile_task.done()
+        """Return whether MA is still catching up to the latest Qobuz command.
+
+        Covers both the per-SET_STATE reconcile task and the snapshot-driven
+        MA-reconcile task (formerly the preload). Both can have MA's queue
+        in a transient state diverged from the mirror; outbound MA→Qobuz
+        differs must not run while either is in flight.
+        """
+        return (self._reconcile_task is not None and not self._reconcile_task.done()) or (
+            self._preload_task is not None and not self._preload_task.done()
+        )
 
     def reset_reconcile_dedup(self) -> None:
         """Clear the reconcile dedup ref — call after deactivation."""
@@ -632,11 +640,22 @@ class CommandHandler:
         """
         engine = self._engine
         logger = engine.bridge.logger
+        # All MA mutations the reconciler triggers fire ``QUEUE_ITEMS_UPDATED``
+        # events. Wrap the whole task body in ``Origin.QOBUZ`` so the outbound
+        # MA→Qobuz differ recognizes those events as cloud-originated and skips
+        # them. Without this, the differ would observe MA being "behind" the
+        # mirror mid-reconcile and emit a wrong-direction
+        # ``CTRL_SRVR_QUEUE_REMOVE_TRACKS`` with a stale version, which the
+        # cloud rejects.
+        from .models import Origin  # noqa: PLC0415
+        from .state import origin_scope  # noqa: PLC0415 — break import cycle
+
         try:
-            if not await self._reconcile_remove_stale(player_id, generation):
-                return
-            await self._reconcile_add_missing(player_id, current_item, generation)
-            await self._reconcile_add_history(player_id, current_item, generation)
+            async with origin_scope(engine, Origin.QOBUZ):
+                if not await self._reconcile_remove_stale(player_id, generation):
+                    return
+                await self._reconcile_add_missing(player_id, current_item, generation)
+                await self._reconcile_add_history(player_id, current_item, generation)
         except asyncio.CancelledError:
             raise
         except PlayerUnavailableError as err:
