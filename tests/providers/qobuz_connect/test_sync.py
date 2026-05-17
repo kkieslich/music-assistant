@@ -2779,6 +2779,108 @@ async def test_ma_backward_reorder_sends_reorder_tracks_to_cloud() -> None:
 
 
 @pytest.mark.asyncio
+async def test_outbound_reorder_echo_does_not_retrigger_reconciler() -> None:
+    """Cloud echoing back our own REORDER_TRACKS must absorb the new qv silently."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.queue_version = QueueVersion(major=58, minor=0)
+    engine.qobuz_state.tracks = [
+        QueueTrackRef(queue_item_id=1, track_id="t1"),
+        QueueTrackRef(queue_item_id=2, track_id="t2"),
+        QueueTrackRef(queue_item_id=3, track_id="t3"),
+    ]
+
+    action_uuid = engine.register_outbound_action(
+        OutboundActionKind.REORDER, QueueVersion(major=58, minor=0)
+    )
+    # Optimistic mirror update — what _emit_reorder_tracks would have done.
+    engine.qobuz_state.tracks = [
+        QueueTrackRef(queue_item_id=1, track_id="t1"),
+        QueueTrackRef(queue_item_id=3, track_id="t3"),
+        QueueTrackRef(queue_item_id=2, track_id="t2"),
+    ]
+
+    # Cloud's echo of our reorder with the new bumped version.
+    await engine.handle_queue_tracks_reordered(
+        QueueTracksReorderedEvent(
+            queue_version=QueueVersion(major=58, minor=1),
+            action_uuid=action_uuid,
+            queue_item_ids=[2],
+            insert_after=2,
+        )
+    )
+
+    assert engine.qobuz_state.queue_version == QueueVersion(major=58, minor=1), (
+        "Echo must absorb the cloud's new version"
+    )
+    assert [r.queue_item_id for r in engine.qobuz_state.tracks] == [1, 3, 2], (
+        "Mirror order must stay as the optimistic update; echo is a no-op"
+    )
+    handler = cast("Any", engine).command_handler
+    assert handler._preload_task is None, "Echo must not trigger the reconciler"
+
+
+@pytest.mark.asyncio
+async def test_outbound_action_error_resyncs_via_ask_for_queue_state() -> None:
+    """Cloud-rejected REORDER triggers a fresh ASK_FOR_QUEUE_STATE to recover."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.queue_version = QueueVersion(major=60, minor=15)
+    action_uuid = engine.register_outbound_action(
+        OutboundActionKind.REORDER, QueueVersion(major=60, minor=15)
+    )
+
+    await engine.handle_queue_error(
+        QueueError(
+            action_uuid=action_uuid,
+            queue_version=QueueVersion(major=60, minor=16),
+            code="ERROR_QUEUE_REORDER_TRACKS",
+            message="Queue version mismatch",
+        )
+    )
+
+    assert engine.qobuz_state.queue_version == QueueVersion(major=60, minor=16), (
+        "Mirror version must absorb the cloud's reported current version"
+    )
+    assert len(session.queue_state_asks) == 1, (
+        f"Error from our own action must trigger a snapshot re-ask; "
+        f"got asks={session.queue_state_asks}"
+    )
+    assert engine.consume_outbound_action(action_uuid) is None, (
+        "Ledger entry for the rejected action must be cleared"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unrelated_error_does_not_resync() -> None:
+    """Errors not tied to our ledger don't trigger our recovery path."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.queue_version = QueueVersion(major=60, minor=15)
+    # Mark already-asked at 60.16 so a real re-ask would be observable.
+    engine._last_asked_qv = (60, 16)
+
+    await engine.handle_queue_error(
+        QueueError(
+            action_uuid=b"\xde" * 16,  # not in our ledger
+            queue_version=QueueVersion(major=60, minor=16),
+            code="ERROR_QUEUE_REMOVE_TRACKS",
+            message="Queue version mismatch",
+        )
+    )
+
+    assert session.queue_state_asks == [], (
+        "Errors for actions we didn't initiate must not trigger a recovery ask"
+    )
+
+
+@pytest.mark.asyncio
 async def test_ma_complex_reorder_skips_outbound_emit() -> None:
     """Two-item reorders are not yet supported — the differ logs and skips."""
     session = _FakeSession()

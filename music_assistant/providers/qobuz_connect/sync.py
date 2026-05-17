@@ -580,7 +580,22 @@ class QobuzConnectSyncEngine:
             await self.report_state()
 
     async def handle_queue_error(self, error: QueueError) -> None:
-        """Handle Qobuz queue command error."""
+        """Handle Qobuz queue command error and resync if it was one of ours.
+
+        The cloud rejects ``CTRL_SRVR_QUEUE_*`` commands when their
+        ``queue_version`` is stale — typically because a natural track
+        advance bumped the cloud's version between the moment we computed
+        ours and the moment the message arrived. Our mirror is then
+        optimistically updated but the cloud is not, so MA's local state
+        will silently revert on the next inbound snapshot.
+
+        Recovery: drop the ledger entry, absorb the cloud's reported version,
+        and ask for a fresh snapshot. The inbound reconciler will align MA
+        back to the cloud's authoritative state. The user's reorder is lost
+        on the rejected attempt — they can retry; subsequent attempts will
+        carry the newer version and succeed.
+        """
+        was_our_action = self.consume_outbound_action(error.action_uuid) is not None
         if error.queue_version:
             self.qobuz_state.queue_version = error.queue_version
         if future := self._pending_queue_loads.pop(error.action_uuid, None):
@@ -593,6 +608,11 @@ class QobuzConnectSyncEngine:
             error.queue_version.major if error.queue_version else "?",
             error.queue_version.minor if error.queue_version else "?",
         )
+        if was_our_action:
+            # Re-ask for the cloud's current snapshot so the inbound
+            # reconciler can drag MA's optimistically-updated queue back
+            # in line with the cloud's authoritative view.
+            await self.maybe_ask_for_queue_state()
 
     async def handle_queue_version(self, version: QueueVersion) -> None:
         """Remember Qobuz queue version changes."""
@@ -716,13 +736,14 @@ class QobuzConnectSyncEngine:
                     break
 
     async def handle_queue_tracks_reordered(self, event: QueueTracksReorderedEvent) -> None:
-        """Apply a ``SRVR_CTRL_QUEUE_TRACKS_REORDERED`` delta, then reconcile MA.
-
-        Note: the reconciler currently only adds missing items and removes
-        stale ones — pure-reorder events (same set, different order) leave
-        MA's queue order untouched in Pass 2a. Full position alignment lands
-        with the positional-insert pass.
-        """
+        """Apply a ``SRVR_CTRL_QUEUE_TRACKS_REORDERED`` delta, then reconcile MA."""
+        echo = self.consume_outbound_action(event.action_uuid)
+        if echo is not None:
+            # We originated this reorder — mirror was already updated
+            # optimistically when we emitted. Just absorb the cloud-assigned
+            # new version and skip the reconciler.
+            self.qobuz_state.queue_version = event.queue_version
+            return
         self.qobuz_state.queue_version = event.queue_version
         ids_to_move = list(event.queue_item_ids)
         id_to_track = {track.queue_item_id: track for track in self.qobuz_state.tracks}
