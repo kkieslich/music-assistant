@@ -1,24 +1,19 @@
 """
 Single seam between the sync engine and the Music Assistant world.
 
-Why this exists: the sync engine used to reach into the provider object
-~40 times directly — ``provider.get_target_player_id()``,
-``provider.get_qobuz_track_id_from_queue_item()``,
-``provider.qobuz_session``, ``provider.logger``, etc. — across hundreds
-of lines. Tests had to stand up a fake provider whose surface matched
-every one of those calls.
+After Phase C, every MA-world touch in :mod:`.sync` goes through this
+class — both the provider-facing accessors (``provider.logger``,
+``provider.qobuz_session``, ``provider.get_target_player_id()`` …) and
+the MA-core operations (``mass.player_queues.play_index``,
+``mass.players.cmd_volume_set`` …). The sync engine no longer holds a
+direct ``self.mass`` reference and reaches into the provider only via
+``self.bridge``.
 
-The bridge collects the provider-facing accessors behind a small typed
-interface. Future stages of the Phase C redesign will:
+That seam pays off in two places:
 
-- expand the bridge to wrap MA-core operations
-  (``mass.player_queues.play_index``, ``mass.players.cmd_volume_set``, ...)
-  so sync.py stops touching ``mass`` directly;
-- replace it with an abstract base in tests so a single ``FakeMABridge``
-  fixture covers every sync handler.
-
-For now it is intentionally a thin delegating layer: same behavior as
-before, just one place to find every provider-level call.
+- tests no longer stand up a fake provider mirroring every method-name
+  in MA's surface; a single ``FakeMABridge`` fixture covers it;
+- changes to MA's API only need to be reflected in one file.
 
 Stays MA-free at the type level — runtime accesses are typed ``Any`` so
 adding this module doesn't pull MA-specific imports into the sync
@@ -79,3 +74,55 @@ class MABridge:
     def qobuz_track_id_for(self, queue_item: Any) -> str | None:
         """Extract the Qobuz track id from an MA queue item, if present."""
         return cast("str | None", self._provider.get_qobuz_track_id_from_queue_item(queue_item))
+
+    # ---- MA player-queue operations -------------------------------------
+
+    def get_queue(self, player_id: str | None) -> Any | None:
+        """Return the MA player-queue for ``player_id`` (or ``None``)."""
+        if not player_id:
+            return None
+        return self._provider.mass.player_queues.get(player_id)
+
+    async def play(self, player_id: str) -> None:
+        """Resume playback on the target player."""
+        await self._provider.mass.player_queues.play(player_id)
+
+    async def pause(self, player_id: str) -> None:
+        """Pause playback on the target player."""
+        await self._provider.mass.player_queues.pause(player_id)
+
+    async def stop_queue(self, player_id: str) -> None:
+        """Stop playback on the target player."""
+        await self._provider.mass.player_queues.stop(player_id)
+
+    async def seek(self, player_id: str, position: int) -> None:
+        """Seek the target player to a given position (in seconds)."""
+        await self._provider.mass.player_queues.seek(player_id, position)
+
+    async def play_index(self, player_id: str, index: int, **kwargs: Any) -> None:
+        """Start a specific queue index on the target player."""
+        await self._provider.mass.player_queues.play_index(player_id, index, **kwargs)
+
+    async def play_media(self, player_id: str, media: Any, **kwargs: Any) -> None:
+        """Play / enqueue media on the target player."""
+        await self._provider.mass.player_queues.play_media(
+            queue_id=player_id, media=media, **kwargs
+        )
+
+    async def load_queue(self, player_id: str, queue_items: list[Any], **kwargs: Any) -> None:
+        """Replace the target player's queue with the given items."""
+        await self._provider.mass.player_queues.load(player_id, queue_items, **kwargs)
+
+    def clear_queue(self, player_id: str, *, skip_stop: bool = False) -> None:
+        """Clear the target player's queue."""
+        self._provider.mass.player_queues.clear(player_id, skip_stop=skip_stop)
+
+    # ---- MA player operations -------------------------------------------
+
+    def get_player(self, player_id: str) -> Any | None:
+        """Return the MA player object for ``player_id`` (or ``None``)."""
+        return self._provider.mass.players.get_player(player_id)
+
+    async def cmd_volume_set(self, player_id: str, volume: int) -> None:
+        """Set the player's volume."""
+        await self._provider.mass.players.cmd_volume_set(player_id, volume)
