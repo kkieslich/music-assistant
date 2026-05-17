@@ -54,6 +54,7 @@ message tables and the glossary.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -134,6 +135,14 @@ class QobuzConnectSyncEngine:
         ] = {}
         self._last_ma_origin_track_id: str | None = None
         self._command_generation = 0
+        # Tracks whether the Qobuz cloud has us as the active renderer. False
+        # between SRVR_RNDR_SET_ACTIVE(false) and the next ...(true). While
+        # inactive we silence outbound MA-origin echoes so we don't push
+        # queue loads at a session the cloud no longer expects us to drive.
+        # Defaults to True: the heartbeat starts on provider load before any
+        # SET_ACTIVE arrives, and pre-Qobuz MA playback should still be able
+        # to register with the cloud once a session opens.
+        self._is_active = True
 
     @property
     def pending_paused_seek_ms(self) -> int | None:
@@ -160,8 +169,11 @@ class QobuzConnectSyncEngine:
 
         Keeps the heartbeat running so we can resume cleanly when the cloud
         reactivates us, but drops anything that was specific to the previous
-        playback session.
+        playback session. Use :meth:`release_target_player` instead from the
+        provider's deactivation handler — that method also stops and clears
+        the underlying MA queue.
         """
+        self._is_active = False
         self.qobuz_state = QobuzMirror()
         self.paused_seek = None
         self.qobuz_position = None
@@ -174,6 +186,33 @@ class QobuzConnectSyncEngine:
         self._last_ma_origin_track_id = None
         self.metadata.clear_unresolvable_cache()
 
+    def set_active(self, *, active: bool) -> None:
+        """Toggle the engine's "Qobuz cloud says we're the active renderer" flag."""
+        self._is_active = active
+
+    async def release_target_player(self) -> None:
+        """
+        Hand the target player back to the user — stop playback + clear queue.
+
+        Sequence matters here:
+        1. Reset our mirror + cancel async tasks *first* so any heartbeat or
+           in-flight reconcile racing during the stop/clear can't push a
+           stale "still playing" frame back to the Qobuz cloud (observed in
+           the May 2026 log as two extra ``Qobuz report state=2`` lines
+           emitted between the deactivation log and the actual stop).
+        2. Stop the MA queue so the audio stream tears down cleanly.
+        3. Clear the MA queue so the next time the user opens MA the old
+           Qobuz Connect tracks aren't sitting there orphaned.
+        """
+        player_id = self.bridge.target_player_id()
+        self.reset_for_deactivation()
+        if not player_id:
+            return
+        with contextlib.suppress(Exception):
+            await self.bridge.stop_queue(player_id)
+        with contextlib.suppress(Exception):
+            self.bridge.clear_queue(player_id, skip_stop=True)
+
     async def handle_qobuz_set_state(self, event: SetStateEvent) -> None:
         """Apply a full Qobuz SET_STATE event to MA (delegates)."""
         await self.command_handler.handle_set_state(event)
@@ -181,6 +220,12 @@ class QobuzConnectSyncEngine:
     async def handle_ma_queue_event(self, event: MassEvent) -> None:
         """React to MA queue updates that were not caused by Qobuz commands."""
         if self.origin == Origin.QOBUZ:
+            return
+        if not self._is_active:
+            # The cloud told us we're no longer the active renderer. The
+            # post-deactivation ``stop`` and ``clear`` themselves emit MA
+            # queue events that would otherwise echo back to the cloud as
+            # MA-origin queue loads, undoing the handoff.
             return
         player_id = self.bridge.target_player_id()
         if not player_id or event.object_id != player_id:
