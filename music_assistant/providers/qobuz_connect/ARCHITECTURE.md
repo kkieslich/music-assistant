@@ -102,21 +102,56 @@ dispatched in [`session.py`](session.py) and handled in [`sync.py`](sync.py):
 
 ### Known gaps (Phase B targets)
 
-The Qobuz app emits several more `SRVR_CTRL_*` messages we currently
-**ignore** — they exist in `qconnect_queue.proto` but have no decoder
-branch and no handler:
+Validated against the full bidirectional captures under
+[`tests/providers/qobuz_connect/protocol_capture/.runs/`](../../../tests/providers/qobuz_connect/protocol_capture/.runs/).
+Tier 1 is the set the captures *prove* matter; Tier 2 are proto-defined
+messages the Qobuz app *will* emit on flows we haven't captured yet
+(insert/remove/reorder via specific UI paths, clear from another client).
 
-| Type    | Defined in proto?            | Currently handled? | Symptom when ignored                                              |
-|---------|------------------------------|--------------------|-------------------------------------------------------------------|
-| `SRVR_CTRL_QUEUE_TRACKS_INSERTED` | ✅ `qconnect_queue.proto` | ❌                  | Queue silently drifts on insert                                   |
-| `SRVR_CTRL_QUEUE_TRACKS_ADDED`    | ✅                          | ❌                  | Tracks added in the Qobuz app never appear in MA                  |
-| `SRVR_CTRL_QUEUE_TRACKS_REMOVED`  | ✅                          | ❌                  | Removals don't reflect in MA                                       |
-| `SRVR_CTRL_QUEUE_TRACKS_REORDERED`| ✅                          | ❌                  | Reorders silently drift until next full state report               |
-| `SRVR_CTRL_QUEUE_CLEARED`         | ✅                          | ❌                  | MA keeps playing the orphaned current track                        |
-| `RNDR_SRVR_VOLUME_MUTED` (type 29)| ✅ `qconnect_payload.proto` | ❌ outbound only   | Mute toggles in the app are not reported back                       |
+**Tier 1 — directly observed in captures, must be handled:**
 
-These gaps are addressed in Phase B, using bytes from
-[`proto/captured/full/`](proto/captured/) as ground-truth fixtures.
+| Type ID | Name                                 | Direction | Symptom when ignored                                                          |
+|--------:|--------------------------------------|-----------|-------------------------------------------------------------------------------|
+|      90 | `SRVR_CTRL_QUEUE_STATE`              | inbound   | **Most critical.** Full queue snapshot the cloud pushes on every (re)connect and on `CTRL_SRVR_ASK_FOR_QUEUE_STATE`. Without it, MA cannot authoritatively rebuild queue state after the WS reconnects. |
+|      93 | `SRVR_CTRL_QUEUE_TRACKS_ADDED`       | inbound   | Tracks added in the Qobuz app silently drift                                  |
+|      45 | `SRVR_RNDR_SET_LOOP_MODE`            | inbound   | Repeat-mode toggles in the Qobuz app never reach MA                           |
+|      46 | `SRVR_RNDR_SET_SHUFFLE_MODE`         | inbound   | Shuffle toggles in the Qobuz app never reach MA                               |
+|      47 | `SRVR_RNDR_SET_AUTOPLAY_MODE`        | inbound   | Autoplay setting can't be controlled from the Qobuz app                       |
+|      10 | `DISCONNECT` (outer envelope)        | inbound   | Cloud-initiated disconnects (renderer-replaced, token expiry) silently drop the session instead of reconnecting cleanly |
+|      29 | `RNDR_SRVR_VOLUME_MUTED`             | outbound  | MA never tells the cloud when the target player gets muted                    |
+
+**Tier 2 — defined in proto, expected on flows we haven't captured yet:**
+
+| Type ID | Name                                  | Symptom when ignored                                  |
+|--------:|---------------------------------------|-------------------------------------------------------|
+|      92 | `SRVR_CTRL_QUEUE_TRACKS_INSERTED`     | Queue drift on insert-at-position                     |
+|      94 | `SRVR_CTRL_QUEUE_TRACKS_REMOVED`      | Removals don't reflect in MA                          |
+|      95 | `SRVR_CTRL_QUEUE_TRACKS_REORDERED`    | Reorders drift until the next full QUEUE_STATE        |
+|      89 | `SRVR_CTRL_QUEUE_CLEARED`             | MA keeps playing the now-orphaned current track       |
+
+**Tier 3 — explicitly benign, but must be acknowledged (not fall through unhandled):**
+
+A class of `SRVR_CTRL_*` broadcasts shows up on our WebSocket because of
+how Qobuz routes subscriptions: messages about *other* renderers'
+state-changes get sent to us too. They require no MA action — the right
+behavior is to log them at debug and move on:
+
+`SRVR_CTRL_SESSION_STATE` (81), `SRVR_CTRL_RENDERER_STATE_UPDATED` (82),
+`SRVR_CTRL_ADD_RENDERER` (83), `SRVR_CTRL_UPDATE_RENDERER` (84),
+`SRVR_CTRL_REMOVE_RENDERER` (85), `SRVR_CTRL_ACTIVE_RENDERER_CHANGED`
+(86), `SRVR_CTRL_VOLUME_CHANGED` (87), `SRVR_CTRL_VOLUME_MUTED` (98),
+`SRVR_CTRL_MAX_AUDIO_QUALITY_CHANGED` (99),
+`SRVR_CTRL_FILE_AUDIO_QUALITY_CHANGED` (100),
+`SRVR_CTRL_LOOP_MODE_SET` (97).
+
+**Known parse anomaly:** one 82-byte PAYLOAD frame in
+`queue_mutations__client_b.json` (frame index 30) fails to parse as a
+`QConnectBatch`. Possibly a partial transmission or non-batch control
+message. Defer investigation to Phase C; for now the dispatcher should
+log and continue rather than crash.
+
+Phase B uses bytes from the captures as ground-truth fixtures for
+decoder round-trip tests.
 
 ## Outbound messages (this provider → Qobuz)
 
