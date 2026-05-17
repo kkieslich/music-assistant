@@ -2665,8 +2665,9 @@ async def test_ma_removed_track_sends_queue_remove_tracks_to_cloud() -> None:
     assert payload["queue_item_ids"] == [2], (
         f"Outbound REMOVE must carry the Qobuz queue_item_id; got {payload}"
     )
-    assert payload["queue_version"].minor == 1, (
-        f"Mirror version must bump optimistically; got {payload['queue_version']}"
+    assert (payload["queue_version"].major, payload["queue_version"].minor) == (52, 0), (
+        f"Outbound REMOVE must assert the current mirror version (cloud increments); "
+        f"got {payload['queue_version']}"
     )
     # Mirror optimistically applies the removal so the next reconcile is a no-op.
     assert all(ref.queue_item_id != 2 for ref in engine.qobuz_state.tracks), (
