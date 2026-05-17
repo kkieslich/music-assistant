@@ -1,51 +1,58 @@
 """
-Bidirectional Qobuz ↔ Music Assistant reconciliation engine.
+Qobuz Connect sync engine — facade + cross-cutting state.
 
-Owns:
-- ``QobuzConnectSyncEngine`` — the only stateful glue between the cloud
-  protocol layer and Music Assistant. Single owner of:
+After Phase C the engine is a thin facade that wires up six
+collaborators and holds the small set of state they need to share.
+Everything domain-specific lives in its own module:
 
-  * the ``QobuzMirror`` canonical state snapshot,
-  * generation tracking (``_qobuz_command_generation``) for latest-only
-    reconciliation of bursty commands,
-  * pending-action ephemeral state (paused-seek, playing-seek debounce,
-    position-confirmation, queue-load-ack futures, prequeue),
-  * the heartbeat / reconcile / metadata / buffering-report / debounced-
-    seek asyncio tasks.
+- :mod:`.command_handler` — ``SRVR_RNDR_SET_STATE`` reconciliation
+  pipeline (mirror update + reconcile + per-playing-state branches +
+  MA-queue replacement + prequeue).
+- :mod:`.outbound_reporter` — renderer→cloud emission (heartbeat,
+  buffering reporter, the canonical ``RNDR_SRVR_STATE_UPDATED`` frame).
+- :mod:`.seek_pipeline` — paused-seek storage, playing-seek
+  debouncing, position-confirmation.
+- :mod:`.metadata_resolver` — MA track-metadata lookups + fail-cache.
+- :mod:`.queue_loader` — MA→Qobuz queue-load round-trip.
+- :mod:`.ma_bridge` — the single seam to the MA world (provider +
+  ``mass.player_queues.*`` / ``mass.players.*``).
 
-- The handler entry points used by :mod:`.session`:
-  ``handle_qobuz_set_state``, ``handle_queue_load_ack``,
-  ``handle_queue_error``, ``handle_queue_version``, ``set_volume``,
-  ``set_volume_delta``, ``report_state``, ``reset_for_deactivation``,
-  ``start`` / ``stop``.
+What stays on the engine:
 
-- The MA-event entry point: ``_on_ma_queue_event`` (subscribed via
-  ``mass.subscribe(QUEUE_UPDATED, ...)`` in :mod:`.__init__`).
+- ``QobuzMirror`` canonical state snapshot (``self.qobuz_state``).
+- The pending-action dataclass fields (``paused_seek``, ``playing_seek``,
+  ``qobuz_position``) — these are touched by ~3 collaborators each so
+  they're easiest to keep here as plain attributes.
+- ``_pending_queue_loads`` futures map (used by command_handler +
+  queue_loader + the queue-ack inbound handler — central enough to
+  stay here).
+- ``_qobuz_command_generation`` (latest-only staleness counter) and
+  ``_last_ma_origin_track_id`` (handle_ma_queue_event guard).
+- ``origin`` (in-flight-change source marker, set via
+  :func:`.state.origin_scope`).
+- The Phase B mirror-update handlers (``handle_queue_state`` /
+  ``handle_queue_tracks_*`` / ``handle_loop_mode`` / etc.) — they're
+  small one-liner mirror updates; extracting them would only add
+  indirection.
+- The MA-event entry point (``handle_ma_queue_event`` +
+  ``_sync_mirror_from_ma_queue``).
+- Volume command surface (``set_volume`` / ``set_volume_delta``).
+- Cross-cutting helpers used by multiple collaborators:
+  ``_is_current_command``, ``_same_queue_ref``,
+  ``_current_qobuz_position_ms``, ``_require_target_player_id``,
+  ``_playing_state_from_ma_queue``, ``_ma_state_confirms_qobuz_target``.
 
-Exposes:
-- ``QobuzConnectSyncEngine``.
-
-Depends on:
-- :mod:`.models` for state DTOs and enums.
-- :mod:`.state` for ``PausedSeek`` / ``PendingPlayingSeek`` /
-  ``PendingQobuzPosition`` / ``TrackRefKey`` / ``origin_scope`` — the
-  ephemeral pending-action state that used to live as scattered
-  ``_pending_*`` fields here.
-- :mod:`.ma_bridge` (``self.bridge``) — the single seam to the MA
-  world: provider accessors plus the ``mass.player_queues.*`` /
-  ``mass.players.*`` operations.
-- :mod:`.session` indirectly via ``self.bridge.session.send_*``.
+Exposes ``QobuzConnectSyncEngine``.
 
 Known sharp edges left for future cleanup:
-- A hardcoded French error-message string-match (``"Le tableau d'octets
-  doit avoir une longueur de 16"``) is still used to recover from a
-  specific ``QueueError``. It works in production but should switch to
-  ``QueueError.code`` matching — defer until we capture a real
-  occurrence of this error.
+- A hardcoded French error-message string-match in
+  :mod:`.queue_loader` (``"Le tableau d'octets doit avoir une longueur
+  de 16"``) is still used to recover from a specific ``QueueError``.
+  It works in production but should switch to ``QueueError.code``
+  matching — defer until we capture a real occurrence of this error.
 
-See :doc:`ARCHITECTURE` for the state machine overview, the field
-inventory and the glossary of concepts (Origin, queue version,
-action_uuid, prequeue).
+See :doc:`ARCHITECTURE` for the end-to-end flow, the inbound/outbound
+message tables and the glossary.
 """
 
 from __future__ import annotations

@@ -69,23 +69,46 @@ actually fetches the audio.
 
 ## Module map
 
-| File                                            | Owns                                                                                  | MA?  | Proto? |
-|-------------------------------------------------|---------------------------------------------------------------------------------------|------|--------|
-| [`discovery.py`](discovery.py)                  | mDNS service + local HTTP handshake endpoints                                         | ❌    | ❌      |
-| [`protocol.py`](protocol.py)                    | Outer-frame codec + protobuf encode/decode                                            | ❌    | ✅      |
-| [`session.py`](session.py)                      | WebSocket lifecycle, token refresh, hand-off to dispatcher                            | ❌    | via proto |
-| [`inbound_dispatcher.py`](inbound_dispatcher.py)| Routing table: decoded inner message → typed callback                                 | ❌    | via proto |
-| [`models.py`](models.py)                        | DTOs + enums shared across all of the above                                           | ❌    | enum refs only |
-| [`state.py`](state.py)                          | Ephemeral pending-action state (paused/playing seek, position confirmation, OriginScope) | ❌ | ❌      |
-| [`ma_bridge.py`](ma_bridge.py)                  | The one place sync.py touches Music Assistant                                         | ✅    | ❌      |
-| [`sync.py`](sync.py)                            | **MA ↔ Qobuz reconciliation engine** — handlers + tasks                                | ✅ (via bridge) | indirect |
-| [`__init__.py`](__init__.py)                    | `QobuzConnectProvider`: config, lifecycle, wiring                                     | ✅    | ❌      |
+The Phase C redesign split what used to be a single 1.1k-LOC `sync.py`
+into a facade + six focused collaborators. Each collaborator owns one
+concern and is reachable from the engine via a single attribute
+(`engine.bridge`, `engine.reporter`, `engine.seek_pipeline`,
+`engine.metadata`, `engine.queue_loader`, `engine.command_handler`).
 
-The first six modules (discovery → models → state → inbound_dispatcher)
-are pure: they could be lifted into a standalone Qobuz Connect SDK
-without MA. MA coupling lives behind `ma_bridge.py` (and in
-`__init__.py` which constructs the provider). After Phase C,
-`sync.py`'s every MA access goes through `self.bridge`.
+| File                                                   | Owns                                                                                                                              | MA?       | Proto?         |
+|--------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|-----------|----------------|
+| [`discovery.py`](discovery.py)                         | mDNS service + local HTTP handshake endpoints                                                                                     | ❌         | ❌              |
+| [`protocol.py`](protocol.py)                           | Outer-frame codec + protobuf encode/decode                                                                                        | ❌         | ✅              |
+| [`session.py`](session.py)                             | WebSocket lifecycle, token refresh, hand-off to dispatcher                                                                        | ❌         | via proto      |
+| [`inbound_dispatcher.py`](inbound_dispatcher.py)       | Routing table: decoded inner message → typed callback                                                                             | ❌         | via proto      |
+| [`models.py`](models.py)                               | DTOs + enums shared across all of the above                                                                                       | ❌         | enum refs only |
+| [`state.py`](state.py)                                 | Ephemeral pending-action dataclasses (`PausedSeek`, `PendingPlayingSeek`, `PendingQobuzPosition`, `TrackRefKey`, `origin_scope`)   | ❌         | ❌              |
+| [`ma_bridge.py`](ma_bridge.py)                         | The one place sync.py touches Music Assistant — provider accessors + `mass.player_queues.*` / `mass.players.*`                    | ✅         | ❌              |
+| [`outbound_reporter.py`](outbound_reporter.py)         | Renderer→cloud emission: `report_state`, heartbeat, buffering reporter, wire-anchor logic                                         | via engine | ❌              |
+| [`seek_pipeline.py`](seek_pipeline.py)                 | Paused-seek storage, playing-seek debouncing, Qobuz-position confirmation                                                         | via engine | ❌              |
+| [`metadata_resolver.py`](metadata_resolver.py)         | MA track-metadata lookups + fail-cache                                                                                            | via engine | ❌              |
+| [`queue_loader.py`](queue_loader.py)                   | MA→Qobuz queue-load round-trip (action_uuid futures, context UUID, ack/timeout)                                                   | via engine | indirect       |
+| [`command_handler.py`](command_handler.py)             | `SRVR_RNDR_SET_STATE` reconciliation: mirror update, reconcile task, per-playing-state branches, MA-queue replacement, prequeue   | via engine | indirect       |
+| [`sync.py`](sync.py)                                   | **Facade** holding QobuzMirror + cross-cutting helpers + Phase B mirror handlers; wires up the six collaborators above            | ✅ (via bridge) | indirect    |
+| [`__init__.py`](__init__.py)                           | `QobuzConnectProvider`: config, lifecycle, MA event subscription, wiring                                                          | ✅         | ❌              |
+
+The first six modules in the table (discovery → models → state →
+inbound_dispatcher) are pure: they could be lifted into a standalone
+Qobuz Connect SDK without MA. MA coupling lives behind `ma_bridge.py`
+(and in `__init__.py` which constructs the provider). After Phase C
+every MA access in the sync engine + its collaborators goes through
+`self.bridge`.
+
+### sync.py size, before vs. after Phase C
+
+| Stage                                  | sync.py LOC |
+|----------------------------------------|------------:|
+| Pre-Phase-C                            |       1,255 |
+| Stage 6 (outbound_reporter.py)         |       1,145 |
+| Stage 7 (seek_pipeline.py)             |       1,002 |
+| Stage 8 (metadata_resolver.py)         |         970 |
+| Stage 9 (queue_loader.py + dead-code)  |         861 |
+| Stage 10 (command_handler.py)          |         461 |
 
 ## Inbound messages (Qobuz → this provider)
 
