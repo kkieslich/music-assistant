@@ -104,6 +104,55 @@ from .state import (
 # so it can't leak.
 OUTBOUND_ACTION_TTL = 10.0
 
+
+def _detect_single_item_move(
+    mirror_order: list[str], ma_order: list[str]
+) -> tuple[int, int] | None:
+    """Detect a single-item drag-reorder between two equal-set lists.
+
+    Returns ``(src_idx, dst_idx)`` where ``src_idx`` is the item's position
+    in ``mirror_order`` and ``dst_idx`` is its new position in ``ma_order``,
+    or ``None`` if the diff isn't a single contiguous item move. Forward
+    (dst > src) and backward (dst < src) moves both supported.
+
+    The shape of a forward single-item move (mirror → ma) is:
+
+    - For ``i < src``: ``ma[i] == mirror[i]``
+    - For ``src <= i < dst``: ``ma[i] == mirror[i + 1]`` (items shifted left)
+    - ``ma[dst] == mirror[src]``
+    - For ``i > dst``: ``ma[i] == mirror[i]``
+
+    Backward move is the mirror image. Any other diff (two items moved,
+    overlapping moves, etc.) returns ``None`` so the caller falls back to
+    the "complex change" warning.
+    """
+    if mirror_order == ma_order or len(mirror_order) != len(ma_order):
+        return None
+    first_div = next(
+        (i for i, (m, a) in enumerate(zip(mirror_order, ma_order, strict=True)) if m != a),
+        None,
+    )
+    if first_div is None:
+        return None
+    last_div = next(
+        (i for i in range(len(mirror_order) - 1, -1, -1) if mirror_order[i] != ma_order[i]),
+        None,
+    )
+    if last_div is None or last_div == first_div:
+        return None
+    # Forward move: mirror[first_div] is the moved item; in ma it lands at last_div.
+    if ma_order[last_div] == mirror_order[first_div] and all(
+        ma_order[i] == mirror_order[i + 1] for i in range(first_div, last_div)
+    ):
+        return first_div, last_div
+    # Backward move: mirror[last_div] is the moved item; in ma it lands at first_div.
+    if ma_order[first_div] == mirror_order[last_div] and all(
+        ma_order[i] == mirror_order[i - 1] for i in range(first_div + 1, last_div + 1)
+    ):
+        return last_div, first_div
+    return None
+
+
 if TYPE_CHECKING:
     from music_assistant_models.event import MassEvent
 
@@ -354,10 +403,37 @@ class QobuzConnectSyncEngine:
             )
             return
 
-        # Mixed change (e.g. reorder, or simultaneous add+remove).
-        # Best-effort: skip for now and let the next snapshot resync.
+        # Same set, different order → user reordered tracks in MA's UI. Try
+        # to detect a single contiguous item move (the common case for
+        # drag-and-drop) and emit one ``CTRL_SRVR_QUEUE_REORDER_TRACKS``.
+        if not removed_track_ids and not added_track_ids:
+            move = _detect_single_item_move(mirror_track_ids, ma_qobuz_ids)
+            if move is not None:
+                src_idx, dst_idx = move
+                moved_track_id = mirror_track_ids[src_idx]
+                qids = mirror_qid_by_track_id.get(moved_track_id, [])
+                if len(qids) != 1:
+                    # Duplicate track_ids — ambiguous which instance moved.
+                    self.bridge.logger.debug(
+                        "MA queue diff: reorder of duplicate track_id %s ambiguous; "
+                        "skipping cloud emit",
+                        moved_track_id,
+                    )
+                    return
+                await self._emit_reorder_tracks(session, [qids[0]], dst_idx)
+                return
+            self.bridge.logger.debug(
+                "MA queue diff: complex reorder not yet supported by outbound differ; "
+                "skipping cloud emit (mirror=%s, ma=%s)",
+                mirror_track_ids,
+                ma_qobuz_ids,
+            )
+            return
+
+        # Mixed change (simultaneous add+remove). Best-effort: skip and let
+        # the next snapshot resync.
         self.bridge.logger.debug(
-            "MA queue diff: complex change not yet supported by outbound differ; "
+            "MA queue diff: simultaneous add+remove not yet supported by outbound differ; "
             "skipping cloud emit (mirror=%s, ma=%s)",
             mirror_track_ids,
             ma_qobuz_ids,
@@ -400,6 +476,35 @@ class QobuzConnectSyncEngine:
         await session.send_queue_remove_tracks(
             action_uuid=action_uuid,
             queue_item_ids=queue_item_ids,
+            queue_version=current_version,
+        )
+
+    async def _emit_reorder_tracks(
+        self,
+        session: Any,
+        queue_item_ids: list[int],
+        insert_after: int,
+    ) -> None:
+        """Send ``CTRL_SRVR_QUEUE_REORDER_TRACKS`` with the current ``queue_version``.
+
+        Optimistically applies the move to the mirror so the next reconcile
+        pass is a no-op. Mirrors :meth:`handle_queue_tracks_reordered`'s
+        layout: items in ``queue_item_ids`` are removed from
+        ``mirror.tracks`` then re-inserted as a contiguous block at index
+        ``insert_after`` of the remaining list.
+        """
+        current_version = self.qobuz_state.queue_version
+        action_uuid = self.register_outbound_action(OutboundActionKind.REORDER, current_version)
+        ids_to_move = set(queue_item_ids)
+        id_to_track = {track.queue_item_id: track for track in self.qobuz_state.tracks}
+        moving = [id_to_track[qid] for qid in queue_item_ids if qid in id_to_track]
+        remaining = [ref for ref in self.qobuz_state.tracks if ref.queue_item_id not in ids_to_move]
+        target = max(0, min(insert_after, len(remaining)))
+        self.qobuz_state.tracks = remaining[:target] + moving + remaining[target:]
+        await session.send_queue_reorder_tracks(
+            action_uuid=action_uuid,
+            queue_item_ids=queue_item_ids,
+            insert_after=insert_after,
             queue_version=current_version,
         )
 
