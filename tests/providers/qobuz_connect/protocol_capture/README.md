@@ -21,11 +21,18 @@ never runs accidentally in CI.
 
 ## One-time setup
 
+This harness depends on Playwright, which is a developer-only dep specific
+to this tool — it is *not* a `qobuz_connect` runtime requirement and is
+intentionally not declared in `pyproject.toml` or `manifest.json`. Install
+it manually into your existing MA venv:
+
 ```bash
 source .venv/bin/activate
-uv pip install -e ".[qobuz-connect-capture]"
+uv pip install 'playwright==1.59.0'
 playwright install chromium
 ```
+
+If you ever need a clean reinstall, repeat both commands.
 
 Qobuz Connect routes between two clients on the same account by design, so
 both browser contexts use the same login — that's exactly the traffic we
