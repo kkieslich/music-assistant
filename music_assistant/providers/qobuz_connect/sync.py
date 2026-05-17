@@ -56,6 +56,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.enums import PlaybackState as MAPlaybackState
@@ -68,6 +69,8 @@ from .models import (
     BufferState,
     LoopMode,
     Origin,
+    OutboundActionKind,
+    OutboundActionMeta,
     PlayingState,
     QobuzMirror,
     QueueClearedEvent,
@@ -93,6 +96,13 @@ from .state import (
     TrackRefKey,
     origin_scope,
 )
+
+# Outbound action ledger TTL. Entries register a queue mutation we *sent* to
+# the Qobuz cloud; the cloud echoes the mutation back as ``SRVR_CTRL_QUEUE_*``
+# with the same ``action_uuid``. If we never see the echo within this window
+# (cloud silently dropped it, lost connection, etc.) we drop the ledger entry
+# so it can't leak.
+OUTBOUND_ACTION_TTL = 10.0
 
 if TYPE_CHECKING:
     from music_assistant_models.event import MassEvent
@@ -134,6 +144,13 @@ class QobuzConnectSyncEngine:
         self._pending_queue_loads: dict[
             bytes, asyncio.Future[QueueLoadAck | QueueError | None]
         ] = {}
+        # Ledger of queue-mutation commands *we* sent to the Qobuz cloud.
+        # Used by the inbound dispatcher to short-circuit the
+        # ``SRVR_CTRL_QUEUE_*`` echo: when an inbound delta carries an
+        # ``action_uuid`` in this dict, MA's queue already reflects the
+        # change (we originated it) and the reconciler must not re-apply.
+        # Entries self-expire after ``OUTBOUND_ACTION_TTL`` seconds.
+        self._outbound_action_uuids: dict[bytes, OutboundActionMeta] = {}
         self._last_ma_origin_track_id: str | None = None
         self._command_generation = 0
         # Tracks whether the Qobuz cloud has us as the active renderer. False
@@ -238,6 +255,175 @@ class QobuzConnectSyncEngine:
         # is the first place we learn the right value to ask for queue
         # state with.
         await self.maybe_ask_for_queue_state()
+
+    def register_outbound_action(
+        self, kind: OutboundActionKind, queue_version: QueueVersion
+    ) -> bytes:
+        """Mint and register an ``action_uuid`` for a MA→cloud queue mutation."""
+        action_uuid = uuid.uuid4().bytes
+        self._outbound_action_uuids[action_uuid] = OutboundActionMeta(
+            kind=kind,
+            queue_version=queue_version,
+            expires_at=time.monotonic() + OUTBOUND_ACTION_TTL,
+        )
+        self._gc_outbound_actions()
+        return action_uuid
+
+    def consume_outbound_action(self, action_uuid: bytes) -> OutboundActionMeta | None:
+        """Return-and-pop the ledger entry for ``action_uuid``, or ``None`` if not ours."""
+        meta = self._outbound_action_uuids.pop(action_uuid, None)
+        if meta is None:
+            return None
+        if time.monotonic() > meta.expires_at:
+            return None
+        return meta
+
+    def _gc_outbound_actions(self) -> None:
+        """Drop ledger entries past their TTL — bounded leak guard."""
+        now = time.monotonic()
+        expired = [
+            uid for uid, meta in self._outbound_action_uuids.items() if meta.expires_at < now
+        ]
+        for uid in expired:
+            self._outbound_action_uuids.pop(uid, None)
+
+    async def handle_ma_queue_items_updated(self, event: MassEvent) -> None:
+        """Propagate user-driven MA queue edits back to the Qobuz cloud.
+
+        Diffs MA's queue items against the mirror's view and emits the
+        minimum ``CTRL_SRVR_QUEUE_*`` message(s) needed to bring the cloud
+        in line. Skipped while origin == QOBUZ (we're applying inbound
+        deltas) or the session is inactive.
+
+        Pass 2c supports: CLEAR, REMOVE, ADD-at-end. Pure-reorder and
+        middle-insert detection are best-effort and may fall back to
+        re-asking for queue state.
+        """
+        if self.origin in (Origin.QOBUZ, Origin.ACK):
+            return
+        if not self._is_active:
+            return
+        if self.command_handler.is_reconciling():
+            return
+        player_id = self.bridge.target_player_id()
+        if not player_id or event.object_id != player_id:
+            return
+        session = self.bridge.session
+        if session is None:
+            return
+
+        ma_items = list(self.bridge.queue_items(player_id))
+        ma_track_ids = [self.bridge.qobuz_track_id_for(it) for it in ma_items]
+        # Drop non-Qobuz items entirely — they live in MA's queue but never
+        # reach the cloud.
+        ma_qobuz_ids = [tid for tid in ma_track_ids if tid]
+        mirror_track_ids = [ref.track_id for ref in self.qobuz_state.tracks]
+        mirror_qid_by_track_id: dict[str, list[int]] = {}
+        for ref in self.qobuz_state.tracks:
+            mirror_qid_by_track_id.setdefault(ref.track_id, []).append(ref.queue_item_id)
+
+        ma_set = set(ma_qobuz_ids)
+        mirror_set = set(mirror_track_ids)
+
+        if ma_qobuz_ids == mirror_track_ids:
+            return  # no diff
+
+        if not ma_qobuz_ids and mirror_track_ids:
+            await self._emit_clear_queue(session)
+            return
+
+        removed_track_ids = mirror_set - ma_set
+        added_track_ids = ma_set - mirror_set
+
+        if removed_track_ids and not added_track_ids:
+            await self._emit_remove_tracks(session, removed_track_ids, mirror_qid_by_track_id)
+            return
+
+        if added_track_ids and not removed_track_ids:
+            # Detect pure-append (MA = mirror + new tail) vs middle-insert.
+            append_only = ma_qobuz_ids[: len(mirror_track_ids)] == mirror_track_ids
+            if append_only:
+                new_tail = ma_qobuz_ids[len(mirror_track_ids) :]
+                await self._emit_add_tracks(session, new_tail)
+                return
+            self.bridge.logger.debug(
+                "MA queue diff: middle-insert not yet supported by outbound differ; "
+                "skipping cloud emit (mirror=%s, ma=%s)",
+                mirror_track_ids,
+                ma_qobuz_ids,
+            )
+            return
+
+        # Mixed change (e.g. reorder, or simultaneous add+remove).
+        # Best-effort: skip for now and let the next snapshot resync.
+        self.bridge.logger.debug(
+            "MA queue diff: complex change not yet supported by outbound differ; "
+            "skipping cloud emit (mirror=%s, ma=%s)",
+            mirror_track_ids,
+            ma_qobuz_ids,
+        )
+
+    async def _emit_clear_queue(self, session: Any) -> None:
+        """Send ``CTRL_SRVR_CLEAR_QUEUE`` and update the mirror optimistically."""
+        new_version = QueueVersion(
+            self.qobuz_state.queue_version.major,
+            self.qobuz_state.queue_version.minor + 1,
+        )
+        self.register_outbound_action(OutboundActionKind.CLEAR, new_version)
+        self.qobuz_state.queue_version = new_version
+        self.qobuz_state.tracks = []
+        await session.send_clear_queue(queue_version=new_version)
+
+    async def _emit_remove_tracks(
+        self,
+        session: Any,
+        removed_track_ids: set[str],
+        mirror_qid_by_track_id: dict[str, list[int]],
+    ) -> None:
+        """Send ``CTRL_SRVR_QUEUE_REMOVE_TRACKS`` for items the user dropped in MA."""
+        queue_item_ids: list[int] = []
+        for tid in removed_track_ids:
+            qids = mirror_qid_by_track_id.get(tid, [])
+            queue_item_ids.extend(qids)
+        if not queue_item_ids:
+            return
+        new_version = QueueVersion(
+            self.qobuz_state.queue_version.major,
+            self.qobuz_state.queue_version.minor + 1,
+        )
+        action_uuid = self.register_outbound_action(OutboundActionKind.REMOVE, new_version)
+        removed_ids_set = set(queue_item_ids)
+        self.qobuz_state.queue_version = new_version
+        self.qobuz_state.tracks = [
+            ref for ref in self.qobuz_state.tracks if ref.queue_item_id not in removed_ids_set
+        ]
+        await session.send_queue_remove_tracks(
+            action_uuid=action_uuid,
+            queue_item_ids=queue_item_ids,
+            queue_version=new_version,
+        )
+
+    async def _emit_add_tracks(self, session: Any, new_track_ids: list[str]) -> None:
+        """Send ``CTRL_SRVR_QUEUE_ADD_TRACKS`` for tracks the user appended in MA."""
+        if not new_track_ids:
+            return
+        new_version = QueueVersion(
+            self.qobuz_state.queue_version.major,
+            self.qobuz_state.queue_version.minor + 1,
+        )
+        action_uuid = self.register_outbound_action(OutboundActionKind.ADD, new_version)
+        # The cloud will assign real queue_item_ids; we register placeholders
+        # on the mirror so the next reconcile pass doesn't re-add them. The
+        # echoed ``SRVR_CTRL_QUEUE_TRACKS_ADDED`` will overwrite these with
+        # the cloud-assigned ids when it lands.
+        placeholder_refs = [QueueTrackRef(queue_item_id=0, track_id=tid) for tid in new_track_ids]
+        self.qobuz_state.queue_version = new_version
+        self.qobuz_state.tracks.extend(placeholder_refs)
+        await session.send_queue_add_tracks(
+            action_uuid=action_uuid,
+            tracks=placeholder_refs,
+            queue_version=new_version,
+        )
 
     async def handle_ma_queue_event(self, event: MassEvent) -> None:
         """React to MA queue updates that were not caused by Qobuz commands."""
@@ -369,12 +555,23 @@ class QobuzConnectSyncEngine:
 
     async def handle_queue_tracks_added(self, event: QueueTracksAddedEvent) -> None:
         """Apply a ``SRVR_CTRL_QUEUE_TRACKS_ADDED`` delta, then reconcile MA."""
+        echo = self.consume_outbound_action(event.action_uuid)
+        if echo is not None:
+            # Our own ADD echoed back — patch the cloud-assigned queue_item_ids
+            # onto the placeholder mirror entries we registered when sending.
+            self.qobuz_state.queue_version = event.queue_version
+            self._absorb_cloud_qids_for_self_add(event.tracks)
+            return
         self.qobuz_state.queue_version = event.queue_version
         self.qobuz_state.tracks.extend(event.tracks)
         await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     async def handle_queue_tracks_inserted(self, event: QueueTracksInsertedEvent) -> None:
         """Apply a ``SRVR_CTRL_QUEUE_TRACKS_INSERTED`` delta, then reconcile MA."""
+        echo = self.consume_outbound_action(event.action_uuid)
+        if echo is not None:
+            self.qobuz_state.queue_version = event.queue_version
+            return
         self.qobuz_state.queue_version = event.queue_version
         insert_index = max(0, min(event.insert_after, len(self.qobuz_state.tracks)))
         self.qobuz_state.tracks[insert_index:insert_index] = event.tracks
@@ -382,12 +579,31 @@ class QobuzConnectSyncEngine:
 
     async def handle_queue_tracks_removed(self, event: QueueTracksRemovedEvent) -> None:
         """Apply a ``SRVR_CTRL_QUEUE_TRACKS_REMOVED`` delta, then reconcile MA."""
+        echo = self.consume_outbound_action(event.action_uuid)
+        if echo is not None:
+            # We originated this remove — mirror already updated optimistically.
+            self.qobuz_state.queue_version = event.queue_version
+            return
         self.qobuz_state.queue_version = event.queue_version
         removed_ids = set(event.queue_item_ids)
         self.qobuz_state.tracks = [
             track for track in self.qobuz_state.tracks if track.queue_item_id not in removed_ids
         ]
         await self.command_handler.schedule_reconcile_ma_to_mirror()
+
+    def _absorb_cloud_qids_for_self_add(self, cloud_tracks: list[QueueTrackRef]) -> None:
+        """Patch cloud-assigned queue_item_ids onto our placeholder mirror entries.
+
+        When we sent ``CTRL_SRVR_QUEUE_ADD_TRACKS`` we registered placeholder
+        ``QueueTrackRef(queue_item_id=0, track_id=X)`` entries on the mirror
+        because the cloud is authoritative for queue_item_ids. The echo
+        carries those assigned ids — patch them in-place by track_id.
+        """
+        for cloud_ref in cloud_tracks:
+            for mirror_ref in self.qobuz_state.tracks:
+                if mirror_ref.queue_item_id == 0 and mirror_ref.track_id == cloud_ref.track_id:
+                    mirror_ref.queue_item_id = cloud_ref.queue_item_id
+                    break
 
     async def handle_queue_tracks_reordered(self, event: QueueTracksReorderedEvent) -> None:
         """Apply a ``SRVR_CTRL_QUEUE_TRACKS_REORDERED`` delta, then reconcile MA.
@@ -416,8 +632,11 @@ class QobuzConnectSyncEngine:
         Empties the mirror; the reconciler then removes every MA item that
         isn't the currently-playing one. Audio continues uninterrupted.
         """
+        echo = self.consume_outbound_action(_event.action_uuid)
         self.qobuz_state.queue_version = _event.queue_version
         self.qobuz_state.tracks = []
+        if echo is not None:
+            return  # MA already cleared; reconciler would be a no-op
         await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     async def handle_loop_mode(self, mode: LoopMode) -> None:

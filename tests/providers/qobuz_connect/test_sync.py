@@ -14,6 +14,8 @@ from music_assistant_models.enums import MediaType, PlaybackState
 from music_assistant.providers.qobuz_connect.models import (
     BufferState,
     LoopMode,
+    Origin,
+    OutboundActionKind,
     PlayingState,
     QueueClearedEvent,
     QueueError,
@@ -88,7 +90,15 @@ class _FakePlayerQueues:
         for item in queue_items:
             if getattr(item, "queue_item_id", None) is None:
                 item.queue_item_id = self._make_qid()
-        self.queue_items = queue_items
+        # Mirror the real ``mass.player_queues.load`` behavior so tests can
+        # exercise positional inserts: keep the existing prefix above the
+        # insert point and the existing suffix below it.
+        insert_at_index = kwargs.get("insert_at_index", 0)
+        keep_played = kwargs.get("keep_played", False)
+        keep_remaining = kwargs.get("keep_remaining", False)
+        prev = self.queue_items[:insert_at_index] if keep_played else []
+        tail = self.queue_items[insert_at_index:] if keep_remaining else []
+        self.queue_items = prev + queue_items + tail
 
     async def play_media(self, queue_id: str, media: Any, **kwargs: Any) -> None:
         self.calls.append(("play_media", (queue_id, media), kwargs))
@@ -148,6 +158,11 @@ class _FakeSession:
         self.queue_loads: list[dict[str, Any]] = []
         self.autoplay_loads: list[dict[str, Any]] = []
         self.queue_state_asks: list[dict[str, Any]] = []
+        self.queue_adds: list[dict[str, Any]] = []
+        self.queue_inserts: list[dict[str, Any]] = []
+        self.queue_removes: list[dict[str, Any]] = []
+        self.queue_reorders: list[dict[str, Any]] = []
+        self.clear_queues: list[dict[str, Any]] = []
 
     async def send_renderer_state(self, **kwargs: Any) -> None:
         self.renderer_states.append(kwargs)
@@ -162,6 +177,26 @@ class _FakeSession:
 
     async def send_ask_for_queue_state(self, **kwargs: Any) -> bool:
         self.queue_state_asks.append(kwargs)
+        return True
+
+    async def send_queue_add_tracks(self, **kwargs: Any) -> bool:
+        self.queue_adds.append(kwargs)
+        return True
+
+    async def send_queue_insert_tracks(self, **kwargs: Any) -> bool:
+        self.queue_inserts.append(kwargs)
+        return True
+
+    async def send_queue_remove_tracks(self, **kwargs: Any) -> bool:
+        self.queue_removes.append(kwargs)
+        return True
+
+    async def send_queue_reorder_tracks(self, **kwargs: Any) -> bool:
+        self.queue_reorders.append(kwargs)
+        return True
+
+    async def send_clear_queue(self, **kwargs: Any) -> bool:
+        self.clear_queues.append(kwargs)
         return True
 
 
@@ -1689,16 +1724,22 @@ async def test_queue_state_snapshot_schedules_background_preload() -> None:
     await _wait_for_preload(engine)
 
     calls_after = provider.mass.player_queues.calls
-    # No additional stop / clear / load / play_index after the snapshot.
-    loads_after = sum(1 for c in calls_after if c[0] == "load")
+    # Destructive loads (= full queue replacements) must not happen again
+    # after the initial replace. History inserts via
+    # ``load(insert_at_index=…, keep_played=True, keep_remaining=True)``
+    # are fine — they prepend to the queue without touching playback.
+    destructive_loads_after = sum(
+        1 for c in calls_after if c[0] == "load" and not c[2].get("keep_played", False)
+    )
     play_indexes_after = sum(1 for c in calls_after if c[0] == "play_index")
     stops_after = sum(1 for c in calls_after if c[0] == "stop")
     clears_after = sum(1 for c in calls_after if c[0] == "clear")
-    assert loads_after == loads_after_set_state, (
-        f"Snapshot preload must not trigger another load; calls={calls_after}"
+    # The only destructive load is the initial SET_STATE replace.
+    assert destructive_loads_after == loads_after_set_state, (
+        f"Snapshot reconcile must not trigger another destructive load; calls={calls_after}"
     )
     assert play_indexes_after == play_indexes_after_set_state, (
-        "Snapshot preload must not call play_index — playback continues uninterrupted"
+        "Snapshot reconcile must not call play_index — playback continues uninterrupted"
     )
     # ``stop`` is fine if it was needed for the initial replace; what we
     # don't want is a *second* stop after the snapshot lands.
@@ -2261,6 +2302,59 @@ async def test_qobuz_app_removes_track_propagates_to_ma_queue() -> None:
 
 
 @pytest.mark.asyncio
+async def test_snapshot_loads_history_tracks_before_current_into_ma_queue() -> None:
+    """Tracks ahead of and *behind* ``current_idx`` in the Qobuz snapshot land in MA's queue.
+
+    Without history preservation, skipping back inside a 600-track playlist
+    triggers a fresh ``QUEUE_LOAD_TRACKS`` round-trip. With it, the
+    skip-backward target is already sitting at the front of MA's queue and
+    ``play_index`` does the rest in a single call.
+
+    Scenario: SET_STATE puts the user on t3 (the third track); QUEUE_STATE
+    delivers a 5-track snapshot. MA's queue must include t1 and t2
+    (history) at the front, plus t4 and t5 (tail).
+    """
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=51, minor=0),
+            current_item=QueueTrackRef(queue_item_id=3, track_id="t3"),
+            next_item=QueueTrackRef(queue_item_id=4, track_id="t4"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+    await engine.handle_queue_state(
+        QueueStateSnapshot(
+            queue_version=QueueVersion(major=51, minor=0),
+            action_uuid=b"\x00" * 16,
+            tracks=[
+                QueueTrackRef(queue_item_id=1, track_id="t1"),
+                QueueTrackRef(queue_item_id=2, track_id="t2"),
+                QueueTrackRef(queue_item_id=3, track_id="t3"),
+                QueueTrackRef(queue_item_id=4, track_id="t4"),
+                QueueTrackRef(queue_item_id=5, track_id="t5"),
+            ],
+            shuffle_mode=False,
+            autoplay_mode=False,
+        )
+    )
+    await _wait_for_preload(engine)
+
+    ma_ids = [
+        engine.bridge.qobuz_track_id_for(item) for item in provider.mass.player_queues.queue_items
+    ]
+    # History (t1, t2) must be present alongside the tail (t4, t5).
+    assert "t1" in ma_ids, f"History track t1 must be loaded; got {ma_ids}"
+    assert "t2" in ma_ids, f"History track t2 must be loaded; got {ma_ids}"
+    assert "t3" in ma_ids, f"Current track t3 must remain; got {ma_ids}"
+    assert "t5" in ma_ids, f"Tail track t5 must be loaded; got {ma_ids}"
+
+
+@pytest.mark.asyncio
 async def test_qobuz_app_clears_queue_clears_ma_keeping_current() -> None:
     """SRVR_CTRL_QUEUE_CLEARED empties MA's queue except the currently playing item."""
     queue = _queue(PlaybackState.IDLE, track_id="old")
@@ -2286,4 +2380,156 @@ async def test_qobuz_app_clears_queue_clears_ma_keeping_current() -> None:
     assert "t1" in ma_ids, f"Currently playing track must remain after CLEARED; got {ma_ids}"
     assert all(tid == "t1" for tid in ma_ids), (
         f"All non-current items must be removed after CLEARED; got {ma_ids}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# MA → Qobuz outbound differ (user edits MA's queue → Qobuz app reflects it).
+# ---------------------------------------------------------------------------
+
+
+def _ma_items_event(player_id: str, items: list[Any]) -> Any:
+    """Build a ``QUEUE_ITEMS_UPDATED`` event with the given queue items."""
+    queue = SimpleNamespace(state=PlaybackState.PLAYING, items=items)
+    return SimpleNamespace(object_id=player_id, data=queue)
+
+
+@pytest.mark.asyncio
+async def test_ma_removed_track_sends_queue_remove_tracks_to_cloud() -> None:
+    """Removing a track in MA's UI sends ``CTRL_SRVR_QUEUE_REMOVE_TRACKS`` to Qobuz."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    # Mirror has 4 tracks; MA has 3 (t2 removed).
+    engine.qobuz_state.queue_version = QueueVersion(major=52, minor=0)
+    engine.qobuz_state.tracks = [
+        QueueTrackRef(queue_item_id=1, track_id="t1"),
+        QueueTrackRef(queue_item_id=2, track_id="t2"),
+        QueueTrackRef(queue_item_id=3, track_id="t3"),
+        QueueTrackRef(queue_item_id=4, track_id="t4"),
+    ]
+    provider.mass.player_queues.queue_items = [
+        SimpleNamespace(media_item=SimpleNamespace(item_id=tid), queue_item_id=f"ma-{tid}")
+        for tid in ("t1", "t3", "t4")
+    ]
+
+    await engine.handle_ma_queue_items_updated(
+        _ma_items_event("player", provider.mass.player_queues.queue_items)
+    )
+
+    assert len(session.queue_removes) == 1, (
+        f"Outbound REMOVE_TRACKS expected; sent={session.queue_removes}"
+    )
+    payload = session.queue_removes[0]
+    assert payload["queue_item_ids"] == [2], (
+        f"Outbound REMOVE must carry the Qobuz queue_item_id; got {payload}"
+    )
+    assert payload["queue_version"].minor == 1, (
+        f"Mirror version must bump optimistically; got {payload['queue_version']}"
+    )
+    # Mirror optimistically applies the removal so the next reconcile is a no-op.
+    assert all(ref.queue_item_id != 2 for ref in engine.qobuz_state.tracks), (
+        f"Mirror must drop t2 optimistically; got {engine.qobuz_state.tracks}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ma_appended_track_sends_queue_add_tracks_to_cloud() -> None:
+    """Appending a track at the end of MA's queue sends ``CTRL_SRVR_QUEUE_ADD_TRACKS``."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.queue_version = QueueVersion(major=52, minor=0)
+    engine.qobuz_state.tracks = [
+        QueueTrackRef(queue_item_id=1, track_id="t1"),
+        QueueTrackRef(queue_item_id=2, track_id="t2"),
+    ]
+    provider.mass.player_queues.queue_items = [
+        SimpleNamespace(media_item=SimpleNamespace(item_id="t1"), queue_item_id="ma-t1"),
+        SimpleNamespace(media_item=SimpleNamespace(item_id="t2"), queue_item_id="ma-t2"),
+        SimpleNamespace(media_item=SimpleNamespace(item_id="t3"), queue_item_id="ma-t3"),
+    ]
+
+    await engine.handle_ma_queue_items_updated(
+        _ma_items_event("player", provider.mass.player_queues.queue_items)
+    )
+
+    assert len(session.queue_adds) == 1, f"Outbound ADD_TRACKS expected; sent={session.queue_adds}"
+    payload = session.queue_adds[0]
+    appended_track_ids = [ref.track_id for ref in payload["tracks"]]
+    assert appended_track_ids == ["t3"], (
+        f"Outbound ADD must include the new tail track ids; got {appended_track_ids}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ma_cleared_queue_sends_clear_to_cloud() -> None:
+    """Clearing MA's queue (with mirror non-empty) sends ``CTRL_SRVR_CLEAR_QUEUE``."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.queue_version = QueueVersion(major=52, minor=0)
+    engine.qobuz_state.tracks = [
+        QueueTrackRef(queue_item_id=1, track_id="t1"),
+        QueueTrackRef(queue_item_id=2, track_id="t2"),
+    ]
+    provider.mass.player_queues.queue_items = []
+
+    await engine.handle_ma_queue_items_updated(_ma_items_event("player", []))
+
+    assert len(session.clear_queues) == 1, (
+        f"Outbound CLEAR_QUEUE expected; sent={session.clear_queues}"
+    )
+    assert engine.qobuz_state.tracks == [], "Mirror must clear optimistically"
+
+
+@pytest.mark.asyncio
+async def test_ma_event_during_qobuz_origin_does_not_emit_to_cloud() -> None:
+    """While applying an inbound Qobuz delta, MA-event echoes must not loop back."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.queue_version = QueueVersion(major=52, minor=0)
+    engine.qobuz_state.tracks = [QueueTrackRef(queue_item_id=1, track_id="t1")]
+    provider.mass.player_queues.queue_items = []
+
+    from music_assistant.providers.qobuz_connect.state import (  # noqa: PLC0415
+        origin_scope,
+    )
+
+    async with origin_scope(engine, Origin.QOBUZ):
+        await engine.handle_ma_queue_items_updated(_ma_items_event("player", []))
+
+    assert session.clear_queues == [], (
+        "MA events during a QOBUZ-origin scope must not echo back to the cloud"
+    )
+
+
+@pytest.mark.asyncio
+async def test_outbound_action_uuid_echo_skips_reconciler() -> None:
+    """Cloud echoing back our own action_uuid must not re-trigger MA reconcile."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.queue_version = QueueVersion(major=52, minor=0)
+    engine.qobuz_state.tracks = [
+        QueueTrackRef(queue_item_id=1, track_id="t1"),
+        QueueTrackRef(queue_item_id=2, track_id="t2"),
+    ]
+
+    action_uuid = engine.register_outbound_action(
+        OutboundActionKind.REMOVE, QueueVersion(major=52, minor=1)
+    )
+
+    # Echo arrives — must consume ledger entry and not call schedule_reconcile.
+    consumed = engine.consume_outbound_action(action_uuid)
+    assert consumed is not None
+    assert consumed.kind == OutboundActionKind.REMOVE
+    assert engine.consume_outbound_action(action_uuid) is None, (
+        "Ledger entry must be removed after first consume"
     )
