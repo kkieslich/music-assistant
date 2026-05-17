@@ -656,6 +656,7 @@ class CommandHandler:
                     return
                 await self._reconcile_add_missing(player_id, current_item, generation)
                 await self._reconcile_add_history(player_id, current_item, generation)
+                await self._reconcile_reorder(player_id, current_item, generation)
         except asyncio.CancelledError:
             raise
         except PlayerUnavailableError as err:
@@ -751,6 +752,144 @@ class CommandHandler:
             # Yield so other tasks (a new SET_STATE, a seek) can preempt
             # before we burn another chunk on the Qobuz API.
             await asyncio.sleep(0)
+
+    async def _reconcile_reorder(
+        self,
+        player_id: str,
+        current_item: QueueTrackRef,
+        generation: int,
+    ) -> None:
+        """Align MA's full queue order with ``qobuz_state.tracks``.
+
+        Handles all reorder shapes including items moving across the
+        currently-playing position (Qobuz user dragging a previously-played
+        track to be the next track, and the reverse). The currently-playing
+        MA item is identified by ``queue_item_id`` and its new position
+        becomes ``current_index`` after the rebuild.
+
+        Strategy:
+
+        1. Walk ``qobuz_state.tracks`` in order; for each ref, pop a
+           matching MA item from a track-id-keyed pool. Items in MA but
+           absent from the mirror (shouldn't happen post remove_stale)
+           and non-Qobuz items end up at the tail.
+        2. Find the playing anchor (by ``queue_item_id``) in the rebuilt
+           list — that's the new ``current_index``.
+        3. ``update_items`` + ``set_current_index``. ``update_items``
+           internally re-enqueues the next track when
+           ``index_in_buffer == current_index`` so MA's buffer pipeline
+           reselects against the new order; no ``stop``/``play_index``
+           needed.
+
+        Inherent limitation (MA streaming architecture): if MA has already
+        pre-buffered the *old* next track (``index_in_buffer > current_index``
+        when the reorder lands), that buffered audio plays first; the new
+        order takes effect on the track *after* the buffered one.
+        """
+        engine = self._engine
+        logger = engine.bridge.logger
+        if not engine._is_current_command(generation):
+            return
+        if not engine.qobuz_state.tracks:
+            return
+
+        mirror_tracks = list(engine.qobuz_state.tracks)
+        current_key = TrackRefKey.from_ref(current_item)
+        mirror_current_idx = next(
+            (i for i, ref in enumerate(mirror_tracks) if TrackRefKey.from_ref(ref) == current_key),
+            None,
+        )
+        if mirror_current_idx is None:
+            # The cloud-side queue_item_id may have changed (autoplay-driven
+            # requeue, etc.). Fall back to track_id-only match.
+            mirror_current_idx = next(
+                (i for i, ref in enumerate(mirror_tracks) if ref.track_id == current_item.track_id),
+                None,
+            )
+        if mirror_current_idx is None:
+            return
+
+        ma_items = list(engine.bridge.queue_items(player_id))
+        if not ma_items:
+            return
+        queue = engine.bridge.get_queue(player_id)
+        current_index = getattr(queue, "current_index", None) if queue else None
+        # Find the playing anchor by Qobuz's authoritative ``current_item.track_id``
+        # rather than by MA's ``current_index`` integer. MA's current_index can
+        # be stale after bootstrap (``play_index(0)`` runs on a 1-item queue,
+        # then history is prepended via ``load(insert_at_index=0, …)`` without
+        # touching ``current_index``) — using it directly would point at the
+        # wrong item.
+        playing_anchor = next(
+            (
+                item
+                for item in ma_items
+                if engine.bridge.qobuz_track_id_for(item) == current_item.track_id
+            ),
+            None,
+        )
+        if playing_anchor is None:
+            return
+        playing_qid = getattr(playing_anchor, "queue_item_id", None)
+        if playing_qid is None:
+            return
+
+        # Pool MA items by Qobuz track_id. Non-Qobuz items stay at the tail.
+        pool: dict[str, list[Any]] = {}
+        non_qobuz: list[Any] = []
+        for item in ma_items:
+            tid = engine.bridge.qobuz_track_id_for(item)
+            if tid is None:
+                non_qobuz.append(item)
+                continue
+            pool.setdefault(tid, []).append(item)
+
+        # Build the rebuilt order by walking mirror tracks. Items the
+        # mirror references but MA doesn't have are simply skipped — they
+        # would have been added by ``_reconcile_add_missing`` /
+        # ``_reconcile_add_history`` in earlier passes.
+        rebuilt: list[Any] = []
+        for ref in mirror_tracks:
+            items = pool.get(ref.track_id)
+            if items:
+                rebuilt.append(items.pop(0))
+        leftover = [it for items in pool.values() for it in items]
+        rebuilt.extend(leftover)
+        rebuilt.extend(non_qobuz)
+
+        # Identify where the playing anchor ended up so we can pin
+        # ``current_index`` to it post-rebuild.
+        new_current_index = next(
+            (
+                i
+                for i, item in enumerate(rebuilt)
+                if getattr(item, "queue_item_id", None) == playing_qid
+            ),
+            None,
+        )
+        if new_current_index is None:
+            logger.debug(
+                "MA reconcile: playing anchor %s vanished from rebuilt queue; skipping reorder",
+                playing_qid,
+            )
+            return
+
+        new_ids = [engine.bridge.qobuz_track_id_for(it) for it in rebuilt]
+        old_ids = [engine.bridge.qobuz_track_id_for(it) for it in ma_items]
+        order_changed = new_ids != old_ids
+        current_index_changed = new_current_index != current_index
+        if not order_changed and not current_index_changed:
+            return
+
+        logger.debug(
+            "MA reconcile: aligning queue order to mirror (current_index %s → %d)",
+            current_index,
+            new_current_index,
+        )
+        if order_changed:
+            engine.bridge.update_items(player_id, rebuilt)
+        if current_index_changed:
+            engine.bridge.set_current_index(player_id, new_current_index)
 
     async def _reconcile_add_history(
         self,

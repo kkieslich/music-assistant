@@ -1539,8 +1539,8 @@ async def test_set_state_triggers_ask_for_queue_state_when_session_state_missing
 
 
 @pytest.mark.asyncio
-async def test_ask_for_queue_state_fires_only_once_per_session() -> None:
-    """The flag must coalesce repeated SET_STATE events into a single ask."""
+async def test_ask_for_queue_state_coalesces_repeated_observations_at_same_qv() -> None:
+    """Repeated SET_STATE events at the same ``queue_version`` produce one ask."""
     session = _FakeSession()
     provider = _FakeProvider(_queue(PlaybackState.PLAYING), session=session)
     engine = QobuzConnectSyncEngine(provider)
@@ -1554,10 +1554,39 @@ async def test_ask_for_queue_state_fires_only_once_per_session() -> None:
             )
         )
     await _wait_for_reconcile(engine)
-    await engine.handle_queue_version(QueueVersion(major=47, minor=2))
 
     assert len(session.queue_state_asks) == 1, (
-        f"Repeated queueVersion observations must not re-ask; got {session.queue_state_asks}"
+        f"Same-qv observations must coalesce; got {session.queue_state_asks}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ask_for_queue_state_re_fires_on_qv_bump() -> None:
+    """Every distinct ``queue_version`` the cloud announces triggers a fresh ask.
+
+    The Qobuz app bumps ``queue_version`` on every queue mutation. Without
+    re-asking, the mirror keeps the stale track list and the reconciler has
+    nothing to apply (the local-test reorder bug observed in production).
+    """
+    session = _FakeSession()
+    provider = _FakeProvider(_queue(PlaybackState.PLAYING), session=session)
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=47, minor=1),
+            current_item=QueueTrackRef(queue_item_id=7, track_id="175293611"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+    await engine.handle_queue_version(QueueVersion(major=47, minor=2))
+    await engine.handle_queue_version(QueueVersion(major=47, minor=3))
+
+    assert [
+        (ask["queue_version"].major, ask["queue_version"].minor) for ask in session.queue_state_asks
+    ] == [(47, 1), (47, 2), (47, 3)], (
+        f"Each new qv must trigger a fresh ask; got {session.queue_state_asks}"
     )
 
 
@@ -2352,6 +2381,217 @@ async def test_snapshot_loads_history_tracks_before_current_into_ma_queue() -> N
     assert "t2" in ma_ids, f"History track t2 must be loaded; got {ma_ids}"
     assert "t3" in ma_ids, f"Current track t3 must remain; got {ma_ids}"
     assert "t5" in ma_ids, f"Tail track t5 must be loaded; got {ma_ids}"
+
+
+# ---------------------------------------------------------------------------
+# Reorder reconciliation (Qobuz app shuffles tracks → MA queue order matches).
+# Each test:
+#  - bootstraps a playing playlist via _seed_full_playlist (current = "t3")
+#  - delivers a fresh snapshot at a higher qv with a reordered track list
+#  - asserts that MA's queue order, current_index, and the currently-playing
+#    item all line up with the mirror's view
+# ---------------------------------------------------------------------------
+
+
+async def _seed_full_playlist(
+    engine: QobuzConnectSyncEngine,
+    track_ids: list[str],
+    current_track_id: str,
+) -> None:
+    """Bootstrap MA with a known multi-track playing playlist for reorder tests."""
+    current_qid = 100 + track_ids.index(current_track_id)
+    next_idx = track_ids.index(current_track_id) + 1
+    next_item = (
+        QueueTrackRef(queue_item_id=100 + next_idx, track_id=track_ids[next_idx])
+        if next_idx < len(track_ids)
+        else None
+    )
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=70, minor=0),
+            current_item=QueueTrackRef(queue_item_id=current_qid, track_id=current_track_id),
+            next_item=next_item,
+        )
+    )
+    await _wait_for_reconcile(engine)
+    await engine.handle_queue_state(
+        QueueStateSnapshot(
+            queue_version=QueueVersion(major=70, minor=0),
+            action_uuid=b"\x00" * 16,
+            tracks=[
+                QueueTrackRef(queue_item_id=100 + idx, track_id=tid)
+                for idx, tid in enumerate(track_ids)
+            ],
+            shuffle_mode=False,
+            autoplay_mode=False,
+        )
+    )
+    await _wait_for_preload(engine)
+
+
+def _ma_track_ids(provider: _FakeProvider) -> list[str | None]:
+    return [
+        getattr(item.media_item, "item_id", None)
+        for item in provider.mass.player_queues.queue_items
+    ]
+
+
+async def _deliver_reorder_snapshot(
+    engine: QobuzConnectSyncEngine,
+    track_ids: list[str],
+    *,
+    qv_minor: int = 1,
+) -> None:
+    """Push a new snapshot at higher qv that reflects a Qobuz-app reorder."""
+    await engine.handle_queue_state(
+        QueueStateSnapshot(
+            queue_version=QueueVersion(major=70, minor=qv_minor),
+            action_uuid=b"\x00" * 16,
+            tracks=[
+                QueueTrackRef(queue_item_id=100 + idx, track_id=tid)
+                for idx, tid in enumerate(track_ids)
+            ],
+            shuffle_mode=False,
+            autoplay_mode=False,
+        )
+    )
+    await _wait_for_preload(engine)
+
+
+@pytest.mark.asyncio
+async def test_reorder_within_tail_aligns_ma_queue() -> None:
+    """Pure tail reorder: ``[a,b,c,X,d,e,f]`` → ``[a,b,c,X,e,d,f]``."""
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+    await _seed_full_playlist(engine, ["a", "b", "c", "X", "d", "e", "f"], "X")
+
+    await _deliver_reorder_snapshot(engine, ["a", "b", "c", "X", "e", "d", "f"])
+
+    assert _ma_track_ids(provider) == ["a", "b", "c", "X", "e", "d", "f"]
+    assert queue.current_index == 3  # X still at index 3
+
+
+@pytest.mark.asyncio
+async def test_reorder_within_history_aligns_ma_queue() -> None:
+    """Pure history reorder: ``[a,b,c,X,d,e]`` → ``[c,b,a,X,d,e]``."""
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+    await _seed_full_playlist(engine, ["a", "b", "c", "X", "d", "e"], "X")
+
+    await _deliver_reorder_snapshot(engine, ["c", "b", "a", "X", "d", "e"])
+
+    assert _ma_track_ids(provider) == ["c", "b", "a", "X", "d", "e"]
+    assert queue.current_index == 3  # X still at index 3 — prefix size unchanged
+
+
+@pytest.mark.asyncio
+async def test_reorder_history_to_tail_shifts_current_index() -> None:
+    """History → tail: ``[a,b,c,X,d,e]`` → ``[b,c,X,a,d,e]`` shifts current 3 → 2."""
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+    await _seed_full_playlist(engine, ["a", "b", "c", "X", "d", "e"], "X")
+    assert queue.current_index == 3
+
+    await _deliver_reorder_snapshot(engine, ["b", "c", "X", "a", "d", "e"])
+
+    assert _ma_track_ids(provider) == ["b", "c", "X", "a", "d", "e"]
+    assert queue.current_index == 2, (
+        f"X moved up one position (a left history); got current_index={queue.current_index}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reorder_tail_to_history_shifts_current_index() -> None:
+    """Tail → history: ``[a,X,b,c,d,e]`` → ``[a,b,X,c,d,e]`` shifts current 1 → 2."""
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+    await _seed_full_playlist(engine, ["a", "X", "b", "c", "d", "e"], "X")
+    assert queue.current_index == 1
+
+    await _deliver_reorder_snapshot(engine, ["a", "b", "X", "c", "d", "e"])
+
+    assert _ma_track_ids(provider) == ["a", "b", "X", "c", "d", "e"]
+    assert queue.current_index == 2, (
+        f"X shifted down one position (b moved before it); got current_index={queue.current_index}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reorder_does_not_disturb_audio() -> None:
+    """Reorder must not call ``stop`` / ``play_index`` / ``clear`` — only ``update_items``."""
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+    await _seed_full_playlist(engine, ["a", "b", "X", "c", "d"], "X")
+    calls_before_reorder = len(provider.mass.player_queues.calls)
+
+    await _deliver_reorder_snapshot(engine, ["b", "X", "a", "c", "d"])
+
+    new_calls = provider.mass.player_queues.calls[calls_before_reorder:]
+    kinds = [c[0] for c in new_calls]
+    assert "stop" not in kinds, f"Reorder must not stop playback; got {kinds}"
+    assert "play_index" not in kinds, f"Reorder must not call play_index; got {kinds}"
+    assert "clear" not in kinds, f"Reorder must not clear the queue; got {kinds}"
+    assert "update_items" in kinds, f"Reorder must call update_items; got {kinds}"
+
+
+@pytest.mark.asyncio
+async def test_reorder_does_not_echo_to_cloud() -> None:
+    """The ``update_items`` call inside the reconciler runs under Origin.QOBUZ.
+
+    Without that scope, MA's ``QUEUE_ITEMS_UPDATED`` event would be picked
+    up by our outbound differ and a wrong-direction ``REMOVE_TRACKS`` /
+    ``REORDER_TRACKS`` would fire at the cloud with a stale version.
+    """
+    session = _FakeSession()
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    await _seed_full_playlist(engine, ["a", "b", "X", "c", "d"], "X")
+    outbound_before = (
+        len(session.queue_adds)
+        + len(session.queue_inserts)
+        + len(session.queue_removes)
+        + len(session.queue_reorders)
+        + len(session.clear_queues)
+    )
+
+    await _deliver_reorder_snapshot(engine, ["b", "X", "a", "c", "d"])
+
+    outbound_after = (
+        len(session.queue_adds)
+        + len(session.queue_inserts)
+        + len(session.queue_removes)
+        + len(session.queue_reorders)
+        + len(session.clear_queues)
+    )
+    assert outbound_after == outbound_before, (
+        f"Reorder must not echo to cloud; new outbound calls beyond {outbound_before}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reorder_already_aligned_is_noop() -> None:
+    """Receiving a snapshot identical to MA's current order issues no ``update_items``."""
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+    await _seed_full_playlist(engine, ["a", "b", "X", "c", "d"], "X")
+    calls_before = len(provider.mass.player_queues.calls)
+
+    # Same order, new qv. The dedup gate keys on qv so the reconciler does
+    # iterate; the reorder pass must short-circuit on the new_ids==old_ids
+    # check.
+    await _deliver_reorder_snapshot(engine, ["a", "b", "X", "c", "d"], qv_minor=2)
+
+    new_calls = provider.mass.player_queues.calls[calls_before:]
+    update_calls = [c for c in new_calls if c[0] == "update_items"]
+    assert not update_calls, f"Identical snapshot must not trigger update_items; got {update_calls}"
 
 
 @pytest.mark.asyncio
