@@ -261,6 +261,106 @@ class QobuzConnectCodec:
         msg.ctrlSrvrAskForQueueState.CopyFrom(ask)
         return self._encode_batch(msg)
 
+    def encode_clear_queue(self, queue_version: QueueVersion) -> bytes:
+        """Encode ``CTRL_SRVR_CLEAR_QUEUE`` — drop all queue items."""
+        clear = queue_pb2.CtrlSrvrClearQueue()
+        clear.queueVersion.major = queue_version.major
+        clear.queueVersion.minor = queue_version.minor
+        msg = payload_pb2.QConnectMessage()
+        msg.messageType = QConnectMessageType.CTRL_SRVR_CLEAR_QUEUE
+        msg.ctrlSrvrClearQueue.CopyFrom(clear)
+        return self._encode_batch(msg)
+
+    def encode_queue_add_tracks(
+        self,
+        *,
+        action_uuid: bytes,
+        tracks: list[QueueTrackRef],
+        queue_version: QueueVersion,
+        context_uuid: bytes | None = None,
+        autoplay_reset: bool = False,
+    ) -> bytes:
+        """Encode ``CTRL_SRVR_QUEUE_ADD_TRACKS`` — append tracks to the end of the queue."""
+        add = queue_pb2.CtrlSrvrQueueAddTracks()
+        add.queueVersion.major = queue_version.major
+        add.queueVersion.minor = queue_version.minor
+        add.actionUuid = action_uuid
+        _pack_track_refs(add.tracks, tracks)
+        add.autoplayReset = autoplay_reset
+        if context_uuid:
+            add.contextUuid = context_uuid
+        msg = payload_pb2.QConnectMessage()
+        msg.messageType = QConnectMessageType.CTRL_SRVR_QUEUE_ADD_TRACKS
+        msg.ctrlSrvrQueueAddTracks.CopyFrom(add)
+        return self._encode_batch(msg)
+
+    def encode_queue_insert_tracks(
+        self,
+        *,
+        action_uuid: bytes,
+        tracks: list[QueueTrackRef],
+        insert_after: int,
+        queue_version: QueueVersion,
+        context_uuid: bytes | None = None,
+        autoplay_reset: bool = False,
+    ) -> bytes:
+        """Encode ``CTRL_SRVR_QUEUE_INSERT_TRACKS`` — insert tracks after ``insert_after`` index."""
+        insert = queue_pb2.CtrlSrvrQueueInsertTracks()
+        insert.queueVersion.major = queue_version.major
+        insert.queueVersion.minor = queue_version.minor
+        insert.actionUuid = action_uuid
+        _pack_track_refs(insert.tracks, tracks)
+        insert.insertAfter = insert_after
+        insert.autoplayReset = autoplay_reset
+        if context_uuid:
+            insert.contextUuid = context_uuid
+        msg = payload_pb2.QConnectMessage()
+        msg.messageType = QConnectMessageType.CTRL_SRVR_QUEUE_INSERT_TRACKS
+        msg.ctrlSrvrQueueInsertTracks.CopyFrom(insert)
+        return self._encode_batch(msg)
+
+    def encode_queue_remove_tracks(
+        self,
+        *,
+        action_uuid: bytes,
+        queue_item_ids: list[int],
+        queue_version: QueueVersion,
+        autoplay_reset: bool = False,
+    ) -> bytes:
+        """Encode ``CTRL_SRVR_QUEUE_REMOVE_TRACKS`` — remove items by ``queue_item_id``."""
+        remove = queue_pb2.CtrlSrvrQueueRemoveTracks()
+        remove.queueVersion.major = queue_version.major
+        remove.queueVersion.minor = queue_version.minor
+        remove.actionUuid = action_uuid
+        remove.queueItemIds.extend(queue_item_ids)
+        remove.autoplayReset = autoplay_reset
+        msg = payload_pb2.QConnectMessage()
+        msg.messageType = QConnectMessageType.CTRL_SRVR_QUEUE_REMOVE_TRACKS
+        msg.ctrlSrvrQueueRemoveTracks.CopyFrom(remove)
+        return self._encode_batch(msg)
+
+    def encode_queue_reorder_tracks(
+        self,
+        *,
+        action_uuid: bytes,
+        queue_item_ids: list[int],
+        insert_after: int,
+        queue_version: QueueVersion,
+        autoplay_reset: bool = False,
+    ) -> bytes:
+        """Encode ``CTRL_SRVR_QUEUE_REORDER_TRACKS`` — move the listed items after ``insert_after``."""
+        reorder = queue_pb2.CtrlSrvrQueueReorderTracks()
+        reorder.queueVersion.major = queue_version.major
+        reorder.queueVersion.minor = queue_version.minor
+        reorder.actionUuid = action_uuid
+        reorder.queueItemIds.extend(queue_item_ids)
+        reorder.insertAfter = insert_after
+        reorder.autoplayReset = autoplay_reset
+        msg = payload_pb2.QConnectMessage()
+        msg.messageType = QConnectMessageType.CTRL_SRVR_QUEUE_REORDER_TRACKS
+        msg.ctrlSrvrQueueReorderTracks.CopyFrom(reorder)
+        return self._encode_batch(msg)
+
     def encode_autoplay_load_tracks(
         self,
         *,
@@ -666,3 +766,13 @@ def _parse_track_ref(track_ref: Any) -> QueueTrackRef | None:
         track_id=str(track_ref.trackId),
         context_uuid=track_ref.contextUuid if track_ref.contextUuid else None,
     )
+
+
+def _pack_track_refs(repeated_field: Any, refs: list[QueueTrackRef]) -> None:
+    """Append each ``ref`` onto a protobuf ``repeated QueueTrackRef`` field."""
+    for ref in refs:
+        wire = repeated_field.add()
+        wire.queueItemId = ref.queue_item_id
+        wire.trackId = int(ref.track_id)
+        if ref.context_uuid:
+            wire.contextUuid = ref.context_uuid
