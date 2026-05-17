@@ -65,28 +65,86 @@ class SeekPipeline:
 
     # ---- pending-position (Qobuz wants MA at X before free-run) --------
 
-    def set_pending_qobuz_position(self, position_ms: int) -> None:
-        """Remember the target position MA must confirm before Qobuz can free-run."""
-        self._engine.qobuz_position = PendingQobuzPosition(
-            target_ms=max(0, position_ms),
-            timestamp_ms=int(time.time() * 1000),
-        )
+    def set_pending_qobuz_position(self, position_ms: int, *, mark_issued: bool = True) -> None:
+        """
+        Remember the target position MA must confirm before Qobuz can free-run.
+
+        :param position_ms: New target position from Qobuz, in milliseconds.
+        :param mark_issued: ``True`` when this call accompanies an actual MA
+            operation (``bridge.seek`` / ``bridge.play_index``) — sets
+            ``issued_ms`` to ``position_ms`` and resets the timestamp.
+            ``False`` when only the desired target has moved (a later Qobuz
+            seek arrived while the prior MA operation is still in flight,
+            or the seek-debounce path is reserving the target before its
+            timer fires) — updates ``target_ms`` only so the confirmation
+            check keeps comparing against what we actually told MA to do.
+        """
+        target = max(0, position_ms)
+        pending = self._engine.qobuz_position
+        if pending is None:
+            self._engine.qobuz_position = PendingQobuzPosition(
+                target_ms=target,
+                issued_ms=target if mark_issued else None,
+                timestamp_ms=int(time.time() * 1000),
+            )
+            return
+        if mark_issued:
+            pending.target_ms = target
+            pending.issued_ms = target
+            pending.timestamp_ms = int(time.time() * 1000)
+            return
+        pending.target_ms = target
 
     def pending_position_confirmed(self, ma_position_ms: int) -> bool:
-        """Return whether MA's position plausibly confirms the pending Qobuz target."""
+        """Return whether MA has reached the position we last asked it to seek to."""
         pending = self._engine.qobuz_position
         if pending is None:
             return True
+        if pending.issued_ms is None:
+            # Target reserved but no MA seek issued yet — nothing for MA to
+            # have reached. Hold the frozen Qobuz position until the
+            # debounce path actually fires the MA seek.
+            return False
         elapsed_ms = max(0, int(time.time() * 1000) - pending.timestamp_ms)
-        lower_bound = max(0, pending.target_ms - SEEK_TOLERANCE_MS)
-        upper_bound = pending.target_ms + elapsed_ms + SEEK_CONFIRM_OVERSHOOT_MS
+        lower_bound = max(0, pending.issued_ms - SEEK_TOLERANCE_MS)
+        upper_bound = pending.issued_ms + elapsed_ms + SEEK_CONFIRM_OVERSHOOT_MS
         return lower_bound <= ma_position_ms <= upper_bound
+
+    def has_deferred_target(self) -> bool:
+        """Return whether a newer Qobuz seek target is waiting on the in-flight MA seek."""
+        pending = self._engine.qobuz_position
+        return (
+            pending is not None
+            and pending.issued_ms is not None
+            and pending.target_ms != pending.issued_ms
+        )
+
+    def has_in_flight_seek(self) -> bool:
+        """Return whether we have issued an MA seek that MA hasn't confirmed yet."""
+        pending = self._engine.qobuz_position
+        return pending is not None and pending.issued_ms is not None
 
     def clear_pending_position(self) -> None:
         """Clear a pending Qobuz seek/position confirmation."""
         self._engine.qobuz_position = None
         self._engine.playing_seek = None
         self.cancel_pending_seek()
+
+    async def reissue_deferred_seek(self, player_id: str) -> bool:
+        """
+        Issue an MA seek for the deferred target after the prior one confirmed.
+
+        Returns ``True`` when a fresh MA seek was issued, ``False`` when no
+        deferred target was waiting (caller should clear the pending state
+        in that case).
+        """
+        pending = self._engine.qobuz_position
+        if pending is None or pending.issued_ms is None or pending.target_ms == pending.issued_ms:
+            return False
+        new_target = pending.target_ms
+        self.set_pending_qobuz_position(new_target, mark_issued=True)
+        await self._engine.bridge.seek(player_id, new_target // 1000)
+        return True
 
     # ---- playing-seek (debounced) --------------------------------------
 
@@ -104,11 +162,36 @@ class SeekPipeline:
         if generation is not None and not engine._is_current_command(generation):
             return
         local_ms = int(getattr(queue, "corrected_elapsed_time", 0) * 1000)
-        if abs(local_ms - position_ms) >= SEEK_TOLERANCE_MS:
-            self.set_pending_qobuz_position(position_ms)
-            if generation is not None and not engine._is_current_command(generation):
-                return
-            await engine.bridge.seek(player_id, position_ms // 1000)
+        if abs(local_ms - position_ms) < SEEK_TOLERANCE_MS:
+            return
+        # If a prior MA seek is still in flight and MA's reported position
+        # is clearly *below* the in-flight target (= the seek hasn't
+        # landed yet), don't fire another expensive MA seek on top. On
+        # AirPlay/Snapcast each bridge.seek tears down and restarts the
+        # renderer; stacking those during rapid scrubbing crashed the
+        # audio bridge on Pi (see the May 2026 incident). Just record
+        # the new desired target — the deferred reissue path in
+        # :func:`sync._sync_mirror_from_ma_queue` sends a fresh seek
+        # once MA confirms the in-flight one.
+        #
+        # We deliberately only defer on the "MA still buffering forward
+        # to the prior target" case: backward-seek transients (MA still
+        # reporting the old higher position) are rare scrubbing patterns,
+        # and not deferring there means at most one redundant MA seek
+        # rather than a stuck-deferred state if MA never drops back.
+        pending = engine.qobuz_position
+        if (
+            self.has_in_flight_seek()
+            and pending is not None
+            and pending.issued_ms is not None
+            and local_ms < pending.issued_ms - SEEK_TOLERANCE_MS
+        ):
+            self.set_pending_qobuz_position(position_ms, mark_issued=False)
+            return
+        self.set_pending_qobuz_position(position_ms)
+        if generation is not None and not engine._is_current_command(generation):
+            return
+        await engine.bridge.seek(player_id, position_ms // 1000)
 
     def schedule_playing_seek(
         self,
@@ -120,7 +203,11 @@ class SeekPipeline:
         engine = self._engine
         current_ref = TrackRefKey.from_ref(engine.qobuz_state.current_item)
         engine.reporter.set_buffering()
-        self.set_pending_qobuz_position(position_ms)
+        # Reserve the target *without* marking it as issued: the debounce
+        # timer still has to fire before we call ``bridge.seek``. Marking
+        # issued here would make ``seek_playing_if_needed`` think a prior
+        # seek is in flight and defer instead of issuing the first one.
+        self.set_pending_qobuz_position(position_ms, mark_issued=False)
         self.cancel_pending_seek()
         # ``generation or 0`` keeps the dataclass typed; ``None`` callers
         # come from pre-generation contexts that pre-date staleness checks.
