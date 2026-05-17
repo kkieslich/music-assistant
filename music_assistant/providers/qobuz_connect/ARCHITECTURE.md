@@ -69,19 +69,23 @@ actually fetches the audio.
 
 ## Module map
 
-| File                           | Owns                                                      | MA?  | Proto? |
-|--------------------------------|-----------------------------------------------------------|------|--------|
-| [`discovery.py`](discovery.py) | mDNS service + local HTTP handshake endpoints             | ❌    | ❌      |
-| [`protocol.py`](protocol.py)   | Outer-frame codec + protobuf encode/decode                | ❌    | ✅      |
-| [`session.py`](session.py)     | WebSocket lifecycle, token refresh, frame dispatch        | ❌    | via proto |
-| [`models.py`](models.py)       | DTOs + enums shared across all of the above               | ❌    | enum refs only |
-| [`sync.py`](sync.py)           | **Single owner of MA ↔ Qobuz reconciliation** (1.1k LOC)  | ✅    | indirect (via models enums) |
-| [`__init__.py`](__init__.py)   | `QobuzConnectProvider`: config, lifecycle, wiring, callbacks | ✅ | ❌      |
+| File                                            | Owns                                                                                  | MA?  | Proto? |
+|-------------------------------------------------|---------------------------------------------------------------------------------------|------|--------|
+| [`discovery.py`](discovery.py)                  | mDNS service + local HTTP handshake endpoints                                         | ❌    | ❌      |
+| [`protocol.py`](protocol.py)                    | Outer-frame codec + protobuf encode/decode                                            | ❌    | ✅      |
+| [`session.py`](session.py)                      | WebSocket lifecycle, token refresh, hand-off to dispatcher                            | ❌    | via proto |
+| [`inbound_dispatcher.py`](inbound_dispatcher.py)| Routing table: decoded inner message → typed callback                                 | ❌    | via proto |
+| [`models.py`](models.py)                        | DTOs + enums shared across all of the above                                           | ❌    | enum refs only |
+| [`state.py`](state.py)                          | Ephemeral pending-action state (paused/playing seek, position confirmation, OriginScope) | ❌ | ❌      |
+| [`ma_bridge.py`](ma_bridge.py)                  | The one place sync.py touches Music Assistant                                         | ✅    | ❌      |
+| [`sync.py`](sync.py)                            | **MA ↔ Qobuz reconciliation engine** — handlers + tasks                                | ✅ (via bridge) | indirect |
+| [`__init__.py`](__init__.py)                    | `QobuzConnectProvider`: config, lifecycle, wiring                                     | ✅    | ❌      |
 
-The first three modules are intentionally pure: they could be lifted into a
-standalone Qobuz Connect SDK and reused outside Music Assistant. The MA
-coupling lives in `sync.py` and `__init__.py` — which is also the part the
-plan calls out for restructuring in Phase C.
+The first six modules (discovery → models → state → inbound_dispatcher)
+are pure: they could be lifted into a standalone Qobuz Connect SDK
+without MA. MA coupling lives behind `ma_bridge.py` (and in
+`__init__.py` which constructs the provider). After Phase C,
+`sync.py`'s every MA access goes through `self.bridge`.
 
 ## Inbound messages (Qobuz → this provider)
 

@@ -27,21 +27,21 @@ Exposes:
 
 Depends on:
 - :mod:`.models` for state DTOs and enums.
-- :mod:`.ma_bridge` (``self.bridge``) for the provider-facing accessors:
-  logger, qobuz session, target-player resolution, native qobuz music
-  provider, queue-item → Qobuz track-id mapping.
-- ``music_assistant_models`` + ``self.mass.player_queues`` /
-  ``self.mass.players`` for the direct MA-core operations not yet moved
-  behind the bridge (Phase C later stages absorb these too).
+- :mod:`.state` for ``PausedSeek`` / ``PendingPlayingSeek`` /
+  ``PendingQobuzPosition`` / ``TrackRefKey`` / ``origin_scope`` — the
+  ephemeral pending-action state that used to live as scattered
+  ``_pending_*`` fields here.
+- :mod:`.ma_bridge` (``self.bridge``) — the single seam to the MA
+  world: provider accessors plus the ``mass.player_queues.*`` /
+  ``mass.players.*`` operations.
 - :mod:`.session` indirectly via ``self.bridge.session.send_*``.
 
-Known sharp edges (Phase C continues to address):
-- Direct ``mass.player_queues.*`` / ``mass.players.*`` calls — Phase C
-  later stage expands ``MABridge`` to absorb these too.
+Known sharp edges left for future cleanup:
 - A hardcoded French error-message string-match (``"Le tableau d'octets
-  doit avoir une longueur de 16"``) used to recover from a specific
-  ``QueueError`` — should switch to ``QueueError.code`` matching once
-  the cloud's error-code enum is named (Stage 5 cleanup).
+  doit avoir une longueur de 16"``) is still used to recover from a
+  specific ``QueueError``. It works in production but should switch to
+  ``QueueError.code`` matching — defer until we capture a real
+  occurrence of this error.
 
 See :doc:`ARCHITECTURE` for the state machine overview, the field
 inventory and the glossary of concepts (Origin, queue version,
@@ -106,10 +106,10 @@ class QobuzConnectSyncEngine:
     def __init__(self, provider: Any) -> None:
         """Initialize sync engine."""
         self.provider = provider
-        self.mass = provider.mass
-        # Single seam for provider-facing access. The bridge is a thin
-        # facade today; later Phase C stages will broaden it to absorb
-        # the direct ``mass.player_queues.*`` calls as well.
+        # Single seam for the MA world — provider accessors plus the
+        # ``mass.player_queues.*`` / ``mass.players.*`` operations.
+        # Direct ``self.mass``/``self.provider`` use has been retired
+        # from this file in favour of the bridge.
         self.bridge = MABridge(provider)
         self.qobuz_state = QobuzMirror()
         # Pending-action ephemeral state, grouped into typed dataclasses
@@ -369,7 +369,7 @@ class QobuzConnectSyncEngine:
         if not session:
             return
         player_id = self.bridge.target_player_id()
-        queue = self.mass.player_queues.get(player_id) if player_id else None
+        queue = self.bridge.get_queue(player_id) if player_id else None
         if sync_from_ma and queue and not self._has_active_reconcile():
             ma_track_id = (
                 self.bridge.qobuz_track_id_for(queue.current_item)
@@ -433,7 +433,7 @@ class QobuzConnectSyncEngine:
         """Set MA player volume from Qobuz app."""
         player_id = self._require_target_player_id()
         volume = max(0, min(100, int(level)))
-        await self.mass.players.cmd_volume_set(player_id, volume)
+        await self.bridge.cmd_volume_set(player_id, volume)
         session = self.bridge.session
         if session:
             await session.send_volume_changed(volume)
@@ -443,7 +443,7 @@ class QobuzConnectSyncEngine:
         """Adjust MA volume from Qobuz app."""
         player_id = self.bridge.target_player_id()
         current = 0
-        if player_id and (player := self.mass.players.get_player(player_id)):
+        if player_id and (player := self.bridge.get_player(player_id)):
             current = player.state.volume_level or 0
         return await self.set_volume(current + int(delta))
 
@@ -574,7 +574,7 @@ class QobuzConnectSyncEngine:
     async def _sync_latest_matching_ma_queue(self) -> None:
         """Accept MA state after the latest reconcile has applied its command."""
         player_id = self.bridge.target_player_id()
-        queue = self.mass.player_queues.get(player_id) if player_id else None
+        queue = self.bridge.get_queue(player_id) if player_id else None
         current_item = self.qobuz_state.current_item
         if not queue or not current_item or not getattr(queue, "current_item", None):
             return
@@ -623,7 +623,7 @@ class QobuzConnectSyncEngine:
         )
 
         player_id = self._require_target_player_id()
-        queue = self.mass.player_queues.get(player_id)
+        queue = self.bridge.get_queue(player_id)
         current_ma_track_id = (
             self.bridge.qobuz_track_id_for(queue.current_item)
             if queue and queue.current_item
@@ -637,7 +637,7 @@ class QobuzConnectSyncEngine:
             if start_position_ms > 0 and queue.current_index is not None:
                 if not self._is_current_command(generation, item):
                     return
-                await self.mass.player_queues.play_index(
+                await self.bridge.play_index(
                     player_id,
                     queue.current_index,
                     seek_position=start_position_ms // 1000,
@@ -645,14 +645,14 @@ class QobuzConnectSyncEngine:
             else:
                 if not self._is_current_command(generation, item):
                     return
-                await self.mass.player_queues.play(player_id)
+                await self.bridge.play(player_id)
         elif queue and queue.state == MAPlaybackState.PLAYING:
             await self._seek_playing_if_needed(player_id, start_position_ms, generation)
         elif queue and queue.current_item:
             if start_position_ms > 0 and queue.current_index is not None:
                 if not self._is_current_command(generation, item):
                     return
-                await self.mass.player_queues.play_index(
+                await self.bridge.play_index(
                     player_id,
                     queue.current_index,
                     seek_position=start_position_ms // 1000,
@@ -660,7 +660,7 @@ class QobuzConnectSyncEngine:
             else:
                 if not self._is_current_command(generation, item):
                     return
-                await self.mass.player_queues.play(player_id)
+                await self.bridge.play(player_id)
 
     async def _handle_qobuz_pause(self, event: SetStateEvent, generation: int) -> None:
         self._set_pending_paused_seek(
@@ -672,19 +672,19 @@ class QobuzConnectSyncEngine:
             self.qobuz_state.current_item,
         )
         player_id = self.bridge.target_player_id()
-        queue = self.mass.player_queues.get(player_id) if player_id else None
+        queue = self.bridge.get_queue(player_id) if player_id else None
         if queue and queue.state == MAPlaybackState.PLAYING:
             if not player_id:
                 return
             if not self._is_current_command(generation):
                 return
-            await self.mass.player_queues.pause(player_id)
+            await self.bridge.pause(player_id)
 
     async def _handle_qobuz_stop(self, generation: int) -> None:
         player_id = self.bridge.target_player_id()
         if player_id and self._is_current_command(generation):
             with contextlib.suppress(Exception):
-                await self.mass.player_queues.stop(player_id)
+                await self.bridge.stop_queue(player_id)
 
     async def _handle_qobuz_position_only(self, position_ms: int, generation: int) -> None:
         if self.qobuz_state.playing_state == PlayingState.PAUSED:
@@ -693,7 +693,7 @@ class QobuzConnectSyncEngine:
         if self.qobuz_state.playing_state == PlayingState.PLAYING:
             player_id = self.bridge.target_player_id()
             if player_id:
-                queue = self.mass.player_queues.get(player_id)
+                queue = self.bridge.get_queue(player_id)
                 local_ms = (
                     int(getattr(queue, "corrected_elapsed_time", 0) * 1000)
                     if queue and queue.state == MAPlaybackState.PLAYING
@@ -730,17 +730,17 @@ class QobuzConnectSyncEngine:
                 tracks.append(await self._get_ma_track(self.qobuz_state.next_item.track_id))
         if not self._is_current_command(generation, current_item):
             return
-        queue = self.mass.player_queues.get(player_id)
+        queue = self.bridge.get_queue(player_id)
         if queue and queue.state != MAPlaybackState.IDLE:
             with contextlib.suppress(Exception):
-                await self.mass.player_queues.stop(player_id)
+                await self.bridge.stop_queue(player_id)
         if not self._is_current_command(generation, current_item):
             return
         queue_items = [QueueItem.from_media_item(player_id, track) for track in tracks]
-        self.mass.player_queues.clear(player_id, skip_stop=True)
+        self.bridge.clear_queue(player_id, skip_stop=True)
         if not self._is_current_command(generation, current_item):
             return
-        await self.mass.player_queues.load(
+        await self.bridge.load_queue(
             player_id,
             queue_items=queue_items,
             keep_remaining=False,
@@ -753,7 +753,7 @@ class QobuzConnectSyncEngine:
             item=current_item,
             source_ms=0,
         )
-        await self.mass.player_queues.play_index(
+        await self.bridge.play_index(
             player_id,
             0,
             seek_position=start_position_ms // 1000,
@@ -765,7 +765,7 @@ class QobuzConnectSyncEngine:
         position_ms: int,
         generation: int | None = None,
     ) -> None:
-        queue = self.mass.player_queues.get(player_id)
+        queue = self.bridge.get_queue(player_id)
         if not queue or not queue.current_item or queue.state != MAPlaybackState.PLAYING:
             return
         if generation is not None and not self._is_current_command(generation):
@@ -779,7 +779,7 @@ class QobuzConnectSyncEngine:
             )
             if generation is not None and not self._is_current_command(generation):
                 return
-            await self.mass.player_queues.seek(player_id, position_ms // 1000)
+            await self.bridge.seek(player_id, position_ms // 1000)
 
     def _schedule_playing_seek(
         self,
@@ -858,7 +858,7 @@ class QobuzConnectSyncEngine:
         player_id = self.bridge.target_player_id()
         if not player_id:
             return
-        queue = self.mass.player_queues.get(player_id) if player_id else None
+        queue = self.bridge.get_queue(player_id) if player_id else None
         if not queue or not queue.current_item:
             return
         current_ma_track_id = self.bridge.qobuz_track_id_for(queue.current_item)
@@ -869,9 +869,9 @@ class QobuzConnectSyncEngine:
             return
         if generation is not None and not self._is_current_command(generation):
             return
-        await self.mass.player_queues.play_media(
-            queue_id=player_id,
-            media=cast("Any", ma_track),
+        await self.bridge.play_media(
+            player_id,
+            cast("Any", ma_track),
             option=QueueOption.REPLACE_NEXT,
         )
         self._last_prequeued_next_ref = next_ref
