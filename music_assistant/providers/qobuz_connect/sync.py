@@ -696,18 +696,16 @@ class QobuzConnectSyncEngine:
         )
 
     async def handle_queue_state(self, snapshot: QueueStateSnapshot) -> None:
-        """Apply a full ``SRVR_CTRL_QUEUE_STATE`` snapshot to the mirror + MA.
-
-        The snapshot normally lands *after* an earlier ``SET_STATE`` reconcile
-        has already filled MA's queue with just current+next (because the
-        snapshot is the cloud's async response to our ask). Once the full
-        list is on the mirror, fire-and-forget the chunked background
-        preload that extends MA's queue without disrupting playback.
-        """
+        """Apply a full ``SRVR_CTRL_QUEUE_STATE`` snapshot to the mirror + MA."""
         self.qobuz_state.queue_version = snapshot.queue_version
         self.qobuz_state.tracks = list(snapshot.tracks)
         self.qobuz_state.shuffle_mode = snapshot.shuffle_mode
         self.qobuz_state.autoplay_mode = snapshot.autoplay_mode
+        # Tracks just mutated — release the dedup gate so any prior
+        # materialize (e.g. one that ran during the stale-tracks gap
+        # between SET_STATE and this snapshot) doesn't silently swallow
+        # this reconcile.
+        self.command_handler.reset_reconcile_dedup()
         await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     async def handle_queue_tracks_added(self, event: QueueTracksAddedEvent) -> None:
@@ -721,6 +719,7 @@ class QobuzConnectSyncEngine:
             return
         self.qobuz_state.queue_version = event.queue_version
         self.qobuz_state.tracks.extend(event.tracks)
+        self.command_handler.reset_reconcile_dedup()
         await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     async def handle_queue_tracks_inserted(self, event: QueueTracksInsertedEvent) -> None:
@@ -732,6 +731,7 @@ class QobuzConnectSyncEngine:
         self.qobuz_state.queue_version = event.queue_version
         insert_index = max(0, min(event.insert_after, len(self.qobuz_state.tracks)))
         self.qobuz_state.tracks[insert_index:insert_index] = event.tracks
+        self.command_handler.reset_reconcile_dedup()
         await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     async def handle_queue_tracks_removed(self, event: QueueTracksRemovedEvent) -> None:
@@ -746,6 +746,7 @@ class QobuzConnectSyncEngine:
         self.qobuz_state.tracks = [
             track for track in self.qobuz_state.tracks if track.queue_item_id not in removed_ids
         ]
+        self.command_handler.reset_reconcile_dedup()
         await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     def _absorb_cloud_qids_for_self_add(self, cloud_tracks: list[QueueTrackRef]) -> None:
@@ -782,6 +783,7 @@ class QobuzConnectSyncEngine:
         ]
         target = max(0, min(event.insert_after, len(remaining)))
         self.qobuz_state.tracks = remaining[:target] + moving + remaining[target:]
+        self.command_handler.reset_reconcile_dedup()
         await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     async def handle_queue_cleared(self, _event: QueueClearedEvent) -> None:
@@ -795,6 +797,7 @@ class QobuzConnectSyncEngine:
         self.qobuz_state.tracks = []
         if echo is not None:
             return  # MA already cleared; reconciler would be a no-op
+        self.command_handler.reset_reconcile_dedup()
         await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     async def handle_loop_mode(self, mode: LoopMode) -> None:
