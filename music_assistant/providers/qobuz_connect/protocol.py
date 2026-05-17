@@ -1,4 +1,30 @@
-"""Qobuz Connect websocket frame and protobuf helpers."""
+"""
+Qobuz Connect codec: outer WebSocket frames + inner protobuf messages.
+
+Owns:
+- ``QobuzConnectCodec`` — encoders for every outbound message type
+  (AUTHENTICATE, SUBSCRIBE, RNDR_SRVR_*, CTRL_SRVR_*) and parsers for
+  every inbound message type (SRVR_RNDR_SET_STATE, SRVR_CTRL_QUEUE_*,
+  SRVR_RNDR_SET_VOLUME, SRVR_RNDR_SET_ACTIVE, ...). Pure functions of
+  bytes ↔ typed events from :mod:`.models`.
+- The outer-frame format: ``[msg_type:1][varint_length][payload]``
+  expressed by ``decode_frame`` / the per-message encode helpers.
+
+Exposes:
+- ``QobuzConnectCodec`` and ``DecodedFrame``
+- Module-level constants ``QCONNECT_PROTO`` and the
+  ``OuterMessageType`` / ``QConnectMessageType`` re-exports
+  (real definitions live in :mod:`.models`).
+
+Depends on:
+- :mod:`.models` for enums and dataclasses.
+- ``.proto.qconnect_*_pb2`` generated modules. **Do not delete those
+  generated files** — they're committed and imported directly.
+- No imports from MA or the WebSocket transport — the codec is pure.
+
+See :doc:`ARCHITECTURE` for the full inbound/outbound message tables
+mapping wire types ↔ codec functions ↔ handlers.
+"""
 
 from __future__ import annotations
 

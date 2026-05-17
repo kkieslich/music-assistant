@@ -1,4 +1,54 @@
-"""Bidirectional Qobuz Connect <-> Music Assistant sync engine."""
+"""
+Bidirectional Qobuz ↔ Music Assistant reconciliation engine.
+
+Owns:
+- ``QobuzConnectSyncEngine`` — the only stateful glue between the cloud
+  protocol layer and Music Assistant. Single owner of:
+
+  * the ``QobuzMirror`` canonical state snapshot,
+  * generation tracking (``_qobuz_command_generation``) for latest-only
+    reconciliation of bursty commands,
+  * pending-action ephemeral state (paused-seek, playing-seek debounce,
+    position-confirmation, queue-load-ack futures, prequeue),
+  * the heartbeat / reconcile / metadata / buffering-report / debounced-
+    seek asyncio tasks.
+
+- The handler entry points used by :mod:`.session`:
+  ``handle_qobuz_set_state``, ``handle_queue_load_ack``,
+  ``handle_queue_error``, ``handle_queue_version``, ``set_volume``,
+  ``set_volume_delta``, ``report_state``, ``reset_for_deactivation``,
+  ``start`` / ``stop``.
+
+- The MA-event entry point: ``_on_ma_queue_event`` (subscribed via
+  ``mass.subscribe(QUEUE_UPDATED, ...)`` in :mod:`.__init__`).
+
+Exposes:
+- ``QobuzConnectSyncEngine``.
+
+Depends on:
+- :mod:`.models` for state DTOs and enums.
+- ``music_assistant_models`` + the provider instance for MA-side access:
+  ``provider.mass.player_queues``, ``provider.mass.players``,
+  ``provider.get_qobuz_provider()``, ``provider.get_target_player_id()``,
+  ``provider.qobuz_session``, ``provider.get_qobuz_track_id_from_queue_item()``.
+- :mod:`.session` indirectly via ``provider.qobuz_session.send_*``.
+
+Known sharp edges (Phase C of the plan addresses them):
+- 1.1k LOC in a single class with ~20 ungrouped instance fields.
+- ~40 direct ``provider.mass.*`` reach-throughs that the redesign moves
+  behind a ``MABridge`` abstraction.
+- A hardcoded French error-message string-match (``"Le tableau d'octets
+  doit avoir une longueur de 16"``) used to recover from a specific
+  ``QueueError`` — should switch to ``QueueError.code`` matching once
+  the cloud's error-code enum is named.
+- ``self.origin`` is a plain field used as a feedback-loop guard; a
+  missed ``finally`` would leak. Phase C wraps it in an async context
+  manager.
+
+See :doc:`ARCHITECTURE` for the state machine overview, the field
+inventory and the glossary of concepts (Origin, queue version,
+action_uuid, prequeue).
+"""
 
 from __future__ import annotations
 

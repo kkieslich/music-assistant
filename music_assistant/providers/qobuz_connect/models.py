@@ -1,4 +1,30 @@
-"""Local Qobuz Connect protocol and sync models."""
+"""
+Shared DTOs, enums and constants for the qobuz_connect provider.
+
+Owns:
+- Protocol constants: ``OAUTH_APP_ID``, ``QUALITY_TO_PROTOCOL`` /
+  ``QUALITY_TO_HTTP`` / ``QUALITY_AUDIO_PROPERTIES`` (Qobuz quality-id
+  mappings for the three places Qobuz expects them).
+- Wire-level enums: ``OuterMessageType``, ``QConnectMessageType``,
+  ``PlayingState``, ``BufferState``, ``Origin``.
+- Discovery-side DTOs: ``DeviceConfig``, ``JWTApiToken``,
+  ``JWTConnectToken``, ``ConnectTokens``.
+- State DTOs: ``QueueVersion``, ``QueueTrackRef``, ``SetStateEvent``,
+  ``QueueLoadAck``, ``QueueError``, ``QobuzMirror`` (the canonical
+  remote-state snapshot held by the sync engine).
+
+Exposes:
+- All of the above as importable names.
+
+Depends on:
+- Standard library only. **No MA imports, no protobuf imports.** This
+  module is the lingua franca that the codec, transport, discovery and
+  sync layers communicate with — it must stay framework-free.
+
+See :doc:`ARCHITECTURE` for which fields are part of the canonical mirror
+vs. ephemeral per-action state (the latter is mostly still in
+:mod:`.sync`; consolidating it here is Phase C of the plan).
+"""
 
 from __future__ import annotations
 
