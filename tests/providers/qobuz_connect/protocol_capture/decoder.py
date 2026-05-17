@@ -80,9 +80,7 @@ def decode_capture(path: str | Path) -> Iterator[DecodedFrame]:
     """
     Iterate decoded binary frames from a capture file.
 
-    :param path: Path to a ``.runs/*.json`` file written by ``WsRecorder``
-        (or one of the legacy ``proto/captured/capture-*.json`` files; only
-        the outgoing frames will be useful from those).
+    :param path: Path to a ``.runs/*.json`` file written by ``WsRecorder``.
     :returns: An iterator of :class:`DecodedFrame`, in capture order.
     """
     codec = QobuzConnectCodec(uuid.uuid4().bytes)

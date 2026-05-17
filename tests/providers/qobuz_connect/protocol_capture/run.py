@@ -11,9 +11,7 @@ Usage::
     python -m tests.providers.qobuz_connect.protocol_capture.run \
         --scenario queue_mutations
 
-Outputs two JSON capture files (one per Web Client) under ``.runs/``, in the
-exact schema of music_assistant/providers/qobuz_connect/proto/captured/*.json
-so existing analysis tooling and Phase B fixtures work unchanged.
+Outputs two JSON capture files (one per Web Client) under ``.runs/``.
 """
 
 from __future__ import annotations

@@ -23,7 +23,6 @@ Data flow: `Qobuz app  →  Qobuz Connect protocol (this provider)  →  MA play
 
 - `.proto` sources live in [proto/definition/](music_assistant/providers/qobuz_connect/proto/definition/); generated `*_pb2.py` are committed in [proto/](music_assistant/providers/qobuz_connect/proto/) and imported directly — do not delete the generated files.
 - **For protocol behavior questions, use the Playwright capture harness** at [tests/providers/qobuz_connect/protocol_capture/](tests/providers/qobuz_connect/protocol_capture/). It drives two real Qobuz Web Clients via CDP and records both directions of the WebSocket into `.runs/`. Add a scenario (or extend an existing one) when you need to observe a specific reference-implementation behavior. Network conditions can be throttled via Chrome DevTools Protocol for "slow renderer" tests.
-- The older Chrome-extension exports under [proto/captured/legacy/](music_assistant/providers/qobuz_connect/proto/captured/legacy/) are **obsolete** — incoming binary is empty. Do not use them for protocol analysis. Kept only as a historical record of the reverse-engineering that bootstrapped the proto definitions.
 
 ### qobuz_connect dev notes
 
