@@ -1,5 +1,5 @@
 """
-Handoff scenario — reproduces capture-1's flow with two Web Clients.
+Handoff scenario — A starts a track, hands off to B, B advances.
 
 Steps:
 1. Client A starts a track.

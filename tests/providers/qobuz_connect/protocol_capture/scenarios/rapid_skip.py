@@ -1,15 +1,13 @@
 """
-Rapid-skip scenario — reproduces capture-3's burst-stress flow.
+Rapid-skip scenario — B self-controls and presses skip-next five times rapidly.
 
-Steps:
-1. Client B starts a track.
-2. Client B presses skip-next five times in quick succession.
+When a Web Client controls itself, it short-circuits — skip-next
+mutates local state and broadcasts ``rndrSrvrStateUpdated`` instead of
+round-tripping through ``ctrlSrvrSetPlayerState → cloud → srvrRndrSetState``.
+So this scenario does NOT exercise our renderer-side burst-reconcile code.
+For that, see ``controller_burst_skip`` where A controls and B renders.
 
-Purpose: produce the burst of overlapping state updates that exposed the
-"burst commands" reconciliation issues the recent commits tried to patch
-(see commit 71f0af0a8 "Reconciling mechanism to handle burst commands").
-We want full incoming-binary traffic for this so the reworked dispatcher
-in Phase C can be exercised against real cloud behavior.
+Kept as a baseline for self-controlling burst behavior.
 """
 
 from __future__ import annotations

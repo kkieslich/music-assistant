@@ -1,8 +1,8 @@
 """
-Queue-mutations scenario — reproduces and extends capture-2.
+Queue-mutations scenario — exercises clear / add / pause / resume / reorder.
 
-Steps (mirrors capture-2 README, with the favorite/unfavorite tail dropped
-because those round-trip via REST, not QConnect):
+Steps (favorite/unfavorite intentionally omitted — those round-trip via REST,
+not QConnect):
 1. Client B clears its queue.
 2. Client B starts a track.
 3. Client A adds a track to B's queue (cross-client controller).
