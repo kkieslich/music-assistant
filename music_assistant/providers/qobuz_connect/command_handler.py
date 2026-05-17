@@ -25,13 +25,15 @@ Responsibilities (all consolidated here):
   ``_handle_qobuz_position_only``.
 - Replace MA's queue when Qobuz hands us a track MA doesn't have
   (``_replace_ma_queue_from_qobuz``).
-- Prequeue the next track when Qobuz announces it
-  (``_prequeue_next_item``).
+- Reconcile MA's queue toward ``qobuz_state.tracks`` whenever the
+  cloud's view of the queue changes — chunked background ADDs for
+  new items, surgical deletes for removed ones
+  (``schedule_reconcile_ma_to_mirror`` /
+  ``_run_reconcile_ma_to_mirror``).
 
-The handler owns the two background ``asyncio.Task``s (reconcile +
-metadata) and the prequeue-dedup ref. Everything else (mirror, seek
-pipeline, metadata cache, queue loader, outbound reporter) is reached
-via the engine.
+The handler owns the background ``asyncio.Task``s (reconcile +
+metadata + preload). Everything else (mirror, seek pipeline, metadata
+cache, queue loader, outbound reporter) is reached via the engine.
 """
 
 from __future__ import annotations
@@ -66,8 +68,7 @@ class CommandHandler:
 
     __slots__ = (
         "_engine",
-        "_last_preloaded_qv",
-        "_last_prequeued_next_ref",
+        "_last_reconciled_qv",
         "_metadata_task",
         "_position_only_task",
         "_preload_task",
@@ -81,11 +82,10 @@ class CommandHandler:
         self._metadata_task: asyncio.Task[None] | None = None
         self._position_only_task: asyncio.Task[None] | None = None
         self._preload_task: asyncio.Task[None] | None = None
-        self._last_prequeued_next_ref: TrackRefKey | None = None
-        # Queue-version of the last SRVR_CTRL_QUEUE_STATE snapshot we
-        # preloaded into MA. Dedupes redundant preloads — the cloud emits
-        # a fresh snapshot on every queue mutation.
-        self._last_preloaded_qv: tuple[int, int] | None = None
+        # Queue-version we last reconciled MA toward. The cloud bumps its
+        # ``queue_version`` on every mutation, so a delta naturally
+        # invalidates this and the reconciler runs again on the new qv.
+        self._last_reconciled_qv: tuple[int, int] | None = None
 
     # ---- public surface -------------------------------------------------
 
@@ -125,10 +125,9 @@ class CommandHandler:
         """Return whether MA is still catching up to the latest Qobuz command."""
         return self._reconcile_task is not None and not self._reconcile_task.done()
 
-    def reset_prequeue_dedup(self) -> None:
-        """Clear the prequeue + preload dedup refs — call after deactivation."""
-        self._last_prequeued_next_ref = None
-        self._last_preloaded_qv = None
+    def reset_reconcile_dedup(self) -> None:
+        """Clear the reconcile dedup ref — call after deactivation."""
+        self._last_reconciled_qv = None
 
     def cancel_tasks(self) -> None:
         """Cancel the in-flight reconcile + metadata + preload tasks (best-effort)."""
@@ -213,12 +212,6 @@ class CommandHandler:
         try:
             if event.current_item and engine._is_current_command(generation, event.current_item):
                 await engine.metadata.try_ensure_track_duration(event.current_item)
-            if (
-                engine._is_current_command(generation)
-                and not engine._pending_queue_loads
-                and event.next_item
-            ):
-                await self._prequeue_next_item(event.next_item, generation)
 
             if not engine._is_current_command(generation):
                 return
@@ -291,17 +284,19 @@ class CommandHandler:
         self._metadata_task = asyncio.create_task(self._run_metadata_update(event, generation))
 
     async def _run_metadata_update(self, event: SetStateEvent, generation: int) -> None:
-        """Resolve metadata and next queue items without blocking websocket receive."""
+        """Resolve metadata for the announced track so playback start is smooth.
+
+        Metadata-only ``SET_STATE`` frames (no playing_state, no position) used
+        to also prequeue ``event.next_item`` via ``play_media(REPLACE_NEXT)``,
+        but the cloud now keeps MA's queue in sync via the ``QUEUE_TRACKS_*``
+        delta path, so a separate prequeue is both redundant and destructive
+        (REPLACE_NEXT wipes everything past current). This path is left as a
+        thin track-duration prefetch.
+        """
         engine = self._engine
         try:
             if event.current_item and engine._is_current_command(generation, event.current_item):
                 await engine.metadata.try_ensure_track_duration(event.current_item)
-            if (
-                engine._is_current_command(generation)
-                and not engine._pending_queue_loads
-                and event.next_item
-            ):
-                await self._prequeue_next_item(event.next_item, generation)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -536,17 +531,17 @@ class CommandHandler:
         # previously-preloaded snapshot for the same ``queue_version`` is
         # gone too, so reset the dedup gate — otherwise a user skipping
         # within the same playlist (same qv, new current_item) would see
-        # MA stuck at 2 items because ``maybe_preload_remaining_tracks``
+        # MA stuck at 2 items because ``schedule_reconcile_ma_to_mirror``
         # thinks it already preloaded this qv. The preload itself dedupes
         # via MA's existing queue_items, so re-running is safe and cheap
         # when nothing has actually been lost.
-        self._last_preloaded_qv = None
+        self._last_reconciled_qv = None
         # Audio is now starting; if the cloud has already sent a snapshot
         # (QUEUE_STATE arrived before the replace finished), kick off the
         # background preload so MA's UI grows from current+next to the
         # full queue length without disrupting playback.
         if engine.qobuz_state.tracks and engine._is_current_command(generation, current_item):
-            await self.maybe_preload_remaining_tracks()
+            await self.schedule_reconcile_ma_to_mirror()
 
     async def _resolve_qobuz_queue_for_load(
         self,
@@ -574,18 +569,18 @@ class CommandHandler:
                 )
         return tracks, 0
 
-    async def maybe_preload_remaining_tracks(self) -> None:
-        """Background-extend MA's queue from the latest ``qobuz_state.tracks``.
+    async def schedule_reconcile_ma_to_mirror(self) -> None:
+        """Schedule a background pass that brings MA's queue in line with the mirror.
 
-        The initial ``_replace_ma_queue_from_qobuz`` only loaded current + next
-        so audio could start fast. This method picks up after the cloud's
-        ``SRVR_CTRL_QUEUE_STATE`` lands (or after the initial replace
-        completes if the snapshot was already there) and fills the rest of
-        the queue via chunked ``play_media(option=ADD)`` calls — no stop,
-        no clear, audio keeps playing.
+        Triggered after any cloud-side queue change has updated the mirror
+        (full ``SRVR_CTRL_QUEUE_STATE`` snapshot or any ``SRVR_CTRL_QUEUE_*``
+        delta). The reconciler removes MA items not in the mirror and
+        chunk-adds mirror items not in MA — audio never stops because every
+        mutation goes through non-disrupting ``delete_item`` /
+        ``play_media(option=ADD)`` calls.
 
-        Idempotent / dedupe-safe per ``qobuz_state.queue_version``.
-        Cancellable via the ``_preload_task`` slot.
+        Idempotent per ``qobuz_state.queue_version``. Cancellable via the
+        ``_preload_task`` slot.
         """
         engine = self._engine
         current_item = engine.qobuz_state.current_item
@@ -594,21 +589,19 @@ class CommandHandler:
             return
         if engine.qobuz_state.playing_state != PlayingState.PLAYING:
             return
-        if len(engine.qobuz_state.tracks) <= 1:
-            return
         snapshot_qv = (
             engine.qobuz_state.queue_version.major,
             engine.qobuz_state.queue_version.minor,
         )
-        if snapshot_qv == self._last_preloaded_qv:
+        if snapshot_qv == self._last_reconciled_qv:
             return
         player_id = engine.bridge.target_player_id()
         if not player_id:
             return
-        self._last_preloaded_qv = snapshot_qv
+        self._last_reconciled_qv = snapshot_qv
         generation = engine._command_generation
         logger.info(
-            "Preloading remaining %d tracks in background at qv=%d.%d",
+            "Reconciling MA queue toward Qobuz mirror (%d tracks) at qv=%d.%d",
             len(engine.qobuz_state.tracks),
             snapshot_qv[0],
             snapshot_qv[1],
@@ -616,142 +609,125 @@ class CommandHandler:
         if self._preload_task and not self._preload_task.done():
             self._preload_task.cancel()
         self._preload_task = asyncio.create_task(
-            self._run_queue_preload(player_id, current_item, generation)
+            self._run_ma_reconcile(player_id, current_item, generation)
         )
 
-    async def _run_queue_preload(
+    async def _run_ma_reconcile(
         self,
         player_id: str,
         current_item: QueueTrackRef,
         generation: int,
     ) -> None:
-        """Resolve the snapshot tail in chunks and ``play_media(ADD)`` it to MA.
+        """Drive MA's queue toward the mirror without disrupting playback.
 
-        Each chunk: parallel ``get_track_or_none`` via ``asyncio.gather``,
-        skip unresolvable tracks, skip tracks already present in MA's queue,
-        then a single non-disrupting ``play_media(option=ADD)`` call. A
-        ``_is_current_command`` check before every chunk lets a fresh
-        ``SET_STATE`` cancel us between chunks instead of mid-chunk.
+        Two passes:
+
+        1. **Remove** MA items whose Qobuz ``track_id`` is no longer in
+           ``qobuz_state.tracks`` (i.e. the cloud removed them). The
+           currently-playing MA item is preserved even if the mirror says
+           it's gone — that case is handled by a separate ``SET_STATE``.
+        2. **Add** mirror items not yet present in MA, chunked via
+           ``play_media(option=ADD)``. A ``_is_current_command`` check
+           between chunks lets a fresh ``SET_STATE`` cancel us cleanly.
         """
         engine = self._engine
         logger = engine.bridge.logger
         try:
-            tracks_refs = list(engine.qobuz_state.tracks)
-            current_key = TrackRefKey.from_ref(current_item)
-            current_idx = next(
-                (
-                    i
-                    for i, ref in enumerate(tracks_refs)
-                    if TrackRefKey.from_ref(ref) == current_key
-                ),
-                None,
-            )
-            if current_idx is None:
-                logger.debug("Preload skipped: current_item %s not in snapshot", current_key)
+            if not await self._reconcile_remove_stale(player_id, generation):
                 return
-            remaining = tracks_refs[current_idx + 1 :]
-            if not remaining:
-                return
-            # Build the set of Qobuz track ids already present in MA's queue
-            # so a snapshot refresh that overlaps the SET_STATE current+next
-            # doesn't double-add them. We keep this set in-memory and grow
-            # it as we ADD, rather than re-reading MA's queue between chunks
-            # — the queue size is hot in MA-internal state, not yet
-            # published back via our bridge, so a re-read risks missing
-            # tracks we just added.
-            existing_ids: set[str] = set()
-            for item in engine.bridge.queue_items(player_id):
-                track_id = engine.bridge.qobuz_track_id_for(item)
-                if track_id:
-                    existing_ids.add(track_id)
-            for chunk_start in range(0, len(remaining), PRELOAD_CHUNK_SIZE):
-                if not engine._is_current_command(generation):
-                    logger.debug("Preload bailing: superseded by newer command")
-                    return
-                chunk_refs = remaining[chunk_start : chunk_start + PRELOAD_CHUNK_SIZE]
-                pending_refs = [ref for ref in chunk_refs if ref.track_id not in existing_ids]
-                if not pending_refs:
-                    continue
-                resolved = await asyncio.gather(
-                    *[engine.metadata.get_track_or_none(ref.track_id) for ref in pending_refs],
-                )
-                if not engine._is_current_command(generation):
-                    return
-                to_add: list[Any] = []
-                for ref, ma_track in zip(pending_refs, resolved, strict=True):
-                    if ma_track is None:
-                        continue
-                    to_add.append(ma_track)
-                    existing_ids.add(ref.track_id)
-                if not to_add:
-                    continue
-                await engine.bridge.play_media(
-                    player_id,
-                    cast("Any", to_add),
-                    option=QueueOption.ADD,
-                )
-                # Yield so other tasks (a new SET_STATE, a seek) can preempt
-                # before we burn another chunk on the Qobuz API.
-                await asyncio.sleep(0)
+            await self._reconcile_add_missing(player_id, current_item, generation)
         except asyncio.CancelledError:
             raise
         except PlayerUnavailableError as err:
             if engine._is_current_command(generation):
-                logger.warning("Queue preload: target player unavailable: %s", err)
+                logger.warning("MA reconcile: target player unavailable: %s", err)
         except Exception:
             if engine._is_current_command(generation):
-                logger.exception("Queue preload failed")
+                logger.exception("MA reconcile failed")
         finally:
             if asyncio.current_task() is self._preload_task:
                 self._preload_task = None
 
-    async def _prequeue_next_item(
-        self,
-        item: QueueTrackRef | None,
-        generation: int | None = None,
-    ) -> None:
+    async def _reconcile_remove_stale(self, player_id: str, generation: int) -> bool:
+        """Drop MA items whose Qobuz track_id is no longer on the mirror.
+
+        Returns False if a newer command superseded this run.
+        """
         engine = self._engine
-        if item is None:
-            self._last_prequeued_next_ref = None
+        logger = engine.bridge.logger
+        snapshot_track_ids = {ref.track_id for ref in engine.qobuz_state.tracks}
+        ma_items = list(engine.bridge.queue_items(player_id))
+        queue = engine.bridge.get_queue(player_id)
+        current_index = getattr(queue, "current_index", None) if queue else None
+        for idx, item in enumerate(ma_items):
+            if not engine._is_current_command(generation):
+                logger.debug("MA reconcile bailing during remove: superseded")
+                return False
+            ma_track_id = engine.bridge.qobuz_track_id_for(item)
+            if ma_track_id is None:
+                continue
+            if ma_track_id in snapshot_track_ids:
+                continue
+            if current_index is not None and idx == current_index:
+                continue
+            with contextlib.suppress(Exception):
+                engine.bridge.delete_item(player_id, item.queue_item_id)
+        return True
+
+    async def _reconcile_add_missing(
+        self,
+        player_id: str,
+        current_item: QueueTrackRef,
+        generation: int,
+    ) -> None:
+        """Chunk-add mirror items past ``current_item`` not yet in MA's queue."""
+        engine = self._engine
+        logger = engine.bridge.logger
+        if not engine.qobuz_state.tracks:
             return
-        if generation is not None and not engine._is_current_command(generation):
-            return
-        current_item = engine.qobuz_state.current_item
-        if current_item is None:
-            return
-        next_ref = TrackRefKey.from_ref(item)
-        if next_ref == self._last_prequeued_next_ref:
-            return
-        player_id = engine.bridge.target_player_id()
-        if not player_id:
-            return
-        queue = engine.bridge.get_queue(player_id) if player_id else None
-        if not queue or not queue.current_item:
-            return
-        current_ma_track_id = engine.bridge.qobuz_track_id_for(queue.current_item)
-        if current_ma_track_id != current_item.track_id:
-            return
-        # If MA's queue already has this track sitting at current_index + 1
-        # (the preload's snapshot order has it covered), skip the prequeue
-        # entirely. The default ``play_media(option=REPLACE_NEXT)`` would
-        # otherwise *wipe everything after current* and put only this one
-        # next track back — exactly the bug that left users with a 2-item
-        # queue after every natural advance.
-        queue_items = engine.bridge.queue_items(player_id)
-        current_index = getattr(queue, "current_index", None)
-        if current_index is not None and 0 <= current_index + 1 < len(queue_items):
-            existing_next_id = engine.bridge.qobuz_track_id_for(queue_items[current_index + 1])
-            if existing_next_id == item.track_id:
-                self._last_prequeued_next_ref = next_ref
-                return
-        ma_track = await engine.metadata.get_track_or_none(item.track_id)
-        if ma_track is None:
-            return
-        if generation is not None and not engine._is_current_command(generation):
-            return
-        await engine.bridge.play_media(
-            player_id,
-            cast("Any", ma_track),
-            option=QueueOption.REPLACE_NEXT,
+        tracks_refs = list(engine.qobuz_state.tracks)
+        current_key = TrackRefKey.from_ref(current_item)
+        current_idx = next(
+            (i for i, ref in enumerate(tracks_refs) if TrackRefKey.from_ref(ref) == current_key),
+            None,
         )
-        self._last_prequeued_next_ref = next_ref
+        if current_idx is None:
+            logger.debug("MA reconcile skipped: current_item %s not in snapshot", current_key)
+            return
+        remaining = tracks_refs[current_idx + 1 :]
+        if not remaining:
+            return
+        existing_ids: set[str] = set()
+        for item in engine.bridge.queue_items(player_id):
+            track_id = engine.bridge.qobuz_track_id_for(item)
+            if track_id:
+                existing_ids.add(track_id)
+        for chunk_start in range(0, len(remaining), PRELOAD_CHUNK_SIZE):
+            if not engine._is_current_command(generation):
+                logger.debug("MA reconcile bailing during add: superseded")
+                return
+            chunk_refs = remaining[chunk_start : chunk_start + PRELOAD_CHUNK_SIZE]
+            pending_refs = [ref for ref in chunk_refs if ref.track_id not in existing_ids]
+            if not pending_refs:
+                continue
+            resolved = await asyncio.gather(
+                *[engine.metadata.get_track_or_none(ref.track_id) for ref in pending_refs],
+            )
+            if not engine._is_current_command(generation):
+                return
+            to_add: list[Any] = []
+            for ref, ma_track in zip(pending_refs, resolved, strict=True):
+                if ma_track is None:
+                    continue
+                to_add.append(ma_track)
+                existing_ids.add(ref.track_id)
+            if not to_add:
+                continue
+            await engine.bridge.play_media(
+                player_id,
+                cast("Any", to_add),
+                option=QueueOption.ADD,
+            )
+            # Yield so other tasks (a new SET_STATE, a seek) can preempt
+            # before we burn another chunk on the Qobuz API.
+            await asyncio.sleep(0)
