@@ -41,14 +41,6 @@ if TYPE_CHECKING:
 
 MA_QUEUE_LOAD_ACK_TIMEOUT_S = 3.0
 
-# Specific Qobuz-cloud queue-validation error we know is safe to swallow
-# — the cloud demands a 16-byte context UUID and rejects fallback values.
-# When this message arrives we keep ``_last_ma_origin_track_id`` so a
-# legitimate retry path can recover. See ARCHITECTURE.md "known sharp
-# edges" — this string match is still the best signal we have until a
-# capture pins down the corresponding error code.
-_BENIGN_CONTEXT_UUID_ERROR = "Le tableau d'octets doit avoir une longueur de 16"
-
 
 def try_parse_qobuz_id(value: Any) -> int | None:
     """Return an integer Qobuz id when the protocol can represent the value."""
@@ -123,7 +115,7 @@ class QueueLoader:
             )
             engine.reporter.set_buffer_ok()
             await engine.report_state()
-        elif isinstance(result, QueueError) and result.message != _BENIGN_CONTEXT_UUID_ERROR:
+        elif isinstance(result, QueueError):
             engine._last_ma_origin_track_id = None
 
     # ---- helpers --------------------------------------------------------

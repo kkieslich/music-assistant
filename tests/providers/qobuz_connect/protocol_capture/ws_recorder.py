@@ -2,11 +2,13 @@
 Chrome DevTools Protocol WebSocket recorder for Qobuz Connect captures.
 
 Records every WebSocket frame (both directions) seen by a Playwright Page,
-preserving full binary bytes — unlike the original Chrome-extension export
-which left incoming binary frames empty (see proto/captured/README.md).
+preserving full binary bytes.
 
-Output schema matches the existing proto/captured/capture-*.json shape so
-analysis tooling and fixtures work across both old and new captures.
+Output schema matches the Chrome-extension export shape used by the legacy
+captures under ``proto/captured/legacy/``, so that simple tooling can read
+both. The legacy files themselves are obsolete (incoming binary empty) and
+should not be used for protocol analysis — all live analysis runs against
+the bidirectional ``.runs/*.json`` produced by this recorder.
 """
 
 from __future__ import annotations
@@ -117,6 +119,51 @@ class WsRecorder:
             LOGGER.debug("CDP detach failed", exc_info=True)
         self._cdp = None
         self._started = False
+
+    async def set_network_conditions(
+        self,
+        *,
+        latency_ms: float = 0.0,
+        download_kbps: float = 0.0,
+        upload_kbps: float = 0.0,
+        offline: bool = False,
+    ) -> None:
+        """
+        Throttle this page's network via Chrome DevTools Protocol.
+
+        ``0`` for ``download_kbps`` / ``upload_kbps`` means unlimited.
+        Call :meth:`reset_network_conditions` to restore unlimited speed.
+
+        :param latency_ms: Additional RTT applied to every request, in ms.
+        :param download_kbps: Maximum downstream throughput, in kilobits/s.
+        :param upload_kbps: Maximum upstream throughput, in kilobits/s.
+        :param offline: If True, the network is fully blocked.
+        """
+        if self._cdp is None:
+            raise RuntimeError("WsRecorder must be started before throttling network")
+        bytes_per_kbit = 1024 / 8
+        await self._cdp.send(
+            "Network.emulateNetworkConditions",
+            {
+                "offline": offline,
+                "latency": float(latency_ms),
+                "downloadThroughput": float(download_kbps) * bytes_per_kbit
+                if download_kbps
+                else -1,
+                "uploadThroughput": float(upload_kbps) * bytes_per_kbit if upload_kbps else -1,
+            },
+        )
+        LOGGER.info(
+            "set network conditions offline=%s latency=%.0fms down=%skbps up=%skbps",
+            offline,
+            latency_ms,
+            download_kbps or "unlimited",
+            upload_kbps or "unlimited",
+        )
+
+    async def reset_network_conditions(self) -> None:
+        """Restore unlimited network throughput on this page."""
+        await self.set_network_conditions()
 
     @property
     def frames(self) -> list[_Frame]:

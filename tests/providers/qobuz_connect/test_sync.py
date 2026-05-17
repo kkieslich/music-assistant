@@ -30,7 +30,6 @@ from music_assistant.providers.qobuz_connect.models import (
 from music_assistant.providers.qobuz_connect.state import (
     PausedSeek,
     PendingQobuzPosition,
-    TrackRefKey,
 )
 from music_assistant.providers.qobuz_connect.sync import QobuzConnectSyncEngine
 
@@ -212,10 +211,11 @@ async def test_play_after_paused_seek_resumes_at_pending_position() -> None:
     """A later PLAYING command applies the stored paused seek once."""
     provider = _FakeProvider(_queue(PlaybackState.PAUSED))
     engine = QobuzConnectSyncEngine(provider)
-    engine.paused_seek = PausedSeek(
-        position_ms=50_000,
-        ref=TrackRefKey(queue_item_id=11, track_id="376286112"),
-    )
+    # In production a paused-seek is only ever stored after the engine has
+    # learned about the current item via a prior SetState — replicate that
+    # so this test exercises the same path the runtime does.
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=11, track_id="376286112")
+    engine.paused_seek = PausedSeek(position_ms=50_000)
 
     await engine.handle_qobuz_set_state(
         SetStateEvent(
@@ -357,8 +357,6 @@ async def test_ma_position_past_pending_seek_clears_buffering() -> None:
     engine.qobuz_state.buffer_state = BufferState.BUFFERING
     engine.qobuz_position = PendingQobuzPosition(
         target_ms=73_794,
-        ref=TrackRefKey(queue_item_id=11, track_id="376286112"),
-        source_ms=0,
         timestamp_ms=int(time.time() * 1000),
     )
 
@@ -505,8 +503,6 @@ async def test_ma_natural_advance_promotes_known_qobuz_next_item() -> None:
     engine.qobuz_state.position_ms = 73_794
     engine.qobuz_position = PendingQobuzPosition(
         target_ms=73_794,
-        ref=TrackRefKey(queue_item_id=1, track_id="217628808"),
-        source_ms=0,
         timestamp_ms=int(time.time() * 1000),
     )
 

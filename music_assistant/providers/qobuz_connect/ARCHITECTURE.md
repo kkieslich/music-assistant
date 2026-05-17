@@ -250,7 +250,7 @@ Phase C of the plan consolidates these into typed dataclasses in a new
 
 ### Generation tracking
 
-`_qobuz_command_generation` ticks up every time a *command* (vs. a
+`_command_generation` ticks up every time a *command* (vs. a
 notification) arrives. Every handler checks `_is_current_command(gen)`
 before issuing MA operations so a stale command doesn't undo a newer one.
 The seek pipeline has its own `_pending_seek_generation` counter.
@@ -294,9 +294,8 @@ an async context manager so leaks become impossible.
 ## Out of scope / out of band
 
 - **Favorites.** Adding or removing favorites uses the Qobuz REST API,
-  *not* the QConnect WebSocket. The favorite/unfavorite steps in
-  [`proto/captured/README.md`](proto/captured/README.md) `capture-2`
-  produced no QConnect frames; that's why.
+  *not* the QConnect WebSocket — the favorite/unfavorite steps in early
+  reverse-engineering captures produced no QConnect frames.
 - **`ws.proto` is dead code.** It defines an older parallel
   protocol that nothing in `qobuz_connect` imports. Safe to delete
   whenever convenient.
@@ -307,9 +306,6 @@ an async context manager so leaks become impossible.
 
 ## Captured reference data
 
-- [`proto/captured/`](proto/captured/) — original Chrome-extension exports
-  (no incoming binary; useful only for outbound frame shapes).
-- [`proto/captured/full/`](proto/captured/) — full bidirectional captures
-  produced by the harness at
-  [`tests/providers/qobuz_connect/protocol_capture/`](../../../tests/providers/qobuz_connect/protocol_capture/).
+- [`tests/providers/qobuz_connect/protocol_capture/`](../../../tests/providers/qobuz_connect/protocol_capture/) — **the** source of reference data. A Playwright harness that drives two real Qobuz Web Clients via CDP, recording both directions of the WebSocket into `.runs/`. Add or extend a scenario whenever a protocol question can't be answered from existing captures. Scenarios can opt in to throttled-network conditions for "slow renderer" / "lossy link" tests.
+- [`proto/captured/legacy/`](proto/captured/legacy/) — early Chrome-extension exports. **Obsolete** (incoming binary empty). Kept as a historical record of the reverse-engineering work; do not use for protocol analysis.
   Each scenario file is suitable as a Phase B test fixture once auth tokens are stripped.
