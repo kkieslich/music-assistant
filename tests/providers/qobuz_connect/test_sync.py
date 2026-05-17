@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -116,7 +117,7 @@ class _FakeProvider:
             get_album_tracks=_fake_get_album_tracks,
         )
 
-    def get_target_player_id(self) -> str:
+    def get_target_player_id(self) -> str | None:
         return "player"
 
     def get_qobuz_track_id_from_queue_item(self, queue_item: Any) -> str | None:
@@ -124,6 +125,13 @@ class _FakeProvider:
 
     def get_qobuz_provider(self) -> Any:
         return self.qobuz_provider
+
+
+class _NoTargetProvider(_FakeProvider):
+    """Provider facade with no available target player."""
+
+    def get_target_player_id(self) -> str | None:
+        return None
 
 
 async def _fake_get_track(track_id: str) -> Any:
@@ -161,6 +169,13 @@ def _event(queue: Any) -> Any:
     return SimpleNamespace(object_id="player", data=queue)
 
 
+async def _wait_for_reconcile(engine: QobuzConnectSyncEngine) -> None:
+    task = cast("Any", engine)._reconcile_task
+    if task:
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 @pytest.mark.asyncio
 async def test_paused_seek_is_stored_without_starting_ma_playback() -> None:
     """Paused Qobuz scrubbing should not seek/reload MA immediately."""
@@ -194,6 +209,7 @@ async def test_play_after_paused_seek_resumes_at_pending_position() -> None:
             current_item=QueueTrackRef(queue_item_id=11, track_id="376286112"),
         )
     )
+    await _wait_for_reconcile(engine)
 
     assert cast("Any", engine).pending_paused_seek_ms is None
     assert provider.mass.player_queues.calls == [
@@ -220,6 +236,7 @@ async def test_paused_seek_is_not_reused_for_new_track() -> None:
             current_item=QueueTrackRef(queue_item_id=2, track_id="new"),
         )
     )
+    await _wait_for_reconcile(engine)
 
     assert cast("Any", engine).pending_paused_seek_ms is None
     assert provider.mass.player_queues.calls[-1] == (
@@ -246,6 +263,7 @@ async def test_new_current_item_without_position_starts_at_zero_not_old_position
     )
 
     assert session.renderer_states[0]["position_ms"] == 0
+    await _wait_for_reconcile(engine)
     assert provider.mass.player_queues.calls[-1] == (
         "play_index",
         ("player", 0),
@@ -387,6 +405,7 @@ async def test_mid_track_handoff_reports_target_position_before_loading() -> Non
     assert engine.qobuz_state.buffer_state == BufferState.BUFFERING
     assert session.renderer_states[0]["buffer_state"] == BufferState.BUFFERING
     assert ("play_media",) not in [(call[0],) for call in provider.mass.player_queues.calls]
+    await _wait_for_reconcile(engine)
     assert provider.mass.player_queues.calls[-1] == (
         "play_index",
         ("player", 0),
@@ -404,6 +423,7 @@ async def test_play_after_stop_based_pause_restarts_current_item() -> None:
     engine.qobuz_state.position_ms = 72_000
 
     await engine.handle_qobuz_set_state(SetStateEvent(playing_state=PlayingState.PLAYING))
+    await _wait_for_reconcile(engine)
 
     assert provider.mass.player_queues.calls == [
         ("play_index", ("player", 0), {"seek_position": 72})
@@ -492,12 +512,187 @@ async def test_play_with_only_next_item_promotes_next_to_current() -> None:
             position_ms=0,
         )
     )
+    await _wait_for_reconcile(engine)
 
     assert engine.qobuz_state.current_item == QueueTrackRef(
         queue_item_id=11,
         track_id="376286112",
     )
     assert provider.mass.player_queues.calls[-1][0] == "play_index"
+
+
+@pytest.mark.asyncio
+async def test_rapid_next_only_loads_latest_qobuz_item() -> None:
+    """Slow MA work for skipped items must not briefly become playback."""
+    queue = _queue(PlaybackState.PAUSED, track_id="old")
+    provider = _FakeProvider(queue)
+    lookup_started = asyncio.Event()
+    release_lookup = asyncio.Event()
+    lookups: list[str] = []
+
+    async def _slow_get_track(track_id: str) -> Any:
+        lookups.append(track_id)
+        lookup_started.set()
+        await release_lookup.wait()
+        return await _fake_get_track(track_id)
+
+    provider.qobuz_provider = SimpleNamespace(
+        get_track=_slow_get_track,
+        get_album_tracks=_fake_get_album_tracks,
+    )
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            current_item=QueueTrackRef(queue_item_id=5, track_id="track-5"),
+        )
+    )
+    await lookup_started.wait()
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            current_item=QueueTrackRef(queue_item_id=6, track_id="track-6"),
+        )
+    )
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            current_item=QueueTrackRef(queue_item_id=7, track_id="track-7"),
+        )
+    )
+    release_lookup.set()
+    await _wait_for_reconcile(engine)
+
+    assert queue.current_item.track_id == "track-7"
+    assert provider.mass.player_queues.calls[-1] == (
+        "play_index",
+        ("player", 0),
+        {"seek_position": 0},
+    )
+    assert [
+        getattr(item.media_item, "item_id", None)
+        for item in provider.mass.player_queues.queue_items
+    ] == ["track-7"]
+    assert "track-5" in lookups
+
+
+@pytest.mark.asyncio
+async def test_fast_next_then_pause_does_not_resume_superseded_track() -> None:
+    """A later pause command should cancel an older slow play reconciliation."""
+    queue = _queue(PlaybackState.PLAYING, track_id="old")
+    provider = _FakeProvider(queue)
+    lookup_started = asyncio.Event()
+    release_lookup = asyncio.Event()
+
+    async def _slow_get_track(track_id: str) -> Any:
+        lookup_started.set()
+        await release_lookup.wait()
+        return await _fake_get_track(track_id)
+
+    provider.qobuz_provider = SimpleNamespace(
+        get_track=_slow_get_track,
+        get_album_tracks=_fake_get_album_tracks,
+    )
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            current_item=QueueTrackRef(queue_item_id=5, track_id="track-5"),
+        )
+    )
+    await lookup_started.wait()
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PAUSED,
+            position_ms=12_000,
+            current_item=QueueTrackRef(queue_item_id=6, track_id="track-6"),
+        )
+    )
+    release_lookup.set()
+    await _wait_for_reconcile(engine)
+
+    assert provider.mass.player_queues.calls == [("pause", ("player",), {})]
+    assert engine.qobuz_state.current_item == QueueTrackRef(
+        queue_item_id=6,
+        track_id="track-6",
+    )
+    assert engine.qobuz_state.playing_state == PlayingState.PAUSED
+
+
+@pytest.mark.asyncio
+async def test_stale_ma_track_does_not_confirm_latest_qobuz_command() -> None:
+    """An old MA track must not clear buffering for the latest Qobuz item."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING, track_id="old")
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=7, track_id="track-7")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+    engine.qobuz_state.buffer_state = BufferState.BUFFERING
+    engine.qobuz_state.position_ms = 44_000
+
+    await engine.report_state()
+
+    assert engine.qobuz_state.current_item == QueueTrackRef(
+        queue_item_id=7,
+        track_id="track-7",
+    )
+    assert engine.qobuz_state.buffer_state == BufferState.BUFFERING
+    assert session.renderer_states[-1]["queue_item_id"] == 7
+    assert session.renderer_states[-1]["buffer_state"] == BufferState.BUFFERING
+
+
+@pytest.mark.asyncio
+async def test_later_track_command_cancels_pending_seek() -> None:
+    """A debounced seek for an old item must not run after a fast next command."""
+    queue = _queue(PlaybackState.PLAYING, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=1, track_id="old")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+
+    await engine.handle_qobuz_set_state(SetStateEvent(position_ms=50_000))
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            current_item=QueueTrackRef(queue_item_id=2, track_id="new"),
+        )
+    )
+    await asyncio.sleep(0.4)
+    await _wait_for_reconcile(engine)
+
+    assert ("seek", ("player", 50), {}) not in provider.mass.player_queues.calls
+    assert queue.current_item.track_id == "new"
+
+    await engine.handle_qobuz_set_state(SetStateEvent(position_ms=60_000))
+    await asyncio.sleep(0.4)
+
+    assert provider.mass.player_queues.calls[-1] == ("seek", ("player", 60), {})
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_target_does_not_replay_previous_command() -> None:
+    """Missing target players should not crash or mutate MA queue state."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PAUSED, track_id="old")
+    provider = _NoTargetProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            current_item=QueueTrackRef(queue_item_id=7, track_id="new"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+
+    assert provider.mass.player_queues.calls == []
+    assert queue.current_item.track_id == "old"
+    assert engine.qobuz_state.current_item == QueueTrackRef(queue_item_id=7, track_id="new")
+    assert session.renderer_states[0]["queue_item_id"] == 7
 
 
 @pytest.mark.asyncio
