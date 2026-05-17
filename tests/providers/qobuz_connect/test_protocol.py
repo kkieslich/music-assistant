@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from music_assistant.providers.qobuz_connect import _normalize_quality_id
 from music_assistant.providers.qobuz_connect.models import (
     BufferState,
     OuterMessageType,
@@ -60,6 +61,19 @@ def test_encode_renderer_state_update() -> None:
     assert state.currentQueueItemId == 11
     assert state.queueVersion.major == 15
     assert state.queueVersion.minor == 1
+
+
+def test_normalize_quality_id_accepts_protocol_and_qobuz_format_ids() -> None:
+    """Qobuz Connect uses protocol quality ids while MA Qobuz uses format ids."""
+    assert _normalize_quality_id(1) == 5
+    assert _normalize_quality_id(2) == 6
+    assert _normalize_quality_id(3) == 7
+    assert _normalize_quality_id(4) == 27
+    assert _normalize_quality_id(5) == 5
+    assert _normalize_quality_id(6) == 6
+    assert _normalize_quality_id(7) == 7
+    assert _normalize_quality_id(27) == 27
+    assert _normalize_quality_id(99) is None
 
 
 def test_encode_controller_queue_load_tracks() -> None:

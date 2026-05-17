@@ -129,6 +129,13 @@ class QobuzProvider(MusicProvider):
             ),
         )
 
+    async def update_config(self, config: ProviderConfig, changed_keys: set[str]) -> None:
+        """Handle dynamic provider config updates."""
+        if changed_keys == {f"values/{CONF_QUALITY}"}:
+            self.config = config
+            return
+        await super().update_config(config, changed_keys)
+
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         if not self.get_setup_value(CONF_USERNAME) or not self.get_setup_value(CONF_PASSWORD):
