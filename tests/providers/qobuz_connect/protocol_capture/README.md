@@ -2,10 +2,13 @@
 
 This is a reusable Playwright-based tool that drives two real Qobuz Web Client
 sessions and records **every WebSocket frame in both directions, with full
-binary bytes preserved**. It exists because the original capture files in
-[../proto/captured/](../../../../music_assistant/providers/qobuz_connect/proto/captured/)
+binary bytes preserved**. It exists because the legacy capture files in
+[../proto/captured/legacy/](../../../../music_assistant/providers/qobuz_connect/proto/captured/legacy/)
 were exported by a Chrome extension that dropped the incoming binary payload
-— so the entire `SRVR_*` side of the protocol is invisible there.
+— the entire `SRVR_*` side of the protocol is invisible there. Those legacy
+captures are obsolete; this harness is the **only** authoritative source of
+protocol behavior. Each scenario writes a fresh `.runs/<scenario>__client_a.json`
+and `…__client_b.json` pair containing both directions.
 
 The harness is **not** part of the normal test suite. It is excluded from
 pytest collection (see `tests/providers/qobuz_connect/conftest.py`) so it
@@ -70,12 +73,17 @@ Captures land in `.runs/<scenario>__client_a.json` and `…__client_b.json`.
 
 ## Scenarios
 
-| Scenario          | What it does                                                                                       | Protocol coverage focus                                       |
-|-------------------|----------------------------------------------------------------------------------------------------|---------------------------------------------------------------|
-| `handoff`         | A plays a track → A hands off to B → B skips to next                                              | `SRVR_RNDR_SET_ACTIVE`, `SRVR_RNDR_SET_STATE` inbound on B   |
-| `queue_mutations` | B clear → B play → +2 adds → pause → resume → reorder current +3                                 | `SRVR_CTRL_QUEUE_*` (cleared/added/reordered) inbound        |
-| `rapid_skip`      | B plays → 5× skip-next in fast succession                                                          | Burst-command reconciliation (overlapping `SET_STATE` frames) |
-| `quality_change`  | B plays → switches max quality mid-track                                                           | `SRVR_RNDR_SET_MAX_AUDIO_QUALITY` inbound                    |
+| Scenario                              | What it does                                                                       | Protocol coverage focus                                              |
+|---------------------------------------|------------------------------------------------------------------------------------|----------------------------------------------------------------------|
+| `handoff`                             | A plays → A hands off to B → B skips to next                                       | `srvrRndrSetActive` inbound on B                                     |
+| `queue_mutations`                     | B clear → B play → +2 adds → pause → resume → reorder current +3                  | `srvrCtrl*` queue deltas inbound                                     |
+| `rapid_skip`                          | B (self-controls) plays → 5× skip-next rapidly                                     | Baseline self-controlling burst (does NOT exercise renderer burst)   |
+| `quality_change`                      | B plays → switches max quality mid-track                                           | `srvrRndrSetMaxAudioQuality` inbound                                 |
+| `controller_burst_skip`               | A controls + B renders → A presses skip 5× rapidly                                 | True `srvrRndrSetState` burst on B — reconcile / staleness pressure  |
+| `controller_playing_seek_scrub`       | A controls + B renders → A scrubs progress bar through 4 positions while playing  | Playing-seek debounce; do multiple `srvrRndrSetState` arrive at all? |
+| `controller_paused_scrub_then_skip`   | A controls + B renders → pause → scrub-while-paused → skip-next BEFORE resume     | Does the reference renderer get a paused-seek command at all?        |
+| `controller_burst_skip_throttled`     | Same as `controller_burst_skip` with B throttled (200ms RTT + 100kbps both ways)  | Burst under slow renderer (out-of-order arrivals; reconcile stress)  |
+| `controller_play_pause_rapid`         | A controls + B renders → 6× rapid play/pause toggles                              | State-flapping reconciliation                                        |
 
 Promote a `.runs/*.json` capture into the committed reference set by moving
 it to
@@ -112,11 +120,16 @@ protocol_capture/
 | `QOBUZ_CAPTURE_TRACK_QUERY_2/3` | Additional track queries for the multi-track scenarios               |
 | `QOBUZ_CAPTURE_CONNECT_TARGET`  | Label of the Qobuz Connect handoff target (default: "this browser")  |
 | `QOBUZ_CAPTURE_QUALITY_LABEL`   | Quality option label for the `quality_change` scenario               |
-| `QOBUZ_CAPTURE_SKIP_COUNT`      | Number of skip-next presses in `rapid_skip` (default 5)              |
-| `QOBUZ_CAPTURE_SKIP_INTERVAL_MS`| Delay between presses in `rapid_skip` (default 250)                  |
-| `CAPTURE_HEADED`                | Same as `--headed`; convenience for shell aliases                    |
-| `CAPTURE_SLOW_MO_MS`            | Same as `--slow-mo`                                                  |
-| `PWDEBUG`                       | Standard Playwright; opens the Inspector for selector tweaking       |
+| `QOBUZ_CAPTURE_SKIP_COUNT`         | Number of skip-next presses in `rapid_skip` / `controller_burst_skip*` (default 5) |
+| `QOBUZ_CAPTURE_SKIP_INTERVAL_MS`   | Delay between presses in the same scenarios (default 250)            |
+| `QOBUZ_CAPTURE_TOGGLE_COUNT`       | Number of toggles in `controller_play_pause_rapid` (default 6)       |
+| `QOBUZ_CAPTURE_TOGGLE_INTERVAL_MS` | Delay between toggles in the same scenario (default 400)             |
+| `QOBUZ_CAPTURE_THROTTLE_LATENCY_MS`| Per-request latency injected on B in `controller_burst_skip_throttled` (default 200) |
+| `QOBUZ_CAPTURE_THROTTLE_DOWN_KBPS` | Download cap on B in `controller_burst_skip_throttled` (default 100) |
+| `QOBUZ_CAPTURE_THROTTLE_UP_KBPS`   | Upload cap on B in `controller_burst_skip_throttled` (default 100)   |
+| `CAPTURE_HEADED`                   | Same as `--headed`; convenience for shell aliases                    |
+| `CAPTURE_SLOW_MO_MS`               | Same as `--slow-mo`                                                  |
+| `PWDEBUG`                          | Standard Playwright; opens the Inspector for selector tweaking       |
 
 Login itself is *not* env-var-driven — you log in manually in each browser
 window on first run, and the harness saves storage_state for headless reuse.

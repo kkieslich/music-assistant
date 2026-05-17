@@ -4,15 +4,23 @@ Music Assistant is an async Python music library manager that connects to stream
 
 ## Fork Focus: `qobuz_connect` Provider
 
-This fork's primary purpose is the experimental [qobuz_connect](music_assistant/providers/qobuz_connect/) plugin provider — a Qobuz Connect receiver that exposes MA as a Qobuz Connect target so Qobuz apps can hand off playback to an MA player. Data flow: `Qobuz app -> Qobuz Connect protocol -> MA player queue -> native MA qobuz provider`.
+This fork's primary purpose is the experimental [qobuz_connect](music_assistant/providers/qobuz_connect/) plugin provider — a Qobuz Connect receiver that exposes MA as a Qobuz Connect target so Qobuz apps can hand off playback to an MA player. Unlike the DLNA-bridge approach, this provider re-implements the Connect protocol locally and routes playback through the native MA Qobuz music provider + MA player queue.
+
+Data flow: `Qobuz app -> Qobuz Connect protocol -> MA player queue -> native MA qobuz provider`.
 
 - [discovery.py](music_assistant/providers/qobuz_connect/discovery.py): mDNS + local handshake endpoints.
 - [session.py](music_assistant/providers/qobuz_connect/session.py): Qobuz Connect WebSocket lifecycle and dispatch.
 - [protocol.py](music_assistant/providers/qobuz_connect/protocol.py): `QobuzConnectCodec` frame/protobuf codec.
 - [sync.py](music_assistant/providers/qobuz_connect/sync.py): `QobuzConnectSyncEngine`, the owner of Qobuz/MA state reconciliation.
 - [models.py](music_assistant/providers/qobuz_connect/models.py): shared enums/dataclasses and quality maps.
-- Generated protobuf modules are committed in [proto/](music_assistant/providers/qobuz_connect/proto/); do not delete them. Reference captures live under [proto/captured/](music_assistant/providers/qobuz_connect/proto/captured/).
+- Generated protobuf modules are committed in [proto/](music_assistant/providers/qobuz_connect/proto/); do not delete them.
+- For protocol behavior questions, use the Playwright capture harness at [tests/providers/qobuz_connect/protocol_capture/](tests/providers/qobuz_connect/protocol_capture/). It drives real Qobuz Web Clients via CDP and records WebSocket traffic into `.runs/`; add or extend scenarios when observing reference behavior.
+- Older Chrome-extension exports under [proto/captured/legacy/](music_assistant/providers/qobuz_connect/proto/captured/legacy/) are obsolete and kept only as historical reference.
 - Tests live in [tests/providers/qobuz_connect/](tests/providers/qobuz_connect/). Run with `pytest tests/providers/qobuz_connect/`.
+- The provider is `stage: experimental` and `multi_instance: true`. The mDNS serial and Qobuz cloud device UUID are derived from `instance_id` via a fixed namespace UUID.
+- Target player resolution: `CONF_TARGET_PLAYER = "__auto__"` prefers any currently-playing player, else first available. Missing pinned players should warn rather than fail setup.
+- The native `qobuz` music provider must be configured; `get_qobuz_provider()` raises `InvalidDataError` otherwise.
+- Local playground: `.venv/bin/python -m music_assistant --data-dir .mass-data --cache-dir .mass-cache --log-level debug`.
 
 ## Behaviour
 

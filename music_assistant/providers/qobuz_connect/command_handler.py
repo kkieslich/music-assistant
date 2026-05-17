@@ -12,7 +12,13 @@ Responsibilities (all consolidated here):
 - Mirror update (``_update_qobuz_mirror``).
 - Immediate renderer-state report path for command events.
 - Latest-only async reconciliation against MA: one ``_reconcile_task``
-  at a time, generation-checked so stale work bails early.
+  at a time, guarded by ``_command_generation`` so a slower piece of
+  reconcile work (track-metadata fetch, queue replacement) that gets
+  overtaken by a newer ``SET_STATE`` command bails out cleanly.
+  Note this is *not* defending against bursts of commands on the wire
+  — the Qobuz controllers coalesce rapid skip/seek presses client-side
+  before sending anything. The defense is for slow-MA-work-vs-new-event
+  ordering only.
 - Slow-path metadata update for non-command events (``_metadata_task``).
 - Per-playing-state branches: ``_handle_qobuz_play`` /
   ``_handle_qobuz_pause`` / ``_handle_qobuz_stop`` /
@@ -72,27 +78,21 @@ class CommandHandler:
 
         async with origin_scope(engine, Origin.QOBUZ):
             if should_report:
-                engine._qobuz_command_generation += 1
-            generation = engine._qobuz_command_generation
+                engine._command_generation += 1
+            generation = engine._command_generation
             self._update_qobuz_mirror(event)
             if event.playing_state == PlayingState.PAUSED:
                 engine.seek_pipeline.set_paused_seek(
-                    (
-                        max(0, event.position_ms)
-                        if event.position_ms is not None
-                        else engine.qobuz_state.position_ms
-                    ),
-                    engine.qobuz_state.current_item,
+                    max(0, event.position_ms)
+                    if event.position_ms is not None
+                    else engine.qobuz_state.position_ms,
                 )
             elif (
                 event.position_ms is not None
                 and event.playing_state is None
                 and engine.qobuz_state.playing_state == PlayingState.PAUSED
             ):
-                engine.seek_pipeline.set_paused_seek(
-                    max(0, event.position_ms),
-                    engine.qobuz_state.current_item,
-                )
+                engine.seek_pipeline.set_paused_seek(max(0, event.position_ms))
             if should_report:
                 self._prepare_immediate_command_report(event)
                 await engine.report_state(sync_from_ma=False)
@@ -133,9 +133,7 @@ class CommandHandler:
             if not engine._same_queue_ref(engine.qobuz_state.current_item, event.current_item):
                 current_item_changed = True
                 engine.seek_pipeline.clear_pending_position()
-                new_ref = TrackRefKey.from_ref(event.current_item)
-                if engine.paused_seek is not None and engine.paused_seek.ref != new_ref:
-                    engine.paused_seek = None
+                engine.paused_seek = None
             engine.qobuz_state.current_item = event.current_item
             if current_item_changed and event.position_ms is None:
                 engine.qobuz_state.position_ms = 0
@@ -292,7 +290,7 @@ class CommandHandler:
             return
         if not engine._is_current_command(generation, item):
             return
-        pending_paused_seek_ms = engine.seek_pipeline.take_paused_seek(item)
+        pending_paused_seek_ms = engine.seek_pipeline.take_paused_seek()
         start_position_ms = (
             pending_paused_seek_ms
             if pending_paused_seek_ms is not None
@@ -303,11 +301,7 @@ class CommandHandler:
         start_position_ms = max(0, start_position_ms or 0)
         engine.qobuz_state.position_ms = start_position_ms
         engine.qobuz_state.position_timestamp_ms = int(time.time() * 1000)
-        engine.seek_pipeline.set_pending_qobuz_position(
-            position_ms=start_position_ms,
-            item=item,
-            source_ms=0,
-        )
+        engine.seek_pipeline.set_pending_qobuz_position(start_position_ms)
 
         player_id = engine._require_target_player_id()
         queue = engine.bridge.get_queue(player_id)
@@ -354,12 +348,9 @@ class CommandHandler:
     async def _handle_qobuz_pause(self, event: SetStateEvent, generation: int) -> None:
         engine = self._engine
         engine.seek_pipeline.set_paused_seek(
-            (
-                max(0, event.position_ms)
-                if event.position_ms is not None
-                else engine.qobuz_state.position_ms
-            ),
-            engine.qobuz_state.current_item,
+            max(0, event.position_ms)
+            if event.position_ms is not None
+            else engine.qobuz_state.position_ms,
         )
         player_id = engine.bridge.target_player_id()
         queue = engine.bridge.get_queue(player_id) if player_id else None
@@ -380,9 +371,7 @@ class CommandHandler:
     async def _handle_qobuz_position_only(self, position_ms: int, generation: int) -> None:
         engine = self._engine
         if engine.qobuz_state.playing_state == PlayingState.PAUSED:
-            engine.seek_pipeline.set_paused_seek(
-                max(0, position_ms), engine.qobuz_state.current_item
-            )
+            engine.seek_pipeline.set_paused_seek(max(0, position_ms))
             return
         if engine.qobuz_state.playing_state == PlayingState.PLAYING:
             player_id = engine.bridge.target_player_id()
@@ -448,11 +437,7 @@ class CommandHandler:
         )
         if not engine._is_current_command(generation, current_item):
             return
-        engine.seek_pipeline.set_pending_qobuz_position(
-            position_ms=start_position_ms,
-            item=current_item,
-            source_ms=0,
-        )
+        engine.seek_pipeline.set_pending_qobuz_position(start_position_ms)
         await engine.bridge.play_index(
             player_id,
             0,

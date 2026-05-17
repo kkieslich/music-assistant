@@ -26,8 +26,11 @@ What stays on the engine:
 - ``_pending_queue_loads`` futures map (used by command_handler +
   queue_loader + the queue-ack inbound handler — central enough to
   stay here).
-- ``_qobuz_command_generation`` (latest-only staleness counter) and
-  ``_last_ma_origin_track_id`` (handle_ma_queue_event guard).
+- ``_command_generation`` (stale-reconcile guard — monotonic counter
+  bumped on every renderer command; in-flight reconcile work that
+  awaits slow MA operations bails when this no longer matches the
+  generation it started at) and ``_last_ma_origin_track_id``
+  (handle_ma_queue_event guard).
 - ``origin`` (in-flight-change source marker, set via
   :func:`.state.origin_scope`).
 - The Phase B mirror-update handlers (``handle_queue_state`` /
@@ -43,13 +46,6 @@ What stays on the engine:
   ``_playing_state_from_ma_queue``, ``_ma_state_confirms_qobuz_target``.
 
 Exposes ``QobuzConnectSyncEngine``.
-
-Known sharp edges left for future cleanup:
-- A hardcoded French error-message string-match in
-  :mod:`.queue_loader` (``"Le tableau d'octets doit avoir une longueur
-  de 16"``) is still used to recover from a specific ``QueueError``.
-  It works in production but should switch to ``QueueError.code``
-  matching — defer until we capture a real occurrence of this error.
 
 See :doc:`ARCHITECTURE` for the end-to-end flow, the inbound/outbound
 message tables and the glossary.
@@ -137,7 +133,7 @@ class QobuzConnectSyncEngine:
             bytes, asyncio.Future[QueueLoadAck | QueueError | None]
         ] = {}
         self._last_ma_origin_track_id: str | None = None
-        self._qobuz_command_generation = 0
+        self._command_generation = 0
 
     @property
     def pending_paused_seek_ms(self) -> int | None:
@@ -170,7 +166,7 @@ class QobuzConnectSyncEngine:
         self.paused_seek = None
         self.qobuz_position = None
         self.playing_seek = None
-        self._qobuz_command_generation += 1
+        self._command_generation += 1
         self.command_handler.cancel_tasks()
         self.command_handler.reset_prequeue_dedup()
         self.seek_pipeline.cancel_pending_seek()
@@ -392,18 +388,14 @@ class QobuzConnectSyncEngine:
             return
         ma_position_ms = int(getattr(queue, "corrected_elapsed_time", 0) * 1000)
         if self.qobuz_position is not None:
-            current_ref = TrackRefKey.from_ref(self.qobuz_state.current_item)
-            if self.qobuz_position.ref != current_ref:
-                self.seek_pipeline.clear_pending_position()
-            elif not self.seek_pipeline.pending_position_confirmed(ma_position_ms):
+            if not self.seek_pipeline.pending_position_confirmed(ma_position_ms):
                 self.bridge.logger.debug(
                     "Holding Qobuz position at %sms until MA reaches it; MA currently %sms",
                     self.qobuz_position.target_ms,
                     ma_position_ms,
                 )
                 return
-            else:
-                self.seek_pipeline.clear_pending_position()
+            self.seek_pipeline.clear_pending_position()
         self._set_buffer_ok()
         self.qobuz_state.playing_state = ma_playing_state
         self.qobuz_state.position_ms = ma_position_ms
@@ -415,7 +407,7 @@ class QobuzConnectSyncEngine:
         item: QueueTrackRef | None = None,
     ) -> bool:
         """Return whether a slow operation still belongs to the newest Qobuz command."""
-        if generation != self._qobuz_command_generation:
+        if generation != self._command_generation:
             return False
         return item is None or TrackRefKey.from_ref(item) == TrackRefKey.from_ref(
             self.qobuz_state.current_item

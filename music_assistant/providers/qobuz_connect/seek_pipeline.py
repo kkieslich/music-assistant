@@ -32,7 +32,6 @@ from music_assistant_models.enums import PlaybackState as MAPlaybackState
 from .state import PausedSeek, PendingPlayingSeek, PendingQobuzPosition, TrackRefKey
 
 if TYPE_CHECKING:
-    from .models import QueueTrackRef
     from .sync import QobuzConnectSyncEngine
 
 
@@ -52,42 +51,24 @@ class SeekPipeline:
 
     # ---- paused-seek storage -------------------------------------------
 
-    def set_paused_seek(self, position_ms: int, item: QueueTrackRef | None) -> None:
-        """Remember a paused seek only for the Qobuz queue item it belongs to."""
-        ref = TrackRefKey.from_ref(item)
-        if ref is None:
-            # No queue-item ref ⇒ can't match later. Drop rather than
-            # store an ambiguous one.
-            self._engine.paused_seek = None
-            return
-        self._engine.paused_seek = PausedSeek(position_ms=max(0, position_ms), ref=ref)
+    def set_paused_seek(self, position_ms: int) -> None:
+        """Remember a paused-while-scrubbing position to apply on the next PLAYING."""
+        self._engine.paused_seek = PausedSeek(position_ms=max(0, position_ms))
 
-    def take_paused_seek(self, item: QueueTrackRef | None) -> int | None:
-        """Consume a paused seek if it belongs to the item being played."""
+    def take_paused_seek(self) -> int | None:
+        """Consume the pending paused-seek position, if any."""
         pending = self._engine.paused_seek
         if pending is None:
-            return None
-        ref = TrackRefKey.from_ref(item)
-        if pending.ref != ref:
-            self._engine.paused_seek = None
             return None
         self._engine.paused_seek = None
         return pending.position_ms
 
     # ---- pending-position (Qobuz wants MA at X before free-run) --------
 
-    def set_pending_qobuz_position(
-        self,
-        *,
-        position_ms: int,
-        item: QueueTrackRef | None,
-        source_ms: int | None,
-    ) -> None:
+    def set_pending_qobuz_position(self, position_ms: int) -> None:
         """Remember the target position MA must confirm before Qobuz can free-run."""
         self._engine.qobuz_position = PendingQobuzPosition(
             target_ms=max(0, position_ms),
-            ref=TrackRefKey.from_ref(item),
-            source_ms=source_ms if source_ms is not None else max(0, position_ms),
             timestamp_ms=int(time.time() * 1000),
         )
 
@@ -124,11 +105,7 @@ class SeekPipeline:
             return
         local_ms = int(getattr(queue, "corrected_elapsed_time", 0) * 1000)
         if abs(local_ms - position_ms) >= SEEK_TOLERANCE_MS:
-            self.set_pending_qobuz_position(
-                position_ms=position_ms,
-                item=engine.qobuz_state.current_item,
-                source_ms=local_ms,
-            )
+            self.set_pending_qobuz_position(position_ms)
             if generation is not None and not engine._is_current_command(generation):
                 return
             await engine.bridge.seek(player_id, position_ms // 1000)
@@ -143,11 +120,7 @@ class SeekPipeline:
         engine = self._engine
         current_ref = TrackRefKey.from_ref(engine.qobuz_state.current_item)
         engine.reporter.set_buffering()
-        self.set_pending_qobuz_position(
-            position_ms=position_ms,
-            item=engine.qobuz_state.current_item,
-            source_ms=None,
-        )
+        self.set_pending_qobuz_position(position_ms)
         self.cancel_pending_seek()
         # ``generation or 0`` keeps the dataclass typed; ``None`` callers
         # come from pre-generation contexts that pre-date staleness checks.

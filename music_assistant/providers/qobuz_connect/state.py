@@ -58,12 +58,11 @@ class PausedSeek:
     A scrub the user performed while playback was paused.
 
     Held until the next PLAYING command, when ``position_ms`` is consumed
-    as the resume position. If the user switches to a different track
-    first, the seek is dropped (matched by ``ref``).
+    as the resume position. The command handler clears this whenever the
+    current Qobuz queue item changes, so no per-track ref is needed here.
     """
 
     position_ms: int
-    ref: TrackRefKey
 
 
 @dataclass(slots=True)
@@ -90,15 +89,12 @@ class PendingQobuzPosition:
     Target position we sent to MA, waiting for confirmation.
 
     Holds Qobuz's reported state frozen at ``target_ms`` until MA's own
-    progress reports cross it (within tolerance). ``source_ms`` /
-    ``timestamp_ms`` form the interpolation anchor so we can predict
-    how far MA *should* have progressed by now. ``ref`` is optional —
-    a position-only seek from the Qobuz app doesn't always carry one.
+    progress report crosses it (within tolerance, allowing for elapsed
+    interpolation since ``timestamp_ms``). The command handler clears
+    this on track change, so no per-track ref is needed here.
     """
 
     target_ms: int
-    ref: TrackRefKey | None
-    source_ms: int
     timestamp_ms: int
 
 
