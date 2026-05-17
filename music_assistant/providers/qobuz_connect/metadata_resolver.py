@@ -40,6 +40,11 @@ class MetadataResolver:
         """Drop the "track lookups previously failed" memo set."""
         self._unresolvable_track_ids.clear()
 
+    @property
+    def unresolvable_track_ids(self) -> frozenset[str]:
+        """Snapshot of track ids the metadata fetch has marked unfetchable."""
+        return frozenset(self._unresolvable_track_ids)
+
     async def get_track(self, track_id: str) -> Track:
         """Fetch an MA ``Track`` for a Qobuz track id; raises on cloud failure."""
         return cast(

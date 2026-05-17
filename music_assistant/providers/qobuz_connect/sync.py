@@ -366,9 +366,20 @@ class QobuzConnectSyncEngine:
         # Drop non-Qobuz items entirely — they live in MA's queue but never
         # reach the cloud.
         ma_qobuz_ids = [tid for tid in ma_track_ids if tid]
-        mirror_track_ids = [ref.track_id for ref in self.qobuz_state.tracks]
+        # Filter mirror to only items that *could* be in MA. The metadata
+        # resolver marks track_ids it can't fetch (404 / region-locked / etc.)
+        # as unresolvable; the reconciler drops those, so MA's queue is
+        # genuinely shorter than mirror. Without this filter the differ would
+        # see those gaps as user-removes and emit ``REMOVE_TRACKS`` for
+        # tracks the user never actually touched.
+        unresolvable = self.metadata.unresolvable_track_ids
+        mirror_track_ids = [
+            ref.track_id for ref in self.qobuz_state.tracks if ref.track_id not in unresolvable
+        ]
         mirror_qid_by_track_id: dict[str, list[int]] = {}
         for ref in self.qobuz_state.tracks:
+            if ref.track_id in unresolvable:
+                continue
             mirror_qid_by_track_id.setdefault(ref.track_id, []).append(ref.queue_item_id)
 
         ma_set = set(ma_qobuz_ids)
@@ -407,10 +418,26 @@ class QobuzConnectSyncEngine:
         # to detect a single contiguous item move (the common case for
         # drag-and-drop) and emit one ``CTRL_SRVR_QUEUE_REORDER_TRACKS``.
         if not removed_track_ids and not added_track_ids:
-            move = _detect_single_item_move(mirror_track_ids, ma_qobuz_ids)
+            # The mirror may legitimately carry more entries than MA does
+            # — Qobuz playlists sometimes contain track_ids the metadata
+            # resolver can't fetch (404 / region-locked / etc.). The
+            # reconciler drops those, so MA's queue is shorter than mirror
+            # by the unresolvable count. For reorder detection, filter
+            # mirror down to the subsequence MA actually has (by track_id,
+            # accounting for duplicates) so the two lists have the same
+            # length and a single-item move stays detectable.
+            from collections import Counter  # noqa: PLC0415
+
+            ma_remaining = Counter(ma_qobuz_ids)
+            mirror_in_ma_order: list[str] = []
+            for tid in mirror_track_ids:
+                if ma_remaining.get(tid, 0) > 0:
+                    mirror_in_ma_order.append(tid)
+                    ma_remaining[tid] -= 1
+            move = _detect_single_item_move(mirror_in_ma_order, ma_qobuz_ids)
             if move is not None:
                 src_idx, dst_idx = move
-                moved_track_id = mirror_track_ids[src_idx]
+                moved_track_id = mirror_in_ma_order[src_idx]
                 qids = mirror_qid_by_track_id.get(moved_track_id, [])
                 if len(qids) != 1:
                     # Duplicate track_ids — ambiguous which instance moved.
