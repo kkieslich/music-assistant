@@ -20,9 +20,10 @@ from music_assistant_models.enums import PlaybackState as MAPlaybackState
 from music_assistant_models.errors import InvalidDataError
 
 from music_assistant.models.plugin import PluginProvider
+from music_assistant.providers.qobuz import CONF_QUALITY as QOBUZ_CONF_QUALITY
 
 from .discovery import QobuzConnectDiscovery
-from .models import ConnectTokens, DeviceConfig
+from .models import PROTOCOL_TO_QUALITY, QUALITY_TO_PROTOCOL, ConnectTokens, DeviceConfig
 from .session import QobuzConnectSession
 from .sync import QobuzConnectSyncEngine
 
@@ -45,6 +46,7 @@ CONF_INITIAL_VOLUME = "initial_volume"
 PLAYER_ID_AUTO = "__auto__"
 DEFAULT_INITIAL_VOLUME = 25
 AUTO_QUALITY = 0
+SUPPORTED_QUALITIES = frozenset(QUALITY_TO_PROTOCOL)
 
 # Stable namespace for deriving the Qobuz device UUID from MA's instance_id, so
 # the mDNS-advertised serial and the cloud JOIN_SESSION device UUID match and
@@ -202,6 +204,15 @@ class QobuzConnectProvider(PluginProvider):
         if self._discovery:
             await self._discovery.stop()
 
+    async def update_config(self, config: ProviderConfig, changed_keys: set[str]) -> None:
+        """Handle dynamic provider config updates."""
+        if changed_keys == {f"values/{CONF_MAX_QUALITY}"}:
+            self.config = config
+            self._max_quality = int(cast("str", config.get_value(CONF_MAX_QUALITY)) or "27")
+            self._device_config.max_quality = self._max_quality
+            return
+        await super().update_config(config, changed_keys)
+
     @property
     def qobuz_session(self) -> QobuzConnectSession | None:
         """Return active Qobuz Connect websocket session."""
@@ -263,9 +274,44 @@ class QobuzConnectProvider(PluginProvider):
 
     async def _on_quality_change(self, new_quality: int) -> None:
         """Remember quality selected in Qobuz app."""
-        self.logger.info("Qobuz Connect quality changed: %s -> %s", self._max_quality, new_quality)
-        self._max_quality = new_quality
-        self._device_config.max_quality = new_quality
+        quality = _normalize_quality_id(new_quality)
+        if quality is None:
+            self.logger.warning("Ignoring unsupported Qobuz Connect quality value: %s", new_quality)
+            if self._session:
+                await self._session.send_quality_reports(self._max_quality)
+            return
+        self.logger.info("Qobuz Connect quality changed: %s -> %s", self._max_quality, quality)
+        self._max_quality = quality
+        self._device_config.max_quality = quality
+        await self._update_connect_quality_config(quality)
+        await self._update_qobuz_stream_quality(quality)
+        if self._session:
+            await self._session.send_quality_reports(quality)
+
+    async def _update_connect_quality_config(self, quality: int) -> None:
+        """Persist selected Connect quality to this provider's config."""
+        current_quality = int(cast("str", self.config.get_value(CONF_MAX_QUALITY)) or "27")
+        if current_quality == quality:
+            return
+        await self.mass.config.save_provider_config(
+            self.domain,
+            {CONF_MAX_QUALITY: str(quality)},
+            self.instance_id,
+        )
+
+    async def _update_qobuz_stream_quality(self, quality: int) -> None:
+        """Persist selected Connect quality to the native Qobuz stream provider."""
+        qobuz_provider = self.get_qobuz_provider()
+        current_quality = int(
+            cast("str", qobuz_provider.config.get_value(QOBUZ_CONF_QUALITY)) or "27"
+        )
+        if current_quality == quality:
+            return
+        await self.mass.config.save_provider_config(
+            qobuz_provider.domain,
+            {QOBUZ_CONF_QUALITY: str(quality)},
+            qobuz_provider.instance_id,
+        )
 
     async def _on_volume_command(self, volume: int) -> None:
         """Handle absolute or delta volume command from Qobuz."""
@@ -330,3 +376,10 @@ class QobuzConnectProvider(PluginProvider):
             if provider_domain == "qobuz" or provider_instance == qobuz_provider.instance_id:
                 return str(mapping.item_id)
         return None
+
+
+def _normalize_quality_id(value: int) -> int | None:
+    """Normalize Qobuz Connect protocol quality values to MA Qobuz format IDs."""
+    if value in SUPPORTED_QUALITIES:
+        return value
+    return PROTOCOL_TO_QUALITY.get(value)
