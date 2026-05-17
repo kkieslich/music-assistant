@@ -15,6 +15,7 @@ QUALITY_TO_HTTP = {
 }
 
 QUALITY_TO_PROTOCOL = {5: 1, 6: 2, 7: 3, 27: 4}
+PROTOCOL_TO_QUALITY = {protocol: quality for quality, protocol in QUALITY_TO_PROTOCOL.items()}
 QUALITY_AUDIO_PROPERTIES = {
     5: (44100, 16, 2),
     6: (44100, 16, 2),

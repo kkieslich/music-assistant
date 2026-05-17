@@ -153,6 +153,13 @@ class QobuzProvider(MusicProvider):
     # This ensures a single rate limit even if multiple Qobuz accounts are configured.
     throttler = ThrottlerManager(rate_limit=2, period=1)
 
+    async def update_config(self, config: ProviderConfig, changed_keys: set[str]) -> None:
+        """Handle dynamic provider config updates."""
+        if changed_keys == {f"values/{CONF_QUALITY}"}:
+            self.config = config
+            return
+        await super().update_config(config, changed_keys)
+
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         if not self.config.get_value(CONF_USERNAME) or not self.config.get_value(CONF_PASSWORD):
