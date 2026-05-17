@@ -65,12 +65,15 @@ from music_assistant_models.queue_item import QueueItem
 
 from .models import (
     BufferState,
+    LoopMode,
     Origin,
     PlayingState,
     QobuzMirror,
     QueueError,
     QueueLoadAck,
+    QueueStateSnapshot,
     QueueTrackRef,
+    QueueTracksAddedEvent,
     QueueVersion,
     SetStateEvent,
 )
@@ -269,6 +272,42 @@ class QobuzConnectSyncEngine:
     async def handle_queue_version(self, version: QueueVersion) -> None:
         """Remember Qobuz queue version changes."""
         self.qobuz_state.queue_version = version
+
+    async def handle_queue_state(self, snapshot: QueueStateSnapshot) -> None:
+        """
+        Apply a full ``SRVR_CTRL_QUEUE_STATE`` snapshot to the mirror.
+
+        Phase B: protocol-layer tracking only — we record the authoritative
+        queue contents (replacing any prior list) so MA's mirror stops
+        drifting after a (re)connect. MA-side player-queue reconciliation
+        will land with the Phase C redesign.
+        """
+        self.qobuz_state.queue_version = snapshot.queue_version
+        self.qobuz_state.tracks = list(snapshot.tracks)
+        self.qobuz_state.shuffle_mode = snapshot.shuffle_mode
+        self.qobuz_state.autoplay_mode = snapshot.autoplay_mode
+
+    async def handle_queue_tracks_added(self, event: QueueTracksAddedEvent) -> None:
+        """
+        Apply a ``SRVR_CTRL_QUEUE_TRACKS_ADDED`` delta to the mirror.
+
+        Phase B: appends to the mirror's track list and updates the queue
+        version. MA-side queue mutation is deferred to Phase C.
+        """
+        self.qobuz_state.queue_version = event.queue_version
+        self.qobuz_state.tracks.extend(event.tracks)
+
+    async def handle_loop_mode(self, mode: LoopMode) -> None:
+        """Record a renderer ``SET_LOOP_MODE`` command in the mirror."""
+        self.qobuz_state.loop_mode = mode
+
+    async def handle_shuffle_mode(self, shuffle_on: bool) -> None:
+        """Record a renderer ``SET_SHUFFLE_MODE`` command in the mirror."""
+        self.qobuz_state.shuffle_mode = shuffle_on
+
+    async def handle_autoplay_mode(self, autoplay_on: bool) -> None:
+        """Record a renderer ``SET_AUTOPLAY_MODE`` command in the mirror."""
+        self.qobuz_state.autoplay_mode = autoplay_on
 
     async def report_state(self, *, sync_from_ma: bool = True) -> None:
         """Report canonical renderer state to the Qobuz app."""

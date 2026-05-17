@@ -54,7 +54,7 @@ from music_assistant.providers.qobuz import CONF_QUALITY as QOBUZ_CONF_QUALITY
 
 from .discovery import QobuzConnectDiscovery
 from .models import PROTOCOL_TO_QUALITY, QUALITY_TO_PROTOCOL, ConnectTokens, DeviceConfig
-from .session import QobuzConnectSession
+from .session import QobuzConnectSession, SessionCallbacks
 from .sync import QobuzConnectSyncEngine
 
 if TYPE_CHECKING:
@@ -286,15 +286,22 @@ class QobuzConnectProvider(PluginProvider):
 
             self._session = QobuzConnectSession(
                 self._device_config,
-                on_set_state=self._sync.handle_qobuz_set_state,
-                on_queue_load_ack=self._sync.handle_queue_load_ack,
-                on_queue_error=self._sync.handle_queue_error,
-                on_queue_version=self._sync.handle_queue_version,
-                on_volume=self._on_volume_command,
-                on_volume_delta=self._on_volume_delta_command,
-                on_quality=self._on_quality_change,
-                on_state_request=self._sync.report_state,
-                on_set_active=self._on_set_active,
+                SessionCallbacks(
+                    on_set_state=self._sync.handle_qobuz_set_state,
+                    on_queue_load_ack=self._sync.handle_queue_load_ack,
+                    on_queue_error=self._sync.handle_queue_error,
+                    on_queue_version=self._sync.handle_queue_version,
+                    on_queue_state=self._sync.handle_queue_state,
+                    on_queue_tracks_added=self._sync.handle_queue_tracks_added,
+                    on_volume=self._on_volume_command,
+                    on_volume_delta=self._on_volume_delta_command,
+                    on_quality=self._on_quality_change,
+                    on_loop_mode=self._sync.handle_loop_mode,
+                    on_shuffle_mode=self._sync.handle_shuffle_mode,
+                    on_autoplay_mode=self._sync.handle_autoplay_mode,
+                    on_state_request=self._sync.report_state,
+                    on_set_active=self._on_set_active,
+                ),
             )
             self._session.set_tokens(tokens)
             await self._session.start()

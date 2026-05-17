@@ -117,7 +117,7 @@ messages the Qobuz app *will* emit on flows we haven't captured yet
 |      45 | `SRVR_RNDR_SET_LOOP_MODE`            | inbound   | Repeat-mode toggles in the Qobuz app never reach MA                           |
 |      46 | `SRVR_RNDR_SET_SHUFFLE_MODE`         | inbound   | Shuffle toggles in the Qobuz app never reach MA                               |
 |      47 | `SRVR_RNDR_SET_AUTOPLAY_MODE`        | inbound   | Autoplay setting can't be controlled from the Qobuz app                       |
-|      10 | `DISCONNECT` (outer envelope)        | inbound   | Cloud-initiated disconnects (renderer-replaced, token expiry) silently drop the session instead of reconnecting cleanly |
+|      10 | `DISCONNECT` (outer envelope)        | inbound   | Already handled: the receive loop raises ``QobuzServerDisconnect`` and the outer loop reconnects after backoff. Phase B just upgrades the log level so the reconnect is user-visible at INFO. |
 |      29 | `RNDR_SRVR_VOLUME_MUTED`             | outbound  | MA never tells the cloud when the target player gets muted                    |
 
 **Tier 2 — defined in proto, expected on flows we haven't captured yet:**
