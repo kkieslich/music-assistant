@@ -1262,3 +1262,100 @@ async def test_skip_then_immediate_seek_does_not_leave_player_stopped() -> None:
         f"that arrived during the replace, got {final_play_index}"
     )
     await engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the renderer-switch cleanup gap observed in the same
+# May 2026 testing session. When the user picks a different renderer in the
+# Qobuz app, the cloud sends SRVR_RNDR_SET_ACTIVE(false). The receiver must
+# stop playback *and* drop the queue items it loaded — otherwise the next
+# time MA's UI is opened the user sees the abandoned Qobuz Connect tracks
+# still queued — and it must stop echoing the now-stale Qobuz mirror back
+# to the cloud.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_release_target_player_stops_and_clears_ma_queue() -> None:
+    """Deactivation must both stop *and* clear the MA queue."""
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=11, track_id="376286112")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+
+    await engine.release_target_player()
+
+    call_kinds = [call[0] for call in provider.mass.player_queues.calls]
+    assert "stop" in call_kinds, f"Expected stop, got: {call_kinds}"
+    assert "clear" in call_kinds, f"Expected clear, got: {call_kinds}"
+    # clear must come after stop so the player tears the stream down cleanly
+    # before the queue items are dropped.
+    assert call_kinds.index("clear") > call_kinds.index("stop"), call_kinds
+
+
+@pytest.mark.asyncio
+async def test_release_target_player_resets_qobuz_mirror() -> None:
+    """Deactivation must wipe the Qobuz mirror so heartbeat reports stop firing."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=11, track_id="376286112")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+
+    await engine.release_target_player()
+    session.renderer_states.clear()
+    await engine.report_state(sync_from_ma=False)
+
+    assert cast("Any", engine).qobuz_state.current_item is None
+    assert session.renderer_states == [], (
+        f"No state should reach the cloud after release; got {session.renderer_states}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ma_queue_event_after_release_does_not_send_origin_load() -> None:
+    """MA queue events after deactivation must not echo as MA-origin queue loads."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING, track_id="370969289")
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=11, track_id="376286112")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+
+    await engine.release_target_player()
+    session.queue_loads.clear()
+    await engine.handle_ma_queue_event(_event(queue))
+
+    assert session.queue_loads == [], (
+        f"No MA-origin load should be sent after release; got {session.queue_loads}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_then_activate_lets_qobuz_drive_again() -> None:
+    """A later SET_STATE from Qobuz must work normally after release+activate."""
+    queue = _queue(PlaybackState.IDLE)
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=11, track_id="old")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+
+    await engine.release_target_player()
+    engine.set_active(active=True)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            current_item=QueueTrackRef(queue_item_id=20, track_id="new"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+
+    play_index_calls = [
+        call for call in provider.mass.player_queues.calls if call[0] == "play_index"
+    ]
+    assert play_index_calls, (
+        f"play_index should fire after re-activation; got {provider.mass.player_queues.calls}"
+    )

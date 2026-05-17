@@ -108,9 +108,15 @@ async def _dump_state(page: Page, out_dir: Path, label: str) -> None:
     # Accessibility tree (Chromium's view of roles + names). Most useful for
     # finding semantic anchors like "main", "navigation", "complementary".
     try:
-        # Playwright exposes Page.accessibility at runtime but the type stubs
-        # don't declare it — the harness uses it for one-shot DOM dumps only.
-        snapshot = await page.accessibility.snapshot(interesting_only=True)  # type: ignore[attr-defined]
+        # Playwright exposes Page.accessibility at runtime but older versions
+        # of the type stubs don't declare it — go through getattr so we work
+        # with either version. The harness uses this for one-shot DOM dumps.
+        accessibility = getattr(page, "accessibility", None)
+        snapshot = (
+            await accessibility.snapshot(interesting_only=True)
+            if accessibility is not None
+            else None
+        )
     except Exception:
         snapshot = None
     (state_dir / "a11y_tree.json").write_text(json.dumps(snapshot, indent=2))

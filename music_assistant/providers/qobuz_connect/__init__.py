@@ -38,7 +38,6 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the end-to-end flow.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import uuid
 from collections.abc import Callable
@@ -371,16 +370,13 @@ class QobuzConnectProvider(PluginProvider):
         """
         if active:
             self.logger.info("Qobuz Connect activated")
+            self._sync.set_active(active=True)
             await self._broadcast_current_volume()
             if self._session:
                 await self._session.send_quality_reports(self._max_quality)
             return
         self.logger.info("Qobuz Connect deactivated by cloud; releasing MA player")
-        player_id = self.get_target_player_id()
-        if player_id:
-            with contextlib.suppress(Exception):
-                await self.mass.player_queues.stop(player_id)
-        self._sync.reset_for_deactivation()
+        await self._sync.release_target_player()
 
     async def _broadcast_current_volume(self) -> None:
         """Report current MA player volume to Qobuz."""
