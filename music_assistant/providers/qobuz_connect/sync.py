@@ -73,11 +73,15 @@ from .models import (
     Origin,
     PlayingState,
     QobuzMirror,
+    QueueClearedEvent,
     QueueError,
     QueueLoadAck,
     QueueStateSnapshot,
     QueueTrackRef,
     QueueTracksAddedEvent,
+    QueueTracksInsertedEvent,
+    QueueTracksRemovedEvent,
+    QueueTracksReorderedEvent,
     QueueVersion,
     SetStateEvent,
 )
@@ -304,6 +308,57 @@ class QobuzConnectSyncEngine:
         """
         self.qobuz_state.queue_version = event.queue_version
         self.qobuz_state.tracks.extend(event.tracks)
+
+    async def handle_queue_tracks_inserted(self, event: QueueTracksInsertedEvent) -> None:
+        """
+        Apply a ``SRVR_CTRL_QUEUE_TRACKS_INSERTED`` delta to the mirror.
+
+        Inserts the new tracks immediately after the queue position
+        identified by ``event.insert_after`` (0 = before the first
+        track). Phase B: protocol-layer tracking only.
+        """
+        self.qobuz_state.queue_version = event.queue_version
+        insert_index = max(0, min(event.insert_after, len(self.qobuz_state.tracks)))
+        self.qobuz_state.tracks[insert_index:insert_index] = event.tracks
+
+    async def handle_queue_tracks_removed(self, event: QueueTracksRemovedEvent) -> None:
+        """
+        Apply a ``SRVR_CTRL_QUEUE_TRACKS_REMOVED`` delta to the mirror.
+
+        Drops every track whose ``queue_item_id`` is in
+        ``event.queue_item_ids``. Phase B: protocol-layer tracking only.
+        """
+        self.qobuz_state.queue_version = event.queue_version
+        removed_ids = set(event.queue_item_ids)
+        self.qobuz_state.tracks = [
+            track for track in self.qobuz_state.tracks if track.queue_item_id not in removed_ids
+        ]
+
+    async def handle_queue_tracks_reordered(self, event: QueueTracksReorderedEvent) -> None:
+        """
+        Apply a ``SRVR_CTRL_QUEUE_TRACKS_REORDERED`` delta to the mirror.
+
+        Moves every track whose ``queue_item_id`` is in
+        ``event.queue_item_ids`` (preserving their original relative
+        order) to sit immediately after ``event.insert_after``. Phase B:
+        protocol-layer tracking only.
+        """
+        self.qobuz_state.queue_version = event.queue_version
+        ids_to_move = list(event.queue_item_ids)
+        id_to_track = {track.queue_item_id: track for track in self.qobuz_state.tracks}
+        moving = [id_to_track[item_id] for item_id in ids_to_move if item_id in id_to_track]
+        remaining = [
+            track
+            for track in self.qobuz_state.tracks
+            if track.queue_item_id not in set(ids_to_move)
+        ]
+        target = max(0, min(event.insert_after, len(remaining)))
+        self.qobuz_state.tracks = remaining[:target] + moving + remaining[target:]
+
+    async def handle_queue_cleared(self, _event: QueueClearedEvent) -> None:
+        """Apply a ``SRVR_CTRL_QUEUE_CLEARED`` notification to the mirror."""
+        self.qobuz_state.queue_version = _event.queue_version
+        self.qobuz_state.tracks = []
 
     async def handle_loop_mode(self, mode: LoopMode) -> None:
         """Record a renderer ``SET_LOOP_MODE`` command in the mirror."""
