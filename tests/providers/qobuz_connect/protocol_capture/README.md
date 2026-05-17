@@ -2,13 +2,10 @@
 
 This is a reusable Playwright-based tool that drives two real Qobuz Web Client
 sessions and records **every WebSocket frame in both directions, with full
-binary bytes preserved**. It exists because the legacy capture files in
-[../proto/captured/legacy/](../../../../music_assistant/providers/qobuz_connect/proto/captured/legacy/)
-were exported by a Chrome extension that dropped the incoming binary payload
-— the entire `SRVR_*` side of the protocol is invisible there. Those legacy
-captures are obsolete; this harness is the **only** authoritative source of
-protocol behavior. Each scenario writes a fresh `.runs/<scenario>__client_a.json`
-and `…__client_b.json` pair containing both directions.
+binary bytes preserved**. It is the **only** authoritative source of protocol
+behavior for the `qobuz_connect` provider. Each scenario writes a fresh
+`.runs/<scenario>__client_a.json` and `…__client_b.json` pair containing both
+directions.
 
 The harness is **not** part of the normal test suite. It is excluded from
 pytest collection (see `tests/providers/qobuz_connect/conftest.py`) so it
@@ -85,21 +82,16 @@ Captures land in `.runs/<scenario>__client_a.json` and `…__client_b.json`.
 | `controller_burst_skip_throttled`     | Same as `controller_burst_skip` with B throttled (200ms RTT + 100kbps both ways)  | Burst under slow renderer (out-of-order arrivals; reconcile stress)  |
 | `controller_play_pause_rapid`         | A controls + B renders → 6× rapid play/pause toggles                              | State-flapping reconciliation                                        |
 
-Promote a `.runs/*.json` capture into the committed reference set by moving
-it to
-[../proto/captured/full/](../../../../music_assistant/providers/qobuz_connect/proto/captured/full/) —
-this folder is the ground-truth source for Phase B test fixtures. **Before
-committing, strip Qobuz auth tokens** from the AUTHENTICATE frame (frame
-index 0 in most captures): replace the JWT payload bytes with zeros and
-update the recorded `size` field.
+`.runs/` is gitignored — captures contain personal Qobuz JWT auth tokens.
+If you ever need to commit a capture as a fixture, strip the auth bytes
+from the AUTHENTICATE frame (frame index 0 in most captures): zero out
+the JWT payload bytes and update the recorded `size` field first.
 
 ## Schema
 
-Output JSON matches the existing
-[capture-*.json](../../../../music_assistant/providers/qobuz_connect/proto/captured/)
-shape — `version`, `exportDate`, `statistics`, `eventTypes`, `messages[]`
-with each message holding a sparse byte-dict in `data`. The only meaningful
-difference is that incoming binary frames are no longer empty.
+Output JSON shape — `version`, `exportDate`, `statistics`, `eventTypes`,
+`messages[]` with each message holding a sparse byte-dict in `data`. Both
+incoming and outgoing binary frames carry their full bytes.
 
 ## Layout
 
