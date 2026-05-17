@@ -2,6 +2,18 @@
 
 Music Assistant is an async Python music library manager that connects to streaming services and speakers, integrating with Home Assistant.
 
+## Fork Focus: `qobuz_connect` Provider
+
+This fork's primary purpose is the experimental [qobuz_connect](music_assistant/providers/qobuz_connect/) plugin provider — a Qobuz Connect receiver that exposes MA as a Qobuz Connect target so Qobuz apps can hand off playback to an MA player. Data flow: `Qobuz app -> Qobuz Connect protocol -> MA player queue -> native MA qobuz provider`.
+
+- [discovery.py](music_assistant/providers/qobuz_connect/discovery.py): mDNS + local handshake endpoints.
+- [session.py](music_assistant/providers/qobuz_connect/session.py): Qobuz Connect WebSocket lifecycle and dispatch.
+- [protocol.py](music_assistant/providers/qobuz_connect/protocol.py): `QobuzConnectCodec` frame/protobuf codec.
+- [sync.py](music_assistant/providers/qobuz_connect/sync.py): `QobuzConnectSyncEngine`, the owner of Qobuz/MA state reconciliation.
+- [models.py](music_assistant/providers/qobuz_connect/models.py): shared enums/dataclasses and quality maps.
+- Generated protobuf modules are committed in [proto/](music_assistant/providers/qobuz_connect/proto/); do not delete them. Reference captures live under [proto/captured/](music_assistant/providers/qobuz_connect/proto/captured/).
+- Tests live in [tests/providers/qobuz_connect/](tests/providers/qobuz_connect/). Run with `pytest tests/providers/qobuz_connect/`.
+
 ## Behaviour
 
 - NEVER automatically reply on Github (PR's or Discussions) without explicit consent from the developer.
