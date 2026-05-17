@@ -25,6 +25,7 @@ from music_assistant.providers.qobuz_connect.models import (
     QueueTracksRemovedEvent,
     QueueTracksReorderedEvent,
     QueueVersion,
+    SessionStateEvent,
     SetStateEvent,
 )
 from music_assistant.providers.qobuz_connect.state import (
@@ -82,8 +83,22 @@ class _FakePlayerQueues:
 
     async def play_media(self, queue_id: str, media: Any, **kwargs: Any) -> None:
         self.calls.append(("play_media", (queue_id, media), kwargs))
+        option = kwargs.get("option")
+        if option is not None and option.name == "ADD":
+            # Append to the queue, don't disrupt current playback (the
+            # contract we're testing — ``play_media(option=ADD)`` is the
+            # background preload's non-disrupting extend path).
+            self.queue_items = self.queue_items + [
+                SimpleNamespace(media_item=track) for track in media
+            ]
+            return
+        # Treat any other option (or no option) as a REPLACE-style call.
         self.queue.state = PlaybackState.PLAYING
-        self.queue.current_item = SimpleNamespace(track_id=getattr(media[0], "item_id", None))
+        first = media[0] if isinstance(media, list) else media
+        self.queue.current_item = SimpleNamespace(track_id=getattr(first, "item_id", None))
+
+    def items(self, queue_id: str, **_kwargs: Any) -> list[Any]:
+        return self.queue_items if queue_id == "player" else []
 
 
 class _FakeLogger:
@@ -104,6 +119,7 @@ class _FakeSession:
         self.renderer_states: list[dict[str, Any]] = []
         self.queue_loads: list[dict[str, Any]] = []
         self.autoplay_loads: list[dict[str, Any]] = []
+        self.queue_state_asks: list[dict[str, Any]] = []
 
     async def send_renderer_state(self, **kwargs: Any) -> None:
         self.renderer_states.append(kwargs)
@@ -114,6 +130,10 @@ class _FakeSession:
 
     async def send_autoplay_load_tracks(self, **kwargs: Any) -> bool:
         self.autoplay_loads.append(kwargs)
+        return True
+
+    async def send_ask_for_queue_state(self, **kwargs: Any) -> bool:
+        self.queue_state_asks.append(kwargs)
         return True
 
 
@@ -133,7 +153,21 @@ class _FakeProvider:
         return "player"
 
     def get_qobuz_track_id_from_queue_item(self, queue_item: Any) -> str | None:
-        return getattr(queue_item, "track_id", None)
+        # Tests synthesize a few different shapes:
+        # - ``queue.current_item`` is a ``SimpleNamespace(track_id=...)`` (the
+        #   fake ``play_index`` constructs these).
+        # - ``queue_items()`` returns raw ``QueueItem``s from ``load()``; here
+        #   the Qobuz id lives on ``media_item.item_id``.
+        # - ``play_media(option=ADD)`` items wrap a ``media_item=track`` shim.
+        direct = getattr(queue_item, "track_id", None)
+        if direct is not None:
+            return cast("str", direct)
+        media_item = getattr(queue_item, "media_item", None)
+        if media_item is not None:
+            item_id = getattr(media_item, "item_id", None)
+            if item_id is not None:
+                return cast("str", item_id)
+        return None
 
     def get_qobuz_provider(self) -> Any:
         return self.qobuz_provider
@@ -157,6 +191,11 @@ async def _fake_get_track(track_id: str) -> Any:
         duration=180,
         album=SimpleNamespace(item_id="123456", image=None, media_type=MediaType.ALBUM),
         track_number=2,
+        # ``provider`` lets ``get_qobuz_track_id_from_queue_item`` recognise
+        # these items as Qobuz tracks — required by the preload's
+        # already-in-MA dedup check.
+        provider="qobuz",
+        provider_mappings=(),
     )
 
 
@@ -183,6 +222,13 @@ def _event(queue: Any) -> Any:
 
 async def _wait_for_reconcile(engine: QobuzConnectSyncEngine) -> None:
     task = cast("Any", engine).command_handler._reconcile_task
+    if task:
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def _wait_for_preload(engine: QobuzConnectSyncEngine) -> None:
+    task = cast("Any", engine).command_handler._preload_task
     if task:
         with contextlib.suppress(asyncio.CancelledError):
             await task
@@ -1358,4 +1404,734 @@ async def test_release_then_activate_lets_qobuz_drive_again() -> None:
     ]
     assert play_index_calls, (
         f"play_index should fire after re-activation; got {provider.mass.player_queues.calls}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for full-queue loading via SRVR_CTRL_SESSION_STATE +
+# CTRL_SRVR_ASK_FOR_QUEUE_STATE. The reference Web Client (handoff__client_b
+# capture) sends the ask immediately when session-state arrives; without it
+# the cloud never delivers SRVR_CTRL_QUEUE_STATE and MA's queue only ever
+# sees current+next from SET_STATE.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_state_triggers_ask_for_queue_state() -> None:
+    """A ``SRVR_CTRL_SESSION_STATE`` must elicit an ``ASK_FOR_QUEUE_STATE`` out."""
+    session = _FakeSession()
+    provider = _FakeProvider(_queue(PlaybackState.IDLE), session=session)
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_session_state(
+        SessionStateEvent(
+            session_uuid=b"\x01" * 16,
+            session_id=42,
+            queue_version=QueueVersion(major=17, minor=1),
+            track_index=3,
+        )
+    )
+
+    assert len(session.queue_state_asks) == 1, (
+        f"Expected exactly one ASK_FOR_QUEUE_STATE; got {session.queue_state_asks}"
+    )
+    ask = session.queue_state_asks[0]
+    assert ask["queue_version"] == QueueVersion(major=17, minor=1)
+    assert isinstance(ask["queue_uuid"], bytes)
+    assert len(ask["queue_uuid"]) == 16, (
+        "Action correlator must be 16 raw bytes (uuid4().bytes), to match the "
+        "Web Client's pattern observed in the handoff capture."
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_state_triggers_ask_for_queue_state_when_session_state_missing() -> None:
+    """Renderer-role: cloud doesn't push SESSION_STATE, so SET_STATE qv triggers the ask.
+
+    The Qobuz Web Client captures show ``SESSION_STATE`` as the natural ask trigger,
+    but the cloud only pushes it to clients in the controller role (user-login JWT).
+    We authenticate with a device-session JWT from ``/connect`` and never receive
+    ``SESSION_STATE`` — so the ask is driven from the first ``SET_STATE`` that
+    carries a real queue version. Verified locally May 2026 (removing the device-
+    role handshake fields caused the cloud to close the WS with a type-1 ERROR).
+    """
+    session = _FakeSession()
+    provider = _FakeProvider(_queue(PlaybackState.IDLE), session=session)
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=47, minor=1),
+            current_item=QueueTrackRef(queue_item_id=7, track_id="175293611"),
+            next_item=QueueTrackRef(queue_item_id=8, track_id="264108972"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+
+    assert len(session.queue_state_asks) == 1, (
+        f"Expected an ASK driven by SET_STATE's queueVersion; got {session.queue_state_asks}"
+    )
+    assert session.queue_state_asks[0]["queue_version"] == QueueVersion(major=47, minor=1)
+
+
+@pytest.mark.asyncio
+async def test_ask_for_queue_state_fires_only_once_per_session() -> None:
+    """The flag must coalesce repeated SET_STATE events into a single ask."""
+    session = _FakeSession()
+    provider = _FakeProvider(_queue(PlaybackState.PLAYING), session=session)
+    engine = QobuzConnectSyncEngine(provider)
+
+    for _ in range(3):
+        await engine.handle_qobuz_set_state(
+            SetStateEvent(
+                playing_state=PlayingState.PLAYING,
+                queue_version=QueueVersion(major=47, minor=1),
+                current_item=QueueTrackRef(queue_item_id=7, track_id="175293611"),
+            )
+        )
+    await _wait_for_reconcile(engine)
+    await engine.handle_queue_version(QueueVersion(major=47, minor=2))
+
+    assert len(session.queue_state_asks) == 1, (
+        f"Repeated queueVersion observations must not re-ask; got {session.queue_state_asks}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reactivation_re_arms_the_queue_state_ask() -> None:
+    """After release + set_active(True), the next queueVersion must ask again."""
+    session = _FakeSession()
+    provider = _FakeProvider(_queue(PlaybackState.PLAYING), session=session)
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=47, minor=1),
+            current_item=QueueTrackRef(queue_item_id=7, track_id="175293611"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+    assert len(session.queue_state_asks) == 1
+
+    await engine.release_target_player()
+    engine.set_active(active=True)
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=48, minor=1),
+            current_item=QueueTrackRef(queue_item_id=9, track_id="t9"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+
+    assert len(session.queue_state_asks) == 2, (
+        f"Reactivation must rearm the ask; got {session.queue_state_asks}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_state_updates_mirror_queue_version() -> None:
+    """Session-state's queue version must land on the mirror before the ask fires."""
+    provider = _FakeProvider(_queue(PlaybackState.IDLE), session=_FakeSession())
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.queue_version = QueueVersion(major=2, minor=0)
+
+    await engine.handle_session_state(
+        SessionStateEvent(
+            session_uuid=b"\x01" * 16,
+            session_id=99,
+            queue_version=QueueVersion(major=45, minor=1),
+        )
+    )
+
+    assert engine.qobuz_state.queue_version == QueueVersion(major=45, minor=1)
+
+
+@pytest.mark.asyncio
+async def test_replace_loads_only_current_and_next_for_fast_first_audio() -> None:
+    """Initial replace must stay fast: current + next only, even if the snapshot is present.
+
+    The full snapshot is filled in via the background preload — see
+    :func:`test_queue_state_snapshot_schedules_background_preload`.
+    """
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+    # Snapshot already on the mirror (e.g. QUEUE_STATE arrived first).
+    engine.qobuz_state.tracks = [
+        QueueTrackRef(queue_item_id=1, track_id="t1"),
+        QueueTrackRef(queue_item_id=2, track_id="t2"),
+        QueueTrackRef(queue_item_id=3, track_id="t3"),
+        QueueTrackRef(queue_item_id=4, track_id="t4"),
+    ]
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            current_item=QueueTrackRef(queue_item_id=2, track_id="t2"),
+            next_item=QueueTrackRef(queue_item_id=3, track_id="t3"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+
+    load_calls = [c for c in provider.mass.player_queues.calls if c[0] == "load"]
+    loaded_ids = [getattr(qi.media_item, "item_id", None) for qi in load_calls[-1][1][1]]
+    assert loaded_ids == ["t2", "t3"], (
+        f"Initial replace must be fast (current+next only); got {loaded_ids}. "
+        "The rest of the queue is the background preload's job."
+    )
+    play_index_calls = [c for c in provider.mass.player_queues.calls if c[0] == "play_index"]
+    assert play_index_calls[-1][1][1] == 0, (
+        f"play_index must target the just-loaded position 0, got {play_index_calls[-1]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_replace_falls_back_to_current_next_without_snapshot() -> None:
+    """Pre-snapshot behaviour: load only current + next when no full list is known."""
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+    # qobuz_state.tracks is empty — snapshot hasn't landed yet.
+    assert engine.qobuz_state.tracks == []
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            current_item=QueueTrackRef(queue_item_id=2, track_id="current"),
+            next_item=QueueTrackRef(queue_item_id=3, track_id="next"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+
+    load_calls = [c for c in provider.mass.player_queues.calls if c[0] == "load"]
+    assert load_calls, f"Expected a load; got {provider.mass.player_queues.calls}"
+    loaded_items = load_calls[-1][1][1]
+    loaded_ids = [getattr(qi.media_item, "item_id", None) for qi in loaded_items]
+    assert loaded_ids == ["current", "next"], f"Got {loaded_ids}"
+
+
+@pytest.mark.asyncio
+async def test_queue_state_snapshot_schedules_background_preload() -> None:
+    """Snapshot landing after SET_STATE must extend MA in the background, not restart it.
+
+    Production race: SET_STATE fills MA with 2 items, then QUEUE_STATE arrives
+    80-300 ms later with the full list. The fix isn't a full re-load (which
+    restarts the audio stream on AirPlay) — it's a chunked
+    ``play_media(option=ADD)`` background task. Verified in production log
+    May 2026: ``Qobuz QUEUE_STATE qv=47.1 tracks=600``.
+    """
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+
+    # 1. SET_STATE first — only current + next get loaded into MA.
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=47, minor=1),
+            current_item=QueueTrackRef(queue_item_id=2, track_id="t2"),
+            next_item=QueueTrackRef(queue_item_id=3, track_id="t3"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+    loads_after_set_state = sum(1 for c in provider.mass.player_queues.calls if c[0] == "load")
+    play_indexes_after_set_state = sum(
+        1 for c in provider.mass.player_queues.calls if c[0] == "play_index"
+    )
+
+    # 2. QUEUE_STATE response arrives with the full track list — must not
+    # trigger another stop/clear/load/play_index cycle.
+    await engine.handle_queue_state(
+        QueueStateSnapshot(
+            queue_version=QueueVersion(major=47, minor=1),
+            action_uuid=b"\x00" * 16,
+            tracks=[
+                QueueTrackRef(queue_item_id=1, track_id="t1"),
+                QueueTrackRef(queue_item_id=2, track_id="t2"),
+                QueueTrackRef(queue_item_id=3, track_id="t3"),
+                QueueTrackRef(queue_item_id=4, track_id="t4"),
+            ],
+            shuffle_mode=False,
+            autoplay_mode=False,
+        )
+    )
+    await _wait_for_preload(engine)
+
+    calls_after = provider.mass.player_queues.calls
+    # No additional stop / clear / load / play_index after the snapshot.
+    loads_after = sum(1 for c in calls_after if c[0] == "load")
+    play_indexes_after = sum(1 for c in calls_after if c[0] == "play_index")
+    stops_after = sum(1 for c in calls_after if c[0] == "stop")
+    clears_after = sum(1 for c in calls_after if c[0] == "clear")
+    assert loads_after == loads_after_set_state, (
+        f"Snapshot preload must not trigger another load; calls={calls_after}"
+    )
+    assert play_indexes_after == play_indexes_after_set_state, (
+        "Snapshot preload must not call play_index — playback continues uninterrupted"
+    )
+    # ``stop`` is fine if it was needed for the initial replace; what we
+    # don't want is a *second* stop after the snapshot lands.
+    initial_stop_present = stops_after <= 1
+    assert initial_stop_present, f"Snapshot preload must not stop the queue; calls={calls_after}"
+    assert clears_after <= 1, f"Snapshot preload must not clear the queue; calls={calls_after}"
+
+    # The actual extension came via play_media(option=ADD).
+    add_calls = [
+        c
+        for c in calls_after
+        if c[0] == "play_media" and c[2].get("option") is not None and c[2]["option"].name == "ADD"
+    ]
+    assert add_calls, f"Expected a play_media(option=ADD) call; got {calls_after}"
+    added_ids: list[str | None] = []
+    for call in add_calls:
+        added_ids.extend(getattr(track, "item_id", None) for track in call[1][1])
+    # Snapshot has t1..t4 with current=t2 at index 1. Preload appends from
+    # current_idx+1 onwards. ``t3`` is skipped (already in MA as ``next_item``).
+    assert added_ids == ["t4"], (
+        f"Preload must append snapshot[current_idx+1:] minus already-present items; got {added_ids}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_preload_chunks_large_queue() -> None:
+    """600-track snapshot must be appended via multiple chunked ADD calls."""
+    from music_assistant.providers.qobuz_connect.command_handler import (  # noqa: PLC0415
+        PRELOAD_CHUNK_SIZE,
+    )
+
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+    total_tracks = 120  # 5x the chunk size to give us multiple ADD calls
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=47, minor=1),
+            current_item=QueueTrackRef(queue_item_id=1, track_id="t0"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+
+    await engine.handle_queue_state(
+        QueueStateSnapshot(
+            queue_version=QueueVersion(major=47, minor=1),
+            action_uuid=b"\x00" * 16,
+            tracks=[
+                QueueTrackRef(queue_item_id=i + 1, track_id=f"t{i}") for i in range(total_tracks)
+            ],
+            shuffle_mode=False,
+            autoplay_mode=False,
+        )
+    )
+    await _wait_for_preload(engine)
+
+    add_calls = [
+        c
+        for c in provider.mass.player_queues.calls
+        if c[0] == "play_media" and c[2].get("option") is not None and c[2]["option"].name == "ADD"
+    ]
+    assert len(add_calls) >= 2, (
+        f"Expected chunked ADD calls for 120 tracks; got {len(add_calls)} calls"
+    )
+    for call in add_calls:
+        chunk = call[1][1]
+        assert 0 < len(chunk) <= PRELOAD_CHUNK_SIZE, (
+            f"Each chunk must be ≤ {PRELOAD_CHUNK_SIZE}; got chunk of {len(chunk)}"
+        )
+    added_ids: list[str | None] = []
+    for call in add_calls:
+        added_ids.extend(getattr(track, "item_id", None) for track in call[1][1])
+    # current_item=t0 at index 0 → preload covers t1..t119.
+    assert added_ids == [f"t{i}" for i in range(1, total_tracks)], (
+        f"Preload must cover every snapshot track after current; got {len(added_ids)} ids"
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_queue_state_with_same_version_does_not_re_preload() -> None:
+    """Identical queue_version snapshots must not re-trigger the preload."""
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=47, minor=1),
+            current_item=QueueTrackRef(queue_item_id=2, track_id="t2"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+
+    snapshot = QueueStateSnapshot(
+        queue_version=QueueVersion(major=47, minor=1),
+        action_uuid=b"\x00" * 16,
+        tracks=[
+            QueueTrackRef(queue_item_id=1, track_id="t1"),
+            QueueTrackRef(queue_item_id=2, track_id="t2"),
+            QueueTrackRef(queue_item_id=3, track_id="t3"),
+        ],
+        shuffle_mode=False,
+        autoplay_mode=False,
+    )
+    await engine.handle_queue_state(snapshot)
+    await _wait_for_preload(engine)
+    add_calls_after_first = sum(
+        1
+        for c in provider.mass.player_queues.calls
+        if c[0] == "play_media" and c[2].get("option") is not None and c[2]["option"].name == "ADD"
+    )
+
+    await engine.handle_queue_state(snapshot)
+    await _wait_for_preload(engine)
+    add_calls_after_second = sum(
+        1
+        for c in provider.mass.player_queues.calls
+        if c[0] == "play_media" and c[2].get("option") is not None and c[2]["option"].name == "ADD"
+    )
+    assert add_calls_after_second == add_calls_after_first, (
+        f"Duplicate snapshot must not re-preload; "
+        f"first run made {add_calls_after_first} ADD calls, second run made {add_calls_after_second}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_preload_skips_unresolvable_tracks_within_chunk() -> None:
+    """One unresolvable track must not abort the chunk; resolvable ones still ADD."""
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+
+    async def _selectively_resolve(track_id: str) -> Any:
+        if track_id == "bad":
+            msg = "no such track"
+            raise RuntimeError(msg)
+        return await _fake_get_track(track_id)
+
+    provider.qobuz_provider = SimpleNamespace(
+        get_track=_selectively_resolve,
+        get_album_tracks=_fake_get_album_tracks,
+    )
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=47, minor=1),
+            current_item=QueueTrackRef(queue_item_id=1, track_id="t1"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+
+    await engine.handle_queue_state(
+        QueueStateSnapshot(
+            queue_version=QueueVersion(major=47, minor=1),
+            action_uuid=b"\x00" * 16,
+            tracks=[
+                QueueTrackRef(queue_item_id=1, track_id="t1"),
+                QueueTrackRef(queue_item_id=2, track_id="t2"),
+                QueueTrackRef(queue_item_id=3, track_id="bad"),
+                QueueTrackRef(queue_item_id=4, track_id="t4"),
+            ],
+            shuffle_mode=False,
+            autoplay_mode=False,
+        )
+    )
+    await _wait_for_preload(engine)
+
+    add_calls = [
+        c
+        for c in provider.mass.player_queues.calls
+        if c[0] == "play_media" and c[2].get("option") is not None and c[2]["option"].name == "ADD"
+    ]
+    added_ids: list[str | None] = []
+    for call in add_calls:
+        added_ids.extend(getattr(track, "item_id", None) for track in call[1][1])
+    assert added_ids == ["t2", "t4"], (
+        f"Unresolvable 'bad' must be skipped without aborting the rest; got {added_ids}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_preload_cancels_on_new_set_state() -> None:
+    """A new SET_STATE during preload must cancel the preload — no further ADDs."""
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+
+    # Gate the second metadata fetch so we can interleave a new SET_STATE.
+    resolve_gate = asyncio.Event()
+    resolve_started = asyncio.Event()
+    resolved_ids: list[str] = []
+
+    async def _gated_resolve(track_id: str) -> Any:
+        if track_id == "tg":
+            resolve_started.set()
+            await resolve_gate.wait()
+        resolved_ids.append(track_id)
+        return await _fake_get_track(track_id)
+
+    provider.qobuz_provider = SimpleNamespace(
+        get_track=_gated_resolve,
+        get_album_tracks=_fake_get_album_tracks,
+    )
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=47, minor=1),
+            current_item=QueueTrackRef(queue_item_id=1, track_id="t1"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+
+    snapshot_tracks = [
+        QueueTrackRef(queue_item_id=1, track_id="t1"),
+        QueueTrackRef(queue_item_id=2, track_id="tg"),  # the gated one
+        QueueTrackRef(queue_item_id=3, track_id="t3"),
+    ]
+    snapshot_task = asyncio.create_task(
+        engine.handle_queue_state(
+            QueueStateSnapshot(
+                queue_version=QueueVersion(major=47, minor=1),
+                action_uuid=b"\x00" * 16,
+                tracks=snapshot_tracks,
+                shuffle_mode=False,
+                autoplay_mode=False,
+            )
+        )
+    )
+    await resolve_started.wait()
+
+    # Mid-preload, the user skips to a new track. Generation bumps; preload
+    # should cancel and not issue any further ADD calls for the old snapshot.
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=48, minor=1),
+            current_item=QueueTrackRef(queue_item_id=99, track_id="brand-new"),
+        )
+    )
+    resolve_gate.set()
+    await snapshot_task
+    await _wait_for_preload(engine)
+    await _wait_for_reconcile(engine)
+
+    add_calls = [
+        c
+        for c in provider.mass.player_queues.calls
+        if c[0] == "play_media" and c[2].get("option") is not None and c[2]["option"].name == "ADD"
+    ]
+    assert not add_calls, (
+        f"Preload must not ADD anything after generation supersedes it; got {add_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_skip_to_already_loaded_track_does_not_wipe_queue() -> None:
+    """Skip-to-track within the preloaded queue must use play_index, not replace.
+
+    Mirrors plex_connect/player_remote.py:1187 (handle_skip_to) — when the
+    controller picks a track already sitting in MA's queue, we jump via
+    ``play_index`` instead of stop+clear+load+play_index. Otherwise every
+    skip-next would wipe the preloaded 600 tracks and force a refetch.
+    """
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+
+    # 1. Initial connect: SET_STATE + QUEUE_STATE → preload fills the queue.
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=47, minor=1),
+            current_item=QueueTrackRef(queue_item_id=1, track_id="t1"),
+            next_item=QueueTrackRef(queue_item_id=2, track_id="t2"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+    await engine.handle_queue_state(
+        QueueStateSnapshot(
+            queue_version=QueueVersion(major=47, minor=1),
+            action_uuid=b"\x00" * 16,
+            tracks=[
+                QueueTrackRef(queue_item_id=1, track_id="t1"),
+                QueueTrackRef(queue_item_id=2, track_id="t2"),
+                QueueTrackRef(queue_item_id=3, track_id="t3"),
+                QueueTrackRef(queue_item_id=4, track_id="t4"),
+            ],
+            shuffle_mode=False,
+            autoplay_mode=False,
+        )
+    )
+    await _wait_for_preload(engine)
+    ma_queue_after_preload = provider.mass.player_queues.queue_items
+    assert len(ma_queue_after_preload) >= 3, (
+        f"Preload must have filled the queue; got {len(ma_queue_after_preload)} items"
+    )
+
+    calls_before_skip = list(provider.mass.player_queues.calls)
+
+    # 2. User skips to t3 in the Qobuz app. Cloud sends SET_STATE with
+    # current_item=t3. t3 is already in MA's loaded queue.
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=47, minor=1),
+            current_item=QueueTrackRef(queue_item_id=3, track_id="t3"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+    await _wait_for_preload(engine)
+
+    new_calls = provider.mass.player_queues.calls[len(calls_before_skip) :]
+    # No stop / clear / load — the loaded queue is intact.
+    new_call_kinds = [c[0] for c in new_calls]
+    assert "stop" not in new_call_kinds, f"Skip must not stop the queue; got {new_call_kinds}"
+    assert "clear" not in new_call_kinds, f"Skip must not clear the queue; got {new_call_kinds}"
+    assert "load" not in new_call_kinds, (
+        f"Skip must not re-load the queue (would force a refetch); got {new_call_kinds}"
+    )
+    # A play_index call to t3's existing position fired.
+    play_index_after_skip = [c for c in new_calls if c[0] == "play_index"]
+    assert play_index_after_skip, f"Skip must call play_index; got new calls {new_calls}"
+    # The skipped-to index is wherever t3 sits in the loaded list.
+    expected_idx = next(
+        i
+        for i, qi in enumerate(ma_queue_after_preload)
+        if getattr(qi.media_item, "item_id", None) == "t3"
+    )
+    assert play_index_after_skip[-1][1][1] == expected_idx, (
+        f"play_index must target t3's existing index {expected_idx}; "
+        f"got {play_index_after_skip[-1]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_replace_resets_preload_dedup_so_partial_queue_can_refill() -> None:
+    """If a replace wipes MA mid-preload, the dedup flag must be reset.
+
+    Scenario: snapshot is huge, preload is still in flight, user skip-tos
+    a track that's in the snapshot but hasn't been added to MA yet.
+    ``_find_item_in_ma_queue`` doesn't find it → ``_replace_ma_queue_from_qobuz``
+    fires → MA's preloaded items are wiped to just ``[new_current, next]``.
+    Without resetting ``_last_preloaded_qv`` the post-replace
+    ``maybe_preload_remaining_tracks`` would see the same qv and bail,
+    stranding MA at 2 items.
+
+    Unit-level check: after ``_replace_ma_queue_from_qobuz`` runs, the
+    dedup flag is ``None`` regardless of whether the snapshot changed.
+    """
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+    handler = cast("Any", engine).command_handler
+    # Simulate a preload having happened earlier in the session.
+    handler._last_preloaded_qv = (47, 1)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=47, minor=1),
+            current_item=QueueTrackRef(queue_item_id=2, track_id="t2"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+
+    assert handler._last_preloaded_qv is None, (
+        "Replace must reset the preload dedup so the same-qv snapshot can re-preload after a wipe."
+    )
+
+
+@pytest.mark.asyncio
+async def test_natural_advance_then_metadata_set_state_preserves_preloaded_queue() -> None:
+    """Metadata-only SET_STATE post-advance must not wipe the preloaded tail.
+
+    The exact scenario that left the user with a 2-item queue after every
+    track change:
+      1. SET_STATE + QUEUE_STATE → preload fills MA with [t1..t4].
+      2. MA naturally advances to t2 → ``_sync_mirror_from_ma_queue`` promotes
+         next→current and calls ``reset_prequeue_dedup`` (clears
+         ``_last_prequeued_next_ref``).
+      3. Cloud sends a metadata-only SET_STATE with ``next_item=t3``.
+      4. ``_prequeue_next_item(t3)`` runs (dedup is empty). Default code path
+         would issue ``play_media(option=REPLACE_NEXT, media=[t3])``, which
+         wipes everything past current in MA's queue.
+
+    Fix: if MA's queue already has t3 at current_index + 1, skip — the
+    snapshot preload already put it there.
+    """
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=48, minor=1),
+            current_item=QueueTrackRef(queue_item_id=21, track_id="t1"),
+            next_item=QueueTrackRef(queue_item_id=22, track_id="t2"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+    await engine.handle_queue_state(
+        QueueStateSnapshot(
+            queue_version=QueueVersion(major=48, minor=1),
+            action_uuid=b"\x00" * 16,
+            tracks=[
+                QueueTrackRef(queue_item_id=21, track_id="t1"),
+                QueueTrackRef(queue_item_id=22, track_id="t2"),
+                QueueTrackRef(queue_item_id=23, track_id="t3"),
+                QueueTrackRef(queue_item_id=24, track_id="t4"),
+            ],
+            shuffle_mode=False,
+            autoplay_mode=False,
+        )
+    )
+    await _wait_for_preload(engine)
+    pre_advance_queue_len = len(provider.mass.player_queues.queue_items)
+    assert pre_advance_queue_len >= 3, (
+        f"Preload must have extended MA's queue past current+next; "
+        f"got {pre_advance_queue_len} items"
+    )
+
+    # Simulate MA naturally advancing t1 → t2.
+    queue.current_item = SimpleNamespace(track_id="t2")
+    queue.current_index = 1
+    queue.state = PlaybackState.PLAYING
+    await engine.handle_ma_queue_event(_event(queue))
+
+    handler = cast("Any", engine).command_handler
+    promoted_current = engine.qobuz_state.current_item
+    assert promoted_current is not None, "Mirror must keep a current_item after advance"
+    assert promoted_current.track_id == "t2", "Mirror must promote next→current on natural advance"
+    assert handler._last_prequeued_next_ref is None, (
+        "reset_prequeue_dedup must clear the prequeue dedup on advance"
+    )
+
+    calls_before_metadata = len(provider.mass.player_queues.calls)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            queue_version=QueueVersion(major=48, minor=1),
+            next_item=QueueTrackRef(queue_item_id=23, track_id="t3"),
+        )
+    )
+    metadata_task = handler._metadata_task
+    if metadata_task is not None:
+        with contextlib.suppress(asyncio.CancelledError):
+            await metadata_task
+
+    new_calls = provider.mass.player_queues.calls[calls_before_metadata:]
+    play_media_calls = [c for c in new_calls if c[0] == "play_media"]
+    assert not play_media_calls, (
+        f"Metadata-only SET_STATE post-advance must not issue play_media "
+        f"(would wipe preloaded queue tail); got {play_media_calls}"
+    )
+    assert len(provider.mass.player_queues.queue_items) == pre_advance_queue_len, (
+        f"MA's queue length must be unchanged; was {pre_advance_queue_len}, "
+        f"now {len(provider.mass.player_queues.queue_items)}"
     )
