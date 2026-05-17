@@ -62,6 +62,7 @@ from music_assistant_models.errors import PlayerUnavailableError
 from music_assistant_models.queue_item import QueueItem
 
 from .ma_bridge import MABridge
+from .metadata_resolver import MetadataResolver
 from .models import (
     BufferState,
     LoopMode,
@@ -92,7 +93,6 @@ from .state import (
 
 if TYPE_CHECKING:
     from music_assistant_models.event import MassEvent
-    from music_assistant_models.media_items import Track
 
 MA_QUEUE_LOAD_ACK_TIMEOUT = 3.0
 
@@ -113,6 +113,8 @@ class QobuzConnectSyncEngine:
         self.reporter = OutboundReporter(self)
         # Seek + position-confirmation state machine.
         self.seek_pipeline = SeekPipeline(self)
+        # MA-track-metadata lookups + fail-cache.
+        self.metadata = MetadataResolver(self)
         self.qobuz_state = QobuzMirror()
         # Pending-action ephemeral state, grouped into typed dataclasses
         # (see state.py). Each ``None`` means "no pending action of this
@@ -131,7 +133,6 @@ class QobuzConnectSyncEngine:
         self._qobuz_command_generation = 0
         self._reconcile_task: asyncio.Task[None] | None = None
         self._metadata_task: asyncio.Task[None] | None = None
-        self._unresolvable_qobuz_track_ids: set[str] = set()
 
     @property
     def pending_paused_seek_ms(self) -> int | None:
@@ -173,7 +174,7 @@ class QobuzConnectSyncEngine:
         self._prequeued_qobuz_items.clear()
         self._last_prequeued_next_ref = None
         self._last_ma_origin_track_id = None
-        self._unresolvable_qobuz_track_ids.clear()
+        self.metadata.clear_unresolvable_cache()
 
     async def handle_qobuz_set_state(self, event: SetStateEvent) -> None:
         """Apply a full Qobuz SET_STATE event to MA."""
@@ -248,7 +249,7 @@ class QobuzConnectSyncEngine:
             if ack.tracks:
                 idx = min(ack.queue_position, len(ack.tracks) - 1)
                 current_item = ack.tracks[idx]
-                if await self._try_ensure_qobuz_track_metadata(current_item):
+                if await self.metadata.try_ensure_track_duration(current_item):
                     self.qobuz_state.current_item = current_item
             if future := self._pending_queue_loads.pop(ack.action_uuid, None):
                 if not future.done():
@@ -444,7 +445,7 @@ class QobuzConnectSyncEngine:
         """Apply the latest Qobuz command to MA after the immediate mirror update."""
         try:
             if event.current_item and self._is_current_command(generation, event.current_item):
-                await self._try_ensure_qobuz_track_metadata(event.current_item)
+                await self.metadata.try_ensure_track_duration(event.current_item)
             if (
                 self._is_current_command(generation)
                 and not self._pending_queue_loads
@@ -487,7 +488,7 @@ class QobuzConnectSyncEngine:
         """Resolve metadata and next queue items without blocking websocket receive."""
         try:
             if event.current_item and self._is_current_command(generation, event.current_item):
-                await self._try_ensure_qobuz_track_metadata(event.current_item)
+                await self.metadata.try_ensure_track_duration(event.current_item)
             if (
                 self._is_current_command(generation)
                 and not self._pending_queue_loads
@@ -529,7 +530,7 @@ class QobuzConnectSyncEngine:
                 item.queue_item_id,
                 item.track_id,
             )
-            await self._try_ensure_qobuz_track_metadata(item)
+            await self.metadata.try_ensure_track_duration(item)
             if not self._is_current_command(generation, item):
                 return
         if item is None:
@@ -649,7 +650,7 @@ class QobuzConnectSyncEngine:
         generation: int,
     ) -> None:
         player_id = self._require_target_player_id()
-        current_track = await self._get_ma_track_or_none(current_item.track_id)
+        current_track = await self.metadata.get_track_or_none(current_item.track_id)
         if not self._is_current_command(generation, current_item):
             return
         if current_track is None:
@@ -661,7 +662,7 @@ class QobuzConnectSyncEngine:
         tracks = [current_track]
         if self.qobuz_state.next_item:
             with contextlib.suppress(Exception):
-                tracks.append(await self._get_ma_track(self.qobuz_state.next_item.track_id))
+                tracks.append(await self.metadata.get_track(self.qobuz_state.next_item.track_id))
         if not self._is_current_command(generation, current_item):
             return
         queue = self.bridge.get_queue(player_id)
@@ -718,7 +719,7 @@ class QobuzConnectSyncEngine:
         current_ma_track_id = self.bridge.qobuz_track_id_for(queue.current_item)
         if current_ma_track_id != current_item.track_id:
             return
-        ma_track = await self._get_ma_track_or_none(item.track_id)
+        ma_track = await self.metadata.get_track_or_none(item.track_id)
         if ma_track is None:
             return
         if generation is not None and not self._is_current_command(generation):
@@ -799,7 +800,7 @@ class QobuzConnectSyncEngine:
     async def _qobuz_queue_load_context(self, track_id: str) -> tuple[int, int] | None:
         """Resolve Qobuz queue load context reference and item position for a track."""
         try:
-            track = await self._get_ma_track(track_id)
+            track = await self.metadata.get_track(track_id)
             album = getattr(track, "album", None)
             album_id = getattr(album, "item_id", None)
             if not (numeric_album_id := self._try_parse_qobuz_id(album_id)):
@@ -952,39 +953,6 @@ class QobuzConnectSyncEngine:
         return ma_playing_state == target_state or (
             target_state == PlayingState.PAUSED and ma_playing_state == PlayingState.STOPPED
         )
-
-    async def _ensure_qobuz_track_metadata(self, item: QueueTrackRef) -> None:
-        ma_track = await self._get_ma_track(item.track_id)
-        self.qobuz_state.duration_ms = (ma_track.duration or 0) * 1000
-
-    async def _try_ensure_qobuz_track_metadata(self, item: QueueTrackRef) -> bool:
-        if item.track_id in self._unresolvable_qobuz_track_ids:
-            self.qobuz_state.duration_ms = 0
-            return False
-        try:
-            await self._ensure_qobuz_track_metadata(item)
-            return True
-        except Exception:
-            self._unresolvable_qobuz_track_ids.add(item.track_id)
-            self.qobuz_state.duration_ms = 0
-            self.bridge.logger.warning(
-                "Ignoring unresolved Qobuz Connect cloud track %s",
-                item.track_id,
-            )
-            return False
-
-    async def _get_ma_track(self, track_id: str) -> Track:
-        return cast("Track", await self.bridge.qobuz_music_provider().get_track(track_id))
-
-    async def _get_ma_track_or_none(self, track_id: str) -> Track | None:
-        if track_id in self._unresolvable_qobuz_track_ids:
-            return None
-        try:
-            return await self._get_ma_track(track_id)
-        except Exception:
-            self._unresolvable_qobuz_track_ids.add(track_id)
-            self.bridge.logger.warning("Ignoring unresolved Qobuz Connect cloud track %s", track_id)
-            return None
 
     def _current_qobuz_position_ms(self) -> int:
         if self.qobuz_state.playing_state != PlayingState.PLAYING:
