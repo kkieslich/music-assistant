@@ -2946,6 +2946,105 @@ async def test_unrelated_error_does_not_resync() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ma_reorder_emits_when_mirror_has_unresolvable_extras() -> None:
+    """Reorder detection works even when mirror carries items MA doesn't have.
+
+    Some Qobuz playlists contain track_ids the metadata resolver can't
+    fetch (404 / region-locked / etc.). The reconciler drops those, so
+    MA's queue is genuinely shorter than mirror. The outbound differ
+    must still detect a user-driven reorder by filtering mirror down to
+    the subsequence MA actually has; otherwise every reorder of such a
+    playlist would fall into the "complex reorder" branch and silently
+    skip the cloud emit.
+    """
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.queue_version = QueueVersion(major=58, minor=2)
+    # Mirror has 5 tracks. ``ghost`` is unresolvable so MA's queue
+    # never includes it. We mark the resolver's fail-cache directly so
+    # the differ knows to filter that mirror entry out.
+    engine.metadata._unresolvable_track_ids.add("ghost")
+    engine.qobuz_state.tracks = [
+        QueueTrackRef(queue_item_id=1, track_id="t1"),
+        QueueTrackRef(queue_item_id=2, track_id="t2"),
+        QueueTrackRef(queue_item_id=99, track_id="ghost"),
+        QueueTrackRef(queue_item_id=3, track_id="t3"),
+        QueueTrackRef(queue_item_id=4, track_id="t4"),
+    ]
+    # User drags t2 down past t3 in MA. MA's queue (no ghost) reorders.
+    provider.mass.player_queues.queue_items = [
+        SimpleNamespace(media_item=SimpleNamespace(item_id=tid), queue_item_id=f"ma-{tid}")
+        for tid in ("t1", "t3", "t2", "t4")
+    ]
+
+    await engine.handle_ma_queue_items_updated(
+        _ma_items_event("player", provider.mass.player_queues.queue_items)
+    )
+
+    assert len(session.queue_reorders) == 1, (
+        f"Reorder must propagate even when mirror has unresolvable extras; "
+        f"got reorders={session.queue_reorders}"
+    )
+    payload = session.queue_reorders[0]
+    assert payload["queue_item_ids"] == [2], (
+        f"REORDER must carry the moved Qobuz queue_item_id (t2 → qid 2); got {payload}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconciler_preserves_duplicate_track_slots() -> None:
+    """A mirror with the same track_id at multiple positions must materialize all slots.
+
+    Earlier the materialize pass popped one MA item per track_id and
+    skipped subsequent occurrences (the pool was empty AND
+    ``resolved_by_track_id`` didn't include the track because it was
+    already "in MA"). The user reported ``mirror=504, ma=500`` divergence
+    after reorders — the four missing items were duplicate slots that
+    fell into this hole.
+    """
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=80, minor=0),
+            current_item=QueueTrackRef(queue_item_id=1, track_id="t1"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+
+    # Mirror has t1 at index 0 *and* index 3 (duplicate).
+    await engine.handle_queue_state(
+        QueueStateSnapshot(
+            queue_version=QueueVersion(major=80, minor=0),
+            action_uuid=b"\x00" * 16,
+            tracks=[
+                QueueTrackRef(queue_item_id=1, track_id="t1"),
+                QueueTrackRef(queue_item_id=2, track_id="t2"),
+                QueueTrackRef(queue_item_id=3, track_id="t3"),
+                QueueTrackRef(queue_item_id=4, track_id="t1"),  # duplicate of t1
+                QueueTrackRef(queue_item_id=5, track_id="t4"),
+            ],
+            shuffle_mode=False,
+            autoplay_mode=False,
+        )
+    )
+    await _wait_for_preload(engine)
+
+    final_track_ids = [
+        getattr(item.media_item, "item_id", None)
+        for item in provider.mass.player_queues.queue_items
+    ]
+    assert final_track_ids == ["t1", "t2", "t3", "t1", "t4"], (
+        f"All duplicate slots must end up in MA; got {final_track_ids}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_ma_complex_reorder_skips_outbound_emit() -> None:
     """Two-item reorders are not yet supported — the differ logs and skips."""
     session = _FakeSession()
