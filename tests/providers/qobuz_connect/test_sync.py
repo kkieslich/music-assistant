@@ -14,11 +14,15 @@ from music_assistant.providers.qobuz_connect.models import (
     BufferState,
     LoopMode,
     PlayingState,
+    QueueClearedEvent,
     QueueError,
     QueueLoadAck,
     QueueStateSnapshot,
     QueueTrackRef,
     QueueTracksAddedEvent,
+    QueueTracksInsertedEvent,
+    QueueTracksRemovedEvent,
+    QueueTracksReorderedEvent,
     QueueVersion,
     SetStateEvent,
 )
@@ -1020,4 +1024,94 @@ async def test_handle_mode_setters_update_mirror() -> None:
     assert engine.qobuz_state.loop_mode == LoopMode.REPEAT_ALL
     assert engine.qobuz_state.shuffle_mode is True
     assert engine.qobuz_state.autoplay_mode is False
+    await engine.stop()
+
+
+async def test_handle_queue_tracks_inserted_inserts_at_position() -> None:
+    """INSERTED splices new tracks after ``insert_after`` while keeping order."""
+    provider = _FakeProvider(_queue(PlaybackState.PLAYING))
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.tracks = [
+        QueueTrackRef(queue_item_id=1, track_id="a"),
+        QueueTrackRef(queue_item_id=2, track_id="b"),
+        QueueTrackRef(queue_item_id=3, track_id="c"),
+    ]
+
+    await engine.handle_queue_tracks_inserted(
+        QueueTracksInsertedEvent(
+            queue_version=QueueVersion(7, 1),
+            action_uuid=b"\x00" * 16,
+            tracks=[QueueTrackRef(queue_item_id=10, track_id="x")],
+            insert_after=1,
+        )
+    )
+
+    assert engine.qobuz_state.queue_version == QueueVersion(7, 1)
+    assert [t.track_id for t in engine.qobuz_state.tracks] == ["a", "x", "b", "c"]
+    await engine.stop()
+
+
+async def test_handle_queue_tracks_removed_drops_by_id() -> None:
+    """REMOVED drops every track whose queue_item_id matches."""
+    provider = _FakeProvider(_queue(PlaybackState.PLAYING))
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.tracks = [
+        QueueTrackRef(queue_item_id=1, track_id="a"),
+        QueueTrackRef(queue_item_id=2, track_id="b"),
+        QueueTrackRef(queue_item_id=3, track_id="c"),
+    ]
+
+    await engine.handle_queue_tracks_removed(
+        QueueTracksRemovedEvent(
+            queue_version=QueueVersion(7, 2),
+            action_uuid=b"\x00" * 16,
+            queue_item_ids=[1, 3],
+        )
+    )
+
+    assert [t.queue_item_id for t in engine.qobuz_state.tracks] == [2]
+    await engine.stop()
+
+
+async def test_handle_queue_tracks_reordered_moves_block_to_target() -> None:
+    """REORDERED moves the listed ids (in order) to sit after insert_after."""
+    provider = _FakeProvider(_queue(PlaybackState.PLAYING))
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.tracks = [
+        QueueTrackRef(queue_item_id=1, track_id="a"),
+        QueueTrackRef(queue_item_id=2, track_id="b"),
+        QueueTrackRef(queue_item_id=3, track_id="c"),
+        QueueTrackRef(queue_item_id=4, track_id="d"),
+    ]
+
+    await engine.handle_queue_tracks_reordered(
+        QueueTracksReorderedEvent(
+            queue_version=QueueVersion(7, 3),
+            action_uuid=b"\x00" * 16,
+            queue_item_ids=[1, 2],
+            insert_after=2,
+        )
+    )
+
+    # After removing 1 and 2, the remaining queue is [c, d]; inserting
+    # the moved block at index 2 places them at the end.
+    assert [t.track_id for t in engine.qobuz_state.tracks] == ["c", "d", "a", "b"]
+    await engine.stop()
+
+
+async def test_handle_queue_cleared_empties_mirror() -> None:
+    """QUEUE_CLEARED zeroes the mirror's track list and bumps the version."""
+    provider = _FakeProvider(_queue(PlaybackState.PLAYING))
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.tracks = [QueueTrackRef(queue_item_id=99, track_id="stale")]
+
+    await engine.handle_queue_cleared(
+        QueueClearedEvent(
+            queue_version=QueueVersion(8, 0),
+            action_uuid=b"\x00" * 16,
+        )
+    )
+
+    assert engine.qobuz_state.tracks == []
+    assert engine.qobuz_state.queue_version == QueueVersion(8, 0)
     await engine.stop()
