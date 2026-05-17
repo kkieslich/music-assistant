@@ -183,7 +183,7 @@ def _event(queue: Any) -> Any:
 
 
 async def _wait_for_reconcile(engine: QobuzConnectSyncEngine) -> None:
-    task = cast("Any", engine)._reconcile_task
+    task = cast("Any", engine).command_handler._reconcile_task
     if task:
         with contextlib.suppress(asyncio.CancelledError):
             await task
