@@ -235,9 +235,16 @@ overlapping single fields:
 - **Playing seek, debounced** (`_pending_seek_position_ms`, `_ref`,
   `_generation`, `_pending_seek_task`): coalesce rapid scrubs from the
   Qobuz app before issuing a single MA seek.
-- **Position confirmation** (`_pending_qobuz_position_ms`, `_ref`,
-  `_source_ms`, `_timestamp_ms`): hold Qobuz state frozen until MA's
-  reported position confirms a seek landed.
+- **Position confirmation** (`qobuz_position.target_ms`, `issued_ms`,
+  `timestamp_ms`): hold Qobuz state frozen until MA's reported position
+  confirms a seek landed. `issued_ms` is what we last asked MA to seek to
+  via `bridge.seek` / `bridge.play_index` (or `None` when only the
+  debounce path has reserved a target); `target_ms` is the latest target
+  Qobuz wants. Rapid Qobuz seeks while MA is still buffering only update
+  `target_ms`; when MA confirms `issued_ms`, the seek pipeline either
+  clears the pending (if target unchanged) or issues a fresh MA seek for
+  the deferred `target_ms` — never stacking expensive
+  AirPlay-restart-level MA operations.
 - **Queue-load acknowledgement** (`_pending_queue_loads: dict[bytes,
   asyncio.Future]`): map `action_uuid` to a future that resolves when
   Qobuz acks the load (or times out at 3s).
@@ -250,10 +257,16 @@ Phase C of the plan consolidates these into typed dataclasses in a new
 
 ### Generation tracking
 
-`_command_generation` ticks up every time a *command* (vs. a
-notification) arrives. Every handler checks `_is_current_command(gen)`
-before issuing MA operations so a stale command doesn't undo a newer one.
-The seek pipeline has its own `_pending_seek_generation` counter.
+`_command_generation` ticks up every time a *play-state-changing*
+command (a play/pause/stop, or a track change) arrives. Position-only
+seek events deliberately do *not* bump the counter, and they run in a
+separate task slot (`_position_only_task`) rather than through
+`_schedule_reconcile`. The original conflation caused a position-only
+event arriving mid-track-replace to cancel the in-flight reconcile
+between its `stop_queue` and `play_index`, leaving the renderer stopped
+(observed on a Pi, May 2026). Every handler still checks
+`_is_current_command(gen)` before issuing MA operations so a stale
+command doesn't undo a newer one.
 
 ### Origin
 
@@ -268,6 +281,7 @@ an async context manager so leaks become impossible.
 |-------------------------------|------------------------|----------------------------------------------------------|
 | `_heartbeat_task`             | every 5 s              | Periodic `RNDR_SRVR_STATE_UPDATED`                       |
 | `_reconcile_task`             | latest-only            | Run async MA operations from the most recent Qobuz cmd   |
+| `_position_only_task`         | latest-only            | Apply position-only seeks without cancelling reconcile   |
 | `_metadata_task`              | latest-only            | Fetch track metadata for non-command updates             |
 | `_buffering_report_task`      | every 1 s while loading| Faster state reports while audio is loading              |
 | `_pending_seek_task`          | 350 ms after last scrub| Debounced playing-seek                                   |

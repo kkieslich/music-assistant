@@ -357,6 +357,7 @@ async def test_ma_position_past_pending_seek_clears_buffering() -> None:
     engine.qobuz_state.buffer_state = BufferState.BUFFERING
     engine.qobuz_position = PendingQobuzPosition(
         target_ms=73_794,
+        issued_ms=73_794,
         timestamp_ms=int(time.time() * 1000),
     )
 
@@ -503,6 +504,7 @@ async def test_ma_natural_advance_promotes_known_qobuz_next_item() -> None:
     engine.qobuz_state.position_ms = 73_794
     engine.qobuz_position = PendingQobuzPosition(
         target_ms=73_794,
+        issued_ms=73_794,
         timestamp_ms=int(time.time() * 1000),
     )
 
@@ -1127,4 +1129,136 @@ async def test_handle_queue_cleared_empties_mirror() -> None:
 
     assert engine.qobuz_state.tracks == []
     assert engine.qobuz_state.queue_version == QueueVersion(8, 0)
+    await engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the seek-storm + track-replace cancellation bugs
+# observed on a Raspberry Pi deployment (May 2026). See PR description for the
+# full timeline. These two scenarios both stem from a shared root cause: the
+# reconcile pipeline treats every Qobuz state event as something that can
+# cancel work already in flight to MA, even when the new event is purely
+# additive (e.g. a position-only seek arriving during a track replace).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rapid_seeks_during_buffering_do_not_stack_ma_seek_calls() -> None:
+    """Repeated Qobuz seeks while MA hasn't caught up to the prior seek must not stack."""
+    queue = _queue(PlaybackState.PLAYING)
+    # MA stays "stuck at 10s" for the whole test — simulates a slow AirPlay
+    # restart that hasn't surfaced the new position yet. Three Qobuz seeks
+    # outside the 350ms debounce window should still result in *one* bridge
+    # seek, not three, because the first one is still in flight.
+    queue.corrected_elapsed_time = 10
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=11, track_id="376286112")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+
+    await engine.handle_qobuz_set_state(SetStateEvent(position_ms=60_000))
+    await asyncio.sleep(0.4)
+    await engine.handle_qobuz_set_state(SetStateEvent(position_ms=120_000))
+    await asyncio.sleep(0.4)
+    await engine.handle_qobuz_set_state(SetStateEvent(position_ms=180_000))
+    await asyncio.sleep(0.4)
+
+    seek_calls = [call for call in provider.mass.player_queues.calls if call[0] == "seek"]
+    assert len(seek_calls) == 1, (
+        f"Expected exactly 1 bridge.seek while MA is still buffering the first one, "
+        f"got {len(seek_calls)}: {seek_calls}"
+    )
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_deferred_seek_target_reissues_after_ma_confirms_first() -> None:
+    """When MA finally catches up to an in-flight seek, a newer pending target re-issues."""
+    queue = _queue(PlaybackState.PLAYING)
+    queue.corrected_elapsed_time = 10
+    provider = _FakeProvider(queue)
+    session = _FakeSession()
+    provider.qobuz_session = session
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=11, track_id="376286112")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+
+    await engine.handle_qobuz_set_state(SetStateEvent(position_ms=60_000))
+    await asyncio.sleep(0.4)
+    await engine.handle_qobuz_set_state(SetStateEvent(position_ms=180_000))
+    await asyncio.sleep(0.4)
+
+    seek_calls = [call for call in provider.mass.player_queues.calls if call[0] == "seek"]
+    assert seek_calls == [("seek", ("player", 60), {})], (
+        f"Expected only the first seek so far; got {seek_calls}"
+    )
+
+    # MA finally catches up to the first issued target.
+    queue.corrected_elapsed_time = 60
+    await engine.report_state()
+    await asyncio.sleep(0.4)
+
+    seek_calls = [call for call in provider.mass.player_queues.calls if call[0] == "seek"]
+    assert seek_calls == [
+        ("seek", ("player", 60), {}),
+        ("seek", ("player", 180), {}),
+    ], f"Expected the deferred 180s target to fire once MA confirmed 60s; got {seek_calls}"
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_skip_then_immediate_seek_does_not_leave_player_stopped() -> None:
+    """Position-only seek arriving mid-track-replace must not abort the new track's play_index."""
+    queue = _queue(PlaybackState.PLAYING, track_id="old")
+    provider = _FakeProvider(queue)
+    load_gate = asyncio.Event()
+    load_reached = asyncio.Event()
+    orig_load = provider.mass.player_queues.load
+
+    async def gated_load(*args: Any, **kwargs: Any) -> None:
+        load_reached.set()
+        await load_gate.wait()
+        await orig_load(*args, **kwargs)
+
+    cast("Any", provider.mass.player_queues).load = gated_load
+
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=1, track_id="old")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+
+    track_change_task = asyncio.create_task(
+        engine.handle_qobuz_set_state(
+            SetStateEvent(
+                playing_state=PlayingState.PLAYING,
+                current_item=QueueTrackRef(queue_item_id=2, track_id="new"),
+            )
+        )
+    )
+
+    await load_reached.wait()
+    # The replace has already done stop_queue + clear; it's parked on load_queue.
+    # A position-only seek arrives now — exactly the race that left the player
+    # stopped on the Pi.
+    await engine.handle_qobuz_set_state(SetStateEvent(position_ms=45_000))
+
+    load_gate.set()
+    await track_change_task
+    await _wait_for_reconcile(engine)
+    await asyncio.sleep(0.5)
+
+    play_index_calls = [
+        call for call in provider.mass.player_queues.calls if call[0] == "play_index"
+    ]
+    assert play_index_calls, (
+        f"play_index was never called; player would be left stopped. "
+        f"Calls: {provider.mass.player_queues.calls}"
+    )
+    # The play_index that actually started the new track must respect the
+    # seek that came in during the replace — otherwise the user would see
+    # the track start from zero and then jump.
+    final_play_index = play_index_calls[-1]
+    assert final_play_index[2].get("seek_position") == 45, (
+        f"Expected play_index to use the seek position from the position-only event "
+        f"that arrived during the replace, got {final_play_index}"
+    )
     await engine.stop()

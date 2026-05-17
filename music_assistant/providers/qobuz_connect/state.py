@@ -86,15 +86,24 @@ class PendingPlayingSeek:
 @dataclass(slots=True)
 class PendingQobuzPosition:
     """
-    Target position we sent to MA, waiting for confirmation.
+    Target position we asked MA to seek to, with the latest desired target.
 
-    Holds Qobuz's reported state frozen at ``target_ms`` until MA's own
-    progress report crosses it (within tolerance, allowing for elapsed
-    interpolation since ``timestamp_ms``). The command handler clears
+    ``issued_ms`` is what we last asked MA to seek to via ``bridge.seek`` /
+    ``bridge.play_index``; confirmation checks compare MA's progress against
+    this field. ``None`` means we have a target reserved (e.g. by the
+    debounce path that freezes the Qobuz-reported position) but haven't
+    asked MA to seek yet. ``target_ms`` is the latest target Qobuz wants —
+    when newer seeks arrive while the prior MA seek is still in flight,
+    only ``target_ms`` moves. Once MA confirms ``issued_ms`` and
+    ``target_ms`` still differs, the seek pipeline issues another MA seek
+    for ``target_ms`` rather than letting rapid Qobuz seeks stack expensive
+    (AirPlay-restart-level) MA operations. The command handler clears
     this on track change, so no per-track ref is needed here.
+    ``timestamp_ms`` is only meaningful while ``issued_ms`` is set.
     """
 
     target_ms: int
+    issued_ms: int | None
     timestamp_ms: int
 
 

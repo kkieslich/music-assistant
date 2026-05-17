@@ -390,11 +390,20 @@ class QobuzConnectSyncEngine:
         if self.qobuz_position is not None:
             if not self.seek_pipeline.pending_position_confirmed(ma_position_ms):
                 self.bridge.logger.debug(
-                    "Holding Qobuz position at %sms until MA reaches it; MA currently %sms",
+                    "Holding Qobuz target=%sms issued=%sms until MA reaches it; MA at %sms",
                     self.qobuz_position.target_ms,
+                    self.qobuz_position.issued_ms,
                     ma_position_ms,
                 )
                 return
+            # MA caught up to the position we last asked it to seek to. If a
+            # newer Qobuz seek arrived while that one was in flight, send a
+            # fresh MA seek for it now — rather than letting the rapid seeks
+            # all queue MA-side at once.
+            player_id = self.bridge.target_player_id()
+            if player_id and self.seek_pipeline.has_deferred_target():
+                if await self.seek_pipeline.reissue_deferred_seek(player_id):
+                    return
             self.seek_pipeline.clear_pending_position()
         self._set_buffer_ok()
         self.qobuz_state.playing_state = ma_playing_state

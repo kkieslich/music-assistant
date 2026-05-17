@@ -58,13 +58,20 @@ if TYPE_CHECKING:
 class CommandHandler:
     """Owns the ``SRVR_RNDR_SET_STATE`` reconciliation pipeline."""
 
-    __slots__ = ("_engine", "_last_prequeued_next_ref", "_metadata_task", "_reconcile_task")
+    __slots__ = (
+        "_engine",
+        "_last_prequeued_next_ref",
+        "_metadata_task",
+        "_position_only_task",
+        "_reconcile_task",
+    )
 
     def __init__(self, engine: QobuzConnectSyncEngine) -> None:
         """Bind the handler to its host engine."""
         self._engine = engine
         self._reconcile_task: asyncio.Task[None] | None = None
         self._metadata_task: asyncio.Task[None] | None = None
+        self._position_only_task: asyncio.Task[None] | None = None
         self._last_prequeued_next_ref: TrackRefKey | None = None
 
     # ---- public surface -------------------------------------------------
@@ -72,12 +79,14 @@ class CommandHandler:
     async def handle_set_state(self, event: SetStateEvent) -> None:
         """Apply a full Qobuz SET_STATE event to MA."""
         engine = self._engine
-        should_report = self._event_requires_renderer_report(event)
+        is_command_event = event.playing_state is not None
+        is_position_only = not is_command_event and event.position_ms is not None
+        should_report = is_command_event or is_position_only
         from .models import Origin  # noqa: PLC0415
         from .state import origin_scope  # noqa: PLC0415 — break import cycle
 
         async with origin_scope(engine, Origin.QOBUZ):
-            if should_report:
+            if is_command_event:
                 engine._command_generation += 1
             generation = engine._command_generation
             self._update_qobuz_mirror(event)
@@ -87,16 +96,15 @@ class CommandHandler:
                     if event.position_ms is not None
                     else engine.qobuz_state.position_ms,
                 )
-            elif (
-                event.position_ms is not None
-                and event.playing_state is None
-                and engine.qobuz_state.playing_state == PlayingState.PAUSED
-            ):
-                engine.seek_pipeline.set_paused_seek(max(0, event.position_ms))
+            elif is_position_only and engine.qobuz_state.playing_state == PlayingState.PAUSED:
+                engine.seek_pipeline.set_paused_seek(max(0, cast("int", event.position_ms)))
             if should_report:
                 self._prepare_immediate_command_report(event)
                 await engine.report_state(sync_from_ma=False)
-                self._schedule_reconcile(event, generation)
+                if is_command_event:
+                    self._schedule_reconcile(event, generation)
+                else:
+                    self._schedule_position_only(cast("int", event.position_ms), generation)
             else:
                 self._schedule_metadata_update(event, generation)
 
@@ -116,13 +124,11 @@ class CommandHandler:
         if self._metadata_task and not self._metadata_task.done():
             self._metadata_task.cancel()
         self._metadata_task = None
+        if self._position_only_task and not self._position_only_task.done():
+            self._position_only_task.cancel()
+        self._position_only_task = None
 
     # ---- mirror + immediate-report ------------------------------------
-
-    @staticmethod
-    def _event_requires_renderer_report(event: SetStateEvent) -> bool:
-        """Return true when an inbound event represents a renderer command."""
-        return event.playing_state is not None or event.position_ms is not None
 
     def _update_qobuz_mirror(self, event: SetStateEvent) -> None:
         engine = self._engine
@@ -205,8 +211,6 @@ class CommandHandler:
                 await self._handle_qobuz_pause(event, generation)
             elif event.playing_state == PlayingState.STOPPED:
                 await self._handle_qobuz_stop(generation)
-            elif event.position_ms is not None:
-                await self._handle_qobuz_position_only(event.position_ms, generation)
 
             if engine._is_current_command(generation):
                 await self._sync_latest_matching_ma_queue()
@@ -222,6 +226,46 @@ class CommandHandler:
         finally:
             if asyncio.current_task() is self._reconcile_task:
                 self._reconcile_task = None
+
+    def _schedule_position_only(self, position_ms: int, generation: int) -> None:
+        """
+        Schedule a lateral position-only seek without cancelling track work.
+
+        A position-only Qobuz event ("the user moved the scrub bar") never
+        changes which track is playing or whether it's playing — it only
+        moves the play head. Folding it through ``_schedule_reconcile``
+        would cancel any in-flight track-replace mid-way (between the
+        ``stop_queue`` and the matching ``play_index``), leaving the
+        renderer stopped. The mirror update + immediate renderer report
+        have already happened in ``handle_set_state``; this task only
+        carries out the MA-side seek work.
+        """
+        if self._position_only_task and not self._position_only_task.done():
+            self._position_only_task.cancel()
+        self._position_only_task = asyncio.create_task(
+            self._run_position_only_seek(position_ms, generation)
+        )
+
+    async def _run_position_only_seek(self, position_ms: int, generation: int) -> None:
+        """Execute a position-only seek; bails if a newer command supersedes."""
+        engine = self._engine
+        try:
+            if not engine._is_current_command(generation):
+                return
+            await self._handle_qobuz_position_only(position_ms, generation)
+            if engine._is_current_command(generation):
+                await engine.report_state(sync_from_ma=False)
+        except asyncio.CancelledError:
+            raise
+        except PlayerUnavailableError as err:
+            if engine._is_current_command(generation):
+                engine.bridge.logger.warning("Qobuz Connect target player unavailable: %s", err)
+        except Exception:
+            if engine._is_current_command(generation):
+                engine.bridge.logger.exception("Failed to apply Qobuz Connect position-only seek")
+        finally:
+            if asyncio.current_task() is self._position_only_task:
+                self._position_only_task = None
 
     def _schedule_metadata_update(self, event: SetStateEvent, generation: int) -> None:
         """Schedule slow metadata/prequeue work for non-command Qobuz updates."""
@@ -437,11 +481,17 @@ class CommandHandler:
         )
         if not engine._is_current_command(generation, current_item):
             return
-        engine.seek_pipeline.set_pending_qobuz_position(start_position_ms)
+        # Re-read the mirror just before play_index: a position-only event
+        # may have arrived during the (slow) stop+load and now lives on the
+        # mirror. Folding it in here lets the new track start at the seeked
+        # position directly, instead of starting at the original target and
+        # then seeking again.
+        final_start_ms = max(0, engine.qobuz_state.position_ms)
+        engine.seek_pipeline.set_pending_qobuz_position(final_start_ms)
         await engine.bridge.play_index(
             player_id,
             0,
-            seek_position=start_position_ms // 1000,
+            seek_position=final_start_ms // 1000,
         )
 
     async def _prequeue_next_item(
