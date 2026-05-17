@@ -46,6 +46,7 @@ class QobuzConnectSyncEngine:
         self.mass = provider.mass
         self.qobuz_state = QobuzMirror()
         self.pending_paused_seek_ms: int | None = None
+        self._pending_paused_seek_ref: str | None = None
         self.origin: Origin | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._last_prequeued_next_ref: str | None = None
@@ -90,6 +91,7 @@ class QobuzConnectSyncEngine:
         """
         self.qobuz_state = QobuzMirror()
         self.pending_paused_seek_ms = None
+        self._pending_paused_seek_ref = None
         self._pending_qobuz_position_ms = None
         self._pending_qobuz_position_ref = None
         self._pending_qobuz_position_source_ms = None
@@ -287,12 +289,20 @@ class QobuzConnectSyncEngine:
         return event.playing_state is not None or event.position_ms is not None
 
     def _update_qobuz_mirror(self, event: SetStateEvent) -> None:
+        current_item_changed = False
         if event.queue_version:
             self.qobuz_state.queue_version = event.queue_version
         if event.current_item:
             if not self._same_queue_ref(self.qobuz_state.current_item, event.current_item):
+                current_item_changed = True
                 self._clear_pending_position()
+                if self._pending_paused_seek_ref != self._queue_ref_key(event.current_item):
+                    self.pending_paused_seek_ms = None
+                    self._pending_paused_seek_ref = None
             self.qobuz_state.current_item = event.current_item
+            if current_item_changed and event.position_ms is None:
+                self.qobuz_state.position_ms = 0
+                self.qobuz_state.position_timestamp_ms = int(time.time() * 1000)
         if event.next_item:
             self.qobuz_state.next_item = event.next_item
         if (
@@ -337,6 +347,8 @@ class QobuzConnectSyncEngine:
             if item is None:
                 return
             self.qobuz_state.current_item = item
+            self.pending_paused_seek_ms = None
+            self._pending_paused_seek_ref = None
             if self.qobuz_state.next_item == item:
                 self.qobuz_state.next_item = None
             self.provider.logger.debug(
@@ -348,14 +360,14 @@ class QobuzConnectSyncEngine:
         if item is None:
             self.provider.logger.debug("Ignoring Qobuz PLAYING without current or next queue item")
             return
+        pending_paused_seek_ms = self._take_pending_paused_seek(item)
         start_position_ms = (
-            self.pending_paused_seek_ms
-            if self.pending_paused_seek_ms is not None
+            pending_paused_seek_ms
+            if pending_paused_seek_ms is not None
             else event.position_ms
             if event.position_ms is not None
             else self.qobuz_state.position_ms
         )
-        self.pending_paused_seek_ms = None
         if start_position_ms is not None:
             self.qobuz_state.position_ms = max(0, start_position_ms)
             self.qobuz_state.position_timestamp_ms = int(time.time() * 1000)
@@ -398,10 +410,13 @@ class QobuzConnectSyncEngine:
                 await self.mass.player_queues.play(player_id)
 
     async def _handle_qobuz_pause(self, event: SetStateEvent) -> None:
-        self.pending_paused_seek_ms = (
-            max(0, event.position_ms)
-            if event.position_ms is not None
-            else self.qobuz_state.position_ms
+        self._set_pending_paused_seek(
+            (
+                max(0, event.position_ms)
+                if event.position_ms is not None
+                else self.qobuz_state.position_ms
+            ),
+            self.qobuz_state.current_item,
         )
         player_id = self.provider.get_target_player_id()
         queue = self.mass.player_queues.get(player_id) if player_id else None
@@ -418,7 +433,7 @@ class QobuzConnectSyncEngine:
 
     async def _handle_qobuz_position_only(self, position_ms: int) -> None:
         if self.qobuz_state.playing_state == PlayingState.PAUSED:
-            self.pending_paused_seek_ms = max(0, position_ms)
+            self._set_pending_paused_seek(max(0, position_ms), self.qobuz_state.current_item)
             return
         if self.qobuz_state.playing_state == PlayingState.PLAYING:
             player_id = self.provider.get_target_player_id()
@@ -685,6 +700,7 @@ class QobuzConnectSyncEngine:
             self.qobuz_state.next_item = None
             self._last_prequeued_next_ref = None
             self.pending_paused_seek_ms = None
+            self._pending_paused_seek_ref = None
             self._clear_pending_position()
             self.qobuz_state.position_ms = 0
             self.qobuz_state.position_timestamp_ms = int(time.time() * 1000)
@@ -731,6 +747,28 @@ class QobuzConnectSyncEngine:
         self._pending_seek_position_ms = None
         self._pending_seek_ref = None
         self._cancel_pending_seek()
+
+    def _set_pending_paused_seek(
+        self,
+        position_ms: int,
+        item: QueueTrackRef | None,
+    ) -> None:
+        """Remember a paused seek only for the Qobuz queue item it belongs to."""
+        self.pending_paused_seek_ms = max(0, position_ms)
+        self._pending_paused_seek_ref = self._queue_ref_key(item)
+
+    def _take_pending_paused_seek(self, item: QueueTrackRef | None) -> int | None:
+        """Consume a paused seek if it belongs to the item being played."""
+        if self.pending_paused_seek_ms is None:
+            return None
+        if self._pending_paused_seek_ref != self._queue_ref_key(item):
+            self.pending_paused_seek_ms = None
+            self._pending_paused_seek_ref = None
+            return None
+        position_ms = self.pending_paused_seek_ms
+        self.pending_paused_seek_ms = None
+        self._pending_paused_seek_ref = None
+        return position_ms
 
     def _set_pending_qobuz_position(
         self,

@@ -41,6 +41,10 @@ class TokenRefreshRequired(Exception):
     """Raised when the websocket must wait for refreshed tokens."""
 
 
+class QobuzServerDisconnect(Exception):
+    """Raised when the Qobuz server asks this websocket to reconnect."""
+
+
 class QobuzConnectSession:
     """Own the Qobuz cloud websocket and typed protocol events."""
 
@@ -233,6 +237,8 @@ class QobuzConnectSession:
             try:
                 await self._ws.send(data)
                 return True
+            except websockets.ConnectionClosed:
+                LOGGER.debug("Qobuz websocket closed while sending; message queued")
             except Exception:
                 LOGGER.exception("Failed to send Qobuz websocket message")
         self._pending_messages.append(data)
@@ -270,8 +276,14 @@ class QobuzConnectSession:
             except TokenRefreshRequired:
                 should_backoff = False
                 self._is_connected = False
+            except QobuzServerDisconnect:
+                LOGGER.debug("Qobuz Connect server requested websocket reconnect")
+                self._is_connected = False
             except asyncio.CancelledError:
                 raise
+            except websockets.ConnectionClosed as err:
+                LOGGER.debug("Qobuz Connect websocket closed: %s", err)
+                self._is_connected = False
             except Exception:
                 LOGGER.exception("Qobuz Connect websocket error")
                 self._is_connected = False
@@ -303,7 +315,7 @@ class QobuzConnectSession:
         elif decoded.msg_type.name == "ERROR":
             LOGGER.error("Qobuz websocket error %s: %s", decoded.error_code, decoded.error_message)
         elif decoded.msg_type.name == "DISCONNECT":
-            raise websockets.ConnectionClosed(None, None)
+            raise QobuzServerDisconnect
 
     async def _handle_payload(self, payload: bytes | None) -> None:
         if not payload:
@@ -370,12 +382,17 @@ class QobuzConnectSession:
     async def _flush_pending_messages(self) -> None:
         if not self._pending_messages or not self._ws:
             return
-        for data in self._pending_messages:
+        pending = self._pending_messages
+        self._pending_messages = []
+        for index, data in enumerate(pending):
             try:
                 await self._ws.send(data)
+            except websockets.ConnectionClosed:
+                LOGGER.debug("Qobuz websocket closed while flushing messages")
+                self._pending_messages = pending[index:] + self._pending_messages
+                break
             except Exception:
                 LOGGER.exception("Failed to flush Qobuz websocket message")
-        self._pending_messages.clear()
 
     async def _wait_for_valid_token(self, buffer_s: int = 0) -> bool:
         while self._should_run:
