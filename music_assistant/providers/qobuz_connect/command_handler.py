@@ -44,13 +44,11 @@ import time
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.enums import PlaybackState as MAPlaybackState
-from music_assistant_models.enums import QueueOption
 from music_assistant_models.errors import PlayerUnavailableError
 from music_assistant_models.queue_item import QueueItem
 
 from .models import BufferState, PlayingState, SetStateEvent
 from .seek_pipeline import SEEK_TOLERANCE_MS
-from .state import TrackRefKey
 
 if TYPE_CHECKING:
     from .models import QueueTrackRef
@@ -653,37 +651,43 @@ class CommandHandler:
         current_item: QueueTrackRef,
         generation: int,
     ) -> None:
-        """Drive MA's queue toward the mirror without disrupting playback.
+        """Drive MA's queue toward the mirror with a single ``update_items`` call.
 
-        Two passes:
+        Earlier iterations ran four separate passes (remove_stale →
+        add_missing → add_history → reorder), each calling ``play_media`` /
+        ``insert_items`` / ``delete_item`` / ``update_items``. Every call
+        fired its own ``QUEUE_ITEMS_UPDATED`` event and MA's web UI
+        re-rendered. For a 1600-track playlist that meant ~128 re-renders
+        in a few seconds — the visible flickering the user reported.
 
-        1. **Remove** MA items whose Qobuz ``track_id`` is no longer in
-           ``qobuz_state.tracks`` (i.e. the cloud removed them). The
-           currently-playing MA item is preserved even if the mirror says
-           it's gone — that case is handled by a separate ``SET_STATE``.
-        2. **Add** mirror items not yet present in MA, chunked via
-           ``play_media(option=ADD)``. A ``_is_current_command`` check
-           between chunks lets a fresh ``SET_STATE`` cancel us cleanly.
+        New flow: resolve all missing track metadata in chunks (in memory
+        only — no MA mutation), build the desired final queue list, then
+        mutate MA *once* via ``update_items`` + ``set_current_index``.
+        Tracks already in MA are reused (same ``QueueItem`` instance →
+        same ``queue_item_id`` → MA's stream buffer keeps its anchor).
+        Non-Qobuz items already in MA are preserved at the tail.
+
+        Mirror is empty (e.g. ``SRVR_CTRL_QUEUE_CLEARED``) → keep just
+        the currently-playing MA item so audio doesn't get yanked.
+
+        ``_is_current_command(generation)`` is checked before every
+        metadata chunk and right before the final ``update_items`` so a
+        fresh ``SET_STATE`` cancels cleanly mid-resolve.
         """
         engine = self._engine
         logger = engine.bridge.logger
         # All MA mutations the reconciler triggers fire ``QUEUE_ITEMS_UPDATED``
         # events. Wrap the whole task body in ``Origin.QOBUZ`` so the outbound
-        # MA→Qobuz differ recognizes those events as cloud-originated and skips
-        # them. Without this, the differ would observe MA being "behind" the
-        # mirror mid-reconcile and emit a wrong-direction
-        # ``CTRL_SRVR_QUEUE_REMOVE_TRACKS`` with a stale version, which the
-        # cloud rejects.
+        # MA→Qobuz differ recognizes those events as cloud-originated and
+        # skips them. Without this, the differ would observe MA briefly
+        # diverged from the mirror and emit a wrong-direction
+        # ``CTRL_SRVR_QUEUE_REMOVE_TRACKS`` with a stale version.
         from .models import Origin  # noqa: PLC0415
         from .state import origin_scope  # noqa: PLC0415 — break import cycle
 
         try:
             async with origin_scope(engine, Origin.QOBUZ):
-                if not await self._reconcile_remove_stale(player_id, generation):
-                    return
-                await self._reconcile_add_missing(player_id, current_item, generation)
-                await self._reconcile_add_history(player_id, current_item, generation)
-                await self._reconcile_reorder(player_id, current_item, generation)
+                await self._materialize_full_queue(player_id, current_item, generation)
         except asyncio.CancelledError:
             raise
         except PlayerUnavailableError as err:
@@ -696,157 +700,119 @@ class CommandHandler:
             if asyncio.current_task() is self._preload_task:
                 self._preload_task = None
 
-    async def _reconcile_remove_stale(self, player_id: str, generation: int) -> bool:
-        """Drop MA items whose Qobuz track_id is no longer on the mirror.
-
-        Returns False if a newer command superseded this run.
-        """
-        engine = self._engine
-        logger = engine.bridge.logger
-        snapshot_track_ids = {ref.track_id for ref in engine.qobuz_state.tracks}
-        ma_items = list(engine.bridge.queue_items(player_id))
-        queue = engine.bridge.get_queue(player_id)
-        current_index = getattr(queue, "current_index", None) if queue else None
-        for idx, item in enumerate(ma_items):
-            if not engine._is_current_command(generation):
-                logger.debug("MA reconcile bailing during remove: superseded")
-                return False
-            ma_track_id = engine.bridge.qobuz_track_id_for(item)
-            if ma_track_id is None:
-                continue
-            if ma_track_id in snapshot_track_ids:
-                continue
-            if current_index is not None and idx == current_index:
-                continue
-            with contextlib.suppress(Exception):
-                engine.bridge.delete_item(player_id, item.queue_item_id)
-        return True
-
-    async def _reconcile_add_missing(
+    async def _materialize_full_queue(
         self,
         player_id: str,
         current_item: QueueTrackRef,
         generation: int,
     ) -> None:
-        """Chunk-add mirror items past ``current_item`` not yet in MA's queue."""
-        engine = self._engine
-        logger = engine.bridge.logger
-        if not engine.qobuz_state.tracks:
-            return
-        tracks_refs = list(engine.qobuz_state.tracks)
-        current_key = TrackRefKey.from_ref(current_item)
-        current_idx = next(
-            (i for i, ref in enumerate(tracks_refs) if TrackRefKey.from_ref(ref) == current_key),
-            None,
-        )
-        if current_idx is None:
-            logger.debug("MA reconcile skipped: current_item %s not in snapshot", current_key)
-            return
-        remaining = tracks_refs[current_idx + 1 :]
-        if not remaining:
-            return
-        existing_ids: set[str] = set()
-        for item in engine.bridge.queue_items(player_id):
-            track_id = engine.bridge.qobuz_track_id_for(item)
-            if track_id:
-                existing_ids.add(track_id)
-        for chunk_start in range(0, len(remaining), PRELOAD_CHUNK_SIZE):
-            if not engine._is_current_command(generation):
-                logger.debug("MA reconcile bailing during add: superseded")
-                return
-            chunk_refs = remaining[chunk_start : chunk_start + PRELOAD_CHUNK_SIZE]
-            pending_refs = [ref for ref in chunk_refs if ref.track_id not in existing_ids]
-            if not pending_refs:
-                continue
-            resolved = await asyncio.gather(
-                *[engine.metadata.get_track_or_none(ref.track_id) for ref in pending_refs],
-            )
-            if not engine._is_current_command(generation):
-                return
-            to_add: list[Any] = []
-            for ref, ma_track in zip(pending_refs, resolved, strict=True):
-                if ma_track is None:
-                    continue
-                to_add.append(ma_track)
-                existing_ids.add(ref.track_id)
-            if not to_add:
-                continue
-            await engine.bridge.play_media(
-                player_id,
-                cast("Any", to_add),
-                option=QueueOption.ADD,
-            )
-            # Yield so other tasks (a new SET_STATE, a seek) can preempt
-            # before we burn another chunk on the Qobuz API.
-            await asyncio.sleep(0)
-
-    async def _reconcile_reorder(
-        self,
-        player_id: str,
-        current_item: QueueTrackRef,
-        generation: int,
-    ) -> None:
-        """Align MA's full queue order with ``qobuz_state.tracks``.
-
-        Handles all reorder shapes including items moving across the
-        currently-playing position (Qobuz user dragging a previously-played
-        track to be the next track, and the reverse). The currently-playing
-        MA item is identified by ``queue_item_id`` and its new position
-        becomes ``current_index`` after the rebuild.
-
-        Strategy:
-
-        1. Walk ``qobuz_state.tracks`` in order; for each ref, pop a
-           matching MA item from a track-id-keyed pool. Items in MA but
-           absent from the mirror (shouldn't happen post remove_stale)
-           and non-Qobuz items end up at the tail.
-        2. Find the playing anchor (by ``queue_item_id``) in the rebuilt
-           list — that's the new ``current_index``.
-        3. ``update_items`` + ``set_current_index``. ``update_items``
-           internally re-enqueues the next track when
-           ``index_in_buffer == current_index`` so MA's buffer pipeline
-           reselects against the new order; no ``stop``/``play_index``
-           needed.
-
-        Inherent limitation (MA streaming architecture): if MA has already
-        pre-buffered the *old* next track (``index_in_buffer > current_index``
-        when the reorder lands), that buffered audio plays first; the new
-        order takes effect on the track *after* the buffered one.
-        """
+        """Compute the desired MA queue from the mirror and apply via one ``update_items``."""
         engine = self._engine
         logger = engine.bridge.logger
         if not engine._is_current_command(generation):
             return
-        if not engine.qobuz_state.tracks:
-            return
 
         mirror_tracks = list(engine.qobuz_state.tracks)
-        current_key = TrackRefKey.from_ref(current_item)
-        mirror_current_idx = next(
-            (i for i, ref in enumerate(mirror_tracks) if TrackRefKey.from_ref(ref) == current_key),
-            None,
-        )
-        if mirror_current_idx is None:
-            # The cloud-side queue_item_id may have changed (autoplay-driven
-            # requeue, etc.). Fall back to track_id-only match.
-            mirror_current_idx = next(
-                (i for i, ref in enumerate(mirror_tracks) if ref.track_id == current_item.track_id),
-                None,
+        ma_items = list(engine.bridge.queue_items(player_id))
+
+        # Bucket existing MA items by Qobuz track_id (with non-Qobuz items
+        # set aside). When a mirror ref points at a track already in MA we
+        # reuse the existing ``QueueItem`` instance — preserving its
+        # ``queue_item_id`` keeps MA's audio buffer / streaming anchor
+        # stable across the reconcile.
+        ma_by_track_id: dict[str, list[Any]] = {}
+        non_qobuz_items: list[Any] = []
+        for item in ma_items:
+            tid = engine.bridge.qobuz_track_id_for(item)
+            if tid is None:
+                non_qobuz_items.append(item)
+            else:
+                ma_by_track_id.setdefault(tid, []).append(item)
+
+        # Mirror empty (e.g. ``SRVR_CTRL_QUEUE_CLEARED``). Preserve the
+        # currently-playing MA item so audio keeps going; everything else
+        # is dropped to match the cloud's empty-queue intent.
+        if not mirror_tracks:
+            await self._apply_full_queue_state(
+                player_id, current_item, [], ma_items, non_qobuz_items, generation
             )
-        if mirror_current_idx is None:
             return
 
-        ma_items = list(engine.bridge.queue_items(player_id))
-        if not ma_items:
+        # Resolve metadata for tracks in mirror but not yet in MA. Chunked
+        # only to bound parallelism against the Qobuz API; the chunks
+        # accumulate in memory and there are no MA mutations between them.
+        missing_track_ids = [
+            ref.track_id for ref in mirror_tracks if not ma_by_track_id.get(ref.track_id)
+        ]
+        resolved_by_track_id: dict[str, Any] = {}
+        seen_missing: set[str] = set()
+        unique_missing: list[str] = []
+        for tid in missing_track_ids:
+            if tid in seen_missing:
+                continue
+            seen_missing.add(tid)
+            unique_missing.append(tid)
+        for chunk_start in range(0, len(unique_missing), PRELOAD_CHUNK_SIZE):
+            if not engine._is_current_command(generation):
+                logger.debug("MA reconcile bailing during metadata resolve: superseded")
+                return
+            chunk = unique_missing[chunk_start : chunk_start + PRELOAD_CHUNK_SIZE]
+            resolved = await asyncio.gather(
+                *[engine.metadata.get_track_or_none(tid) for tid in chunk],
+            )
+            resolved_by_track_id.update(
+                {
+                    tid: track
+                    for tid, track in zip(chunk, resolved, strict=True)
+                    if track is not None
+                }
+            )
+            await asyncio.sleep(0)
+
+        if not engine._is_current_command(generation):
             return
-        queue = engine.bridge.get_queue(player_id)
-        current_index = getattr(queue, "current_index", None) if queue else None
-        # Find the playing anchor by Qobuz's authoritative ``current_item.track_id``
-        # rather than by MA's ``current_index`` integer. MA's current_index can
-        # be stale after bootstrap (``play_index(0)`` runs on a 1-item queue,
-        # then history is prepended via ``load(insert_at_index=0, …)`` without
-        # touching ``current_index``) — using it directly would point at the
-        # wrong item.
+
+        # Build the final ordered list by walking the mirror.
+        final_items: list[Any] = []
+        for ref in mirror_tracks:
+            pool = ma_by_track_id.get(ref.track_id)
+            if pool:
+                final_items.append(pool.pop(0))
+                continue
+            track = resolved_by_track_id.get(ref.track_id)
+            if track is None:
+                # Unresolvable track — leave it out. Next reconcile retries
+                # once metadata becomes available.
+                continue
+            final_items.append(QueueItem.from_media_item(player_id, track))
+
+        await self._apply_full_queue_state(
+            player_id, current_item, final_items, ma_items, non_qobuz_items, generation
+        )
+
+    async def _apply_full_queue_state(
+        self,
+        player_id: str,
+        current_item: QueueTrackRef,
+        final_items: list[Any],
+        ma_items: list[Any],
+        non_qobuz_items: list[Any],
+        generation: int,
+    ) -> None:
+        """Commit the final ordered queue list to MA via one ``update_items``."""
+        engine = self._engine
+        logger = engine.bridge.logger
+        if not engine._is_current_command(generation):
+            return
+
+        # Always preserve non-Qobuz items the user added in MA; they have
+        # no representation on the cloud side, so we never drop them.
+        if non_qobuz_items:
+            final_items = list(final_items) + non_qobuz_items
+
+        # Locate the currently-playing MA item — it's identified by
+        # ``current_item.track_id`` (Qobuz's authoritative pointer), not
+        # by MA's possibly-stale ``current_index``.
         playing_anchor = next(
             (
                 item
@@ -855,140 +821,42 @@ class CommandHandler:
             ),
             None,
         )
-        if playing_anchor is None:
-            return
-        playing_qid = getattr(playing_anchor, "queue_item_id", None)
-        if playing_qid is None:
-            return
 
-        # Pool MA items by Qobuz track_id. Non-Qobuz items stay at the tail.
-        pool: dict[str, list[Any]] = {}
-        non_qobuz: list[Any] = []
-        for item in ma_items:
-            tid = engine.bridge.qobuz_track_id_for(item)
-            if tid is None:
-                non_qobuz.append(item)
-                continue
-            pool.setdefault(tid, []).append(item)
+        # Mirror empty: keep playing anchor only so audio doesn't get yanked.
+        if not final_items and playing_anchor is not None:
+            final_items = [playing_anchor, *non_qobuz_items]
 
-        # Build the rebuilt order by walking mirror tracks. Items the
-        # mirror references but MA doesn't have are simply skipped — they
-        # would have been added by ``_reconcile_add_missing`` /
-        # ``_reconcile_add_history`` in earlier passes.
-        rebuilt: list[Any] = []
-        for ref in mirror_tracks:
-            items = pool.get(ref.track_id)
-            if items:
-                rebuilt.append(items.pop(0))
-        leftover = [it for items in pool.values() for it in items]
-        rebuilt.extend(leftover)
-        rebuilt.extend(non_qobuz)
+        # If the playing anchor would otherwise vanish from the new list,
+        # splice it back in at position 0 (defensive — a properly behaving
+        # cloud emits a ``SET_STATE`` track-change before dropping the
+        # currently-playing track).
+        if playing_anchor is not None and playing_anchor not in final_items:
+            final_items = [playing_anchor, *final_items]
 
-        # Identify where the playing anchor ended up so we can pin
-        # ``current_index`` to it post-rebuild.
-        new_current_index = next(
-            (
-                i
-                for i, item in enumerate(rebuilt)
-                if getattr(item, "queue_item_id", None) == playing_qid
-            ),
-            None,
+        new_current_index = (
+            final_items.index(playing_anchor) if playing_anchor is not None else None
         )
-        if new_current_index is None:
-            logger.debug(
-                "MA reconcile: playing anchor %s vanished from rebuilt queue; skipping reorder",
-                playing_qid,
-            )
-            return
 
-        new_ids = [engine.bridge.qobuz_track_id_for(it) for it in rebuilt]
+        queue = engine.bridge.get_queue(player_id)
+        current_index = getattr(queue, "current_index", None) if queue else None
         old_ids = [engine.bridge.qobuz_track_id_for(it) for it in ma_items]
+        new_ids = [engine.bridge.qobuz_track_id_for(it) for it in final_items]
         order_changed = new_ids != old_ids
-        current_index_changed = new_current_index != current_index
+        current_index_changed = new_current_index is not None and new_current_index != current_index
+
         if not order_changed and not current_index_changed:
             return
 
         logger.debug(
-            "MA reconcile: aligning queue order to mirror (current_index %s → %d)",
+            "MA reconcile: materializing %d items (current_index %s → %s)",
+            len(final_items),
             current_index,
             new_current_index,
         )
-        if order_changed:
-            engine.bridge.update_items(player_id, rebuilt)
-        if current_index_changed:
+        # Set current_index *before* update_items so MA's internal next-track
+        # pre-enqueue (triggered by update_items when ``index_in_buffer ==
+        # current_index``) looks up the right successor in the new list.
+        if current_index_changed and new_current_index is not None:
             engine.bridge.set_current_index(player_id, new_current_index)
-
-    async def _reconcile_add_history(
-        self,
-        player_id: str,
-        current_item: QueueTrackRef,
-        generation: int,
-    ) -> None:
-        """Insert mirror tracks *before* ``current_item`` at the front of MA's queue.
-
-        Loads the "history" portion of the Qobuz playlist (tracks the user
-        has already passed, but which Qobuz still keeps in the queue) so a
-        skip-backward inside the same playlist resolves instantly from MA's
-        loaded queue.
-
-        Chunks are inserted **front-to-back**: chunk 1 goes in at index 0,
-        chunk 2 at index ``len(chunk1)``, etc. That gives a natural
-        left-to-right fill in MA's UI during the initial load (when the
-        Qobuz metadata cache is still cold) instead of the reverse
-        "items appearing from the end and pushing earlier items in front"
-        UX that back-to-front iteration produced.
-
-        Each insert call uses ``insert_at_index=<offset>`` with
-        ``keep_played=True`` / ``keep_remaining=True``, which leaves the
-        currently-playing item's audio stream untouched — MA's
-        ``current_index`` shifts up internally as the front grows.
-        """
-        engine = self._engine
-        logger = engine.bridge.logger
-        if not engine.qobuz_state.tracks:
-            return
-        tracks_refs = list(engine.qobuz_state.tracks)
-        current_key = TrackRefKey.from_ref(current_item)
-        current_idx = next(
-            (i for i, ref in enumerate(tracks_refs) if TrackRefKey.from_ref(ref) == current_key),
-            None,
-        )
-        if current_idx is None or current_idx == 0:
-            return
-        history = tracks_refs[:current_idx]
-        existing_ids: set[str] = set()
-        for item in engine.bridge.queue_items(player_id):
-            track_id = engine.bridge.qobuz_track_id_for(item)
-            if track_id:
-                existing_ids.add(track_id)
-        inserted_so_far = 0
-        for chunk_start in range(0, len(history), PRELOAD_CHUNK_SIZE):
-            if not engine._is_current_command(generation):
-                logger.debug("MA reconcile bailing during history-add: superseded")
-                return
-            chunk_refs = history[chunk_start : chunk_start + PRELOAD_CHUNK_SIZE]
-            pending_refs = [ref for ref in chunk_refs if ref.track_id not in existing_ids]
-            if not pending_refs:
-                continue
-            resolved = await asyncio.gather(
-                *[engine.metadata.get_track_or_none(ref.track_id) for ref in pending_refs],
-            )
-            if not engine._is_current_command(generation):
-                return
-            queue_items: list[Any] = []
-            for ref, ma_track in zip(pending_refs, resolved, strict=True):
-                if ma_track is None:
-                    continue
-                queue_items.append(QueueItem.from_media_item(player_id, ma_track))
-                existing_ids.add(ref.track_id)
-            if not queue_items:
-                continue
-            await engine.bridge.insert_items(
-                player_id,
-                queue_items,
-                insert_at_index=inserted_so_far,
-                keep_played=True,
-                keep_remaining=True,
-            )
-            inserted_so_far += len(queue_items)
-            await asyncio.sleep(0)
+        if order_changed:
+            engine.bridge.update_items(player_id, final_items)
