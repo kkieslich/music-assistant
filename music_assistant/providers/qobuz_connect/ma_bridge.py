@@ -149,6 +149,21 @@ class MABridge:
         """Replace the ordered queue-items list for a player without restarting playback."""
         self._provider.mass.player_queues.update_items(player_id, items)
 
+    def set_current_index(self, player_id: str, index: int) -> None:
+        """
+        Set ``PlayerQueue.current_index`` directly to ``index``.
+
+        Required after :py:meth:`update_items` when an external authority
+        (the Qobuz cloud) reorders items across the currently-playing
+        position — ``update_items`` keeps the integer ``current_index``
+        unchanged, so the playing anchor would otherwise point at the
+        wrong item. Mirrors the direct-assignment pattern used internally
+        by ``mass.player_queues.next/previous/play_index/clear``.
+        """
+        queue = self._provider.mass.player_queues.get(player_id)
+        if queue is not None:
+            queue.current_index = index
+
     def clear_queue(self, player_id: str, *, skip_stop: bool = False) -> None:
         """Clear the target player's queue."""
         self._provider.mass.player_queues.clear(player_id, skip_stop=skip_stop)
