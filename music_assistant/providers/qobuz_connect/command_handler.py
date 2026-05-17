@@ -156,6 +156,21 @@ class CommandHandler:
         engine = self._engine
         current_item_changed = False
         if event.queue_version:
+            old_qv = engine.qobuz_state.queue_version
+            new_qv = event.queue_version
+            if (new_qv.major, new_qv.minor) != (old_qv.major, old_qv.minor):
+                # Queue version changed but the cloud hasn't yet pushed us
+                # the new tracks list. Drop the now-stale list so any
+                # reconcile that runs in the gap uses an empty mirror
+                # (= keep the currently-playing anchor only) instead of
+                # splicing items from the *previous* queue context on top
+                # of the new playing track. The dedup gate must also
+                # release so the upcoming ``handle_queue_state`` is not
+                # silently dropped — that happens in ``handle_queue_state``
+                # and the delta handlers, which all call
+                # ``reset_reconcile_dedup`` before scheduling.
+                engine.qobuz_state.tracks = []
+                self._last_reconciled_qv = None
             engine.qobuz_state.queue_version = event.queue_version
         if event.current_item:
             if not engine._same_queue_ref(engine.qobuz_state.current_item, event.current_item):

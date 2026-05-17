@@ -2994,6 +2994,98 @@ async def test_ma_reorder_emits_when_mirror_has_unresolvable_extras() -> None:
 
 
 @pytest.mark.asyncio
+async def test_qv_bump_before_snapshot_does_not_splice_stale_tracks_into_ma() -> None:
+    """SET_STATE with a new qv must not let stale mirror tracks leak into MA.
+
+    Production bug (May 17 23:58): user cleared the queue in Qobuz then
+    started a one-track context. SET_STATE state=2 qv=67.1 arrived but
+    QUEUE_STATE qv=67.1 hadn't yet landed, so ``mirror.tracks`` still
+    held the previous qv's content. The reconciler ran in that gap and
+    spliced the stale track on top of the new playing anchor, producing
+    a 2-item MA queue when the correct intermediate state is 1 item
+    (just the playing track).
+
+    Fix: ``_update_qobuz_mirror`` clears ``qobuz_state.tracks`` when qv
+    changes, so the materialize in the stale-tracks window sees an
+    empty mirror and keeps only the playing anchor. When QUEUE_STATE
+    arrives later, the delta handlers release the dedup gate so the
+    real snapshot's reconcile actually fires.
+    """
+    queue = _queue(PlaybackState.IDLE, track_id="old")
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+
+    # Seed: a small playlist at qv=66.1 with track 'stale' loaded.
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=66, minor=1),
+            current_item=QueueTrackRef(queue_item_id=1, track_id="stale"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+    await engine.handle_queue_state(
+        QueueStateSnapshot(
+            queue_version=QueueVersion(major=66, minor=1),
+            action_uuid=b"\x00" * 16,
+            tracks=[QueueTrackRef(queue_item_id=1, track_id="stale")],
+            shuffle_mode=False,
+            autoplay_mode=False,
+        )
+    )
+    await _wait_for_preload(engine)
+
+    # New SET_STATE bumps qv to 67.1 with a different track. QUEUE_STATE
+    # for the new qv hasn't arrived yet.
+    await engine.handle_qobuz_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            queue_version=QueueVersion(major=67, minor=1),
+            current_item=QueueTrackRef(queue_item_id=2, track_id="fresh"),
+        )
+    )
+    await _wait_for_reconcile(engine)
+    await _wait_for_preload(engine)
+
+    # Mirror's stale tracks list must have been cleared.
+    assert engine.qobuz_state.tracks == [], (
+        f"qobuz_state.tracks must clear on qv change; got {engine.qobuz_state.tracks}"
+    )
+    ma_ids = [
+        engine.bridge.qobuz_track_id_for(item) for item in provider.mass.player_queues.queue_items
+    ]
+    # MA must hold just the new playing track — no stale 'stale' track
+    # spliced in from the previous queue context.
+    assert ma_ids == ["fresh"], (
+        f"MA must not carry stale tracks from previous qv into the new one; got {ma_ids}"
+    )
+
+    # Now the real QUEUE_STATE arrives for qv=67.1.
+    await engine.handle_queue_state(
+        QueueStateSnapshot(
+            queue_version=QueueVersion(major=67, minor=1),
+            action_uuid=b"\x00" * 16,
+            tracks=[
+                QueueTrackRef(queue_item_id=2, track_id="fresh"),
+                QueueTrackRef(queue_item_id=3, track_id="another"),
+            ],
+            shuffle_mode=False,
+            autoplay_mode=False,
+        )
+    )
+    await _wait_for_preload(engine)
+
+    ma_ids = [
+        engine.bridge.qobuz_track_id_for(item) for item in provider.mass.player_queues.queue_items
+    ]
+    # Dedup gate must release on the tracks-update so this snapshot
+    # actually reconciles (= MA grows to match new mirror).
+    assert ma_ids == ["fresh", "another"], (
+        f"Snapshot after stale-clear must reconcile MA to new tracks; got {ma_ids}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_reconciler_preserves_duplicate_track_slots() -> None:
     """A mirror with the same track_id at multiple positions must materialize all slots.
 
