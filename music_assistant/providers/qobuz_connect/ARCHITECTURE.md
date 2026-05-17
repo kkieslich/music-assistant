@@ -307,5 +307,4 @@ an async context manager so leaks become impossible.
 ## Captured reference data
 
 - [`tests/providers/qobuz_connect/protocol_capture/`](../../../tests/providers/qobuz_connect/protocol_capture/) — **the** source of reference data. A Playwright harness that drives two real Qobuz Web Clients via CDP, recording both directions of the WebSocket into `.runs/`. Add or extend a scenario whenever a protocol question can't be answered from existing captures. Scenarios can opt in to throttled-network conditions for "slow renderer" / "lossy link" tests.
-- [`proto/captured/legacy/`](proto/captured/legacy/) — early Chrome-extension exports. **Obsolete** (incoming binary empty). Kept as a historical record of the reverse-engineering work; do not use for protocol analysis.
   Each scenario file is suitable as a Phase B test fixture once auth tokens are stripped.

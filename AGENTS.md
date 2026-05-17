@@ -15,7 +15,6 @@ Data flow: `Qobuz app -> Qobuz Connect protocol -> MA player queue -> native MA 
 - [models.py](music_assistant/providers/qobuz_connect/models.py): shared enums/dataclasses and quality maps.
 - Generated protobuf modules are committed in [proto/](music_assistant/providers/qobuz_connect/proto/); do not delete them.
 - For protocol behavior questions, use the Playwright capture harness at [tests/providers/qobuz_connect/protocol_capture/](tests/providers/qobuz_connect/protocol_capture/). It drives real Qobuz Web Clients via CDP and records WebSocket traffic into `.runs/`; add or extend scenarios when observing reference behavior.
-- Older Chrome-extension exports under [proto/captured/legacy/](music_assistant/providers/qobuz_connect/proto/captured/legacy/) are obsolete and kept only as historical reference.
 - Tests live in [tests/providers/qobuz_connect/](tests/providers/qobuz_connect/). Run with `pytest tests/providers/qobuz_connect/`.
 - The provider is `stage: experimental` and `multi_instance: true`. The mDNS serial and Qobuz cloud device UUID are derived from `instance_id` via a fixed namespace UUID.
 - Target player resolution: `CONF_TARGET_PLAYER = "__auto__"` prefers any currently-playing player, else first available. Missing pinned players should warn rather than fail setup.

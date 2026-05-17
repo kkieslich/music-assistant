@@ -2,13 +2,9 @@
 Chrome DevTools Protocol WebSocket recorder for Qobuz Connect captures.
 
 Records every WebSocket frame (both directions) seen by a Playwright Page,
-preserving full binary bytes.
-
-Output schema matches the Chrome-extension export shape used by the legacy
-captures under ``proto/captured/legacy/``, so that simple tooling can read
-both. The legacy files themselves are obsolete (incoming binary empty) and
-should not be used for protocol analysis — all live analysis runs against
-the bidirectional ``.runs/*.json`` produced by this recorder.
+preserving full binary bytes. Output goes to ``.runs/<scenario>__client_*.json``
+in a shape compatible with a Chrome WS-export schema (``version``,
+``exportDate``, ``statistics``, ``eventTypes``, ``messages[]``).
 """
 
 from __future__ import annotations
@@ -52,7 +48,7 @@ class _Frame:
     payload: bytes
 
     def to_export(self) -> dict[str, Any]:
-        """Serialize to the legacy capture-*.json frame shape."""
+        """Serialize to the capture-*.json frame shape."""
         return {
             "type": "message",
             "eventType": "text" if self.opcode == 1 else "binary",
@@ -197,7 +193,7 @@ class WsRecorder:
 
     def write(self, path: str | Path) -> Path:
         """
-        Write captured frames to ``path`` in the legacy capture-*.json schema.
+        Write captured frames to ``path`` in the capture-*.json schema.
 
         :param path: Output file path. Parent directory must exist.
         :returns: Absolute path of the written file.
@@ -276,10 +272,9 @@ class WsRecorder:
         response = params.get("response") or {}
         opcode = int(response.get("opcode", 2))
         payload = _decode_payload(response.get("payloadData", ""), opcode)
-        # CDP timestamps are seconds since an arbitrary monotonic origin; the
-        # legacy capture format used epoch_ms instead. Use wall-clock here —
-        # ordering within the capture is preserved by capture time, not CDP's
-        # internal timestamp.
+        # CDP timestamps are seconds since an arbitrary monotonic origin.
+        # Use wall-clock epoch_ms here so timestamps are interpretable across
+        # captures; ordering within one capture is preserved by capture time.
         self._frames.append(
             _Frame(
                 direction=direction,
@@ -298,9 +293,9 @@ def _decode_payload(payload_data: str, opcode: int) -> bytes:
 
     Per the CDP spec the field is always a string; for binary opcodes (>=2) it
     is base64-encoded, for text opcodes (1) it is the literal text. Real Qobuz
-    traffic occasionally sends protobuf bytes over a text opcode (see the
-    legacy capture-*.json files), so we try base64 first and fall back to a
-    latin1 round-trip that preserves arbitrary byte values.
+    traffic occasionally sends protobuf bytes over a text opcode, so we try
+    base64 first and fall back to a latin1 round-trip that preserves arbitrary
+    byte values.
     """
     if not payload_data:
         return b""
