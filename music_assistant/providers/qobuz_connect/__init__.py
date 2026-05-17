@@ -199,6 +199,7 @@ class QobuzConnectProvider(PluginProvider):
         self._sync = QobuzConnectSyncEngine(self)
         self._ws_setup_lock = asyncio.Lock()
         self._unsubscribe_queue_events: Callable[[], None] | None = None
+        self._unsubscribe_queue_items_events: Callable[[], None] | None = None
 
     async def loaded_in_mass(self) -> None:
         """Start Qobuz Connect discovery after provider load."""
@@ -208,6 +209,13 @@ class QobuzConnectProvider(PluginProvider):
         self._unsubscribe_queue_events = self.mass.subscribe(
             self._on_ma_queue_event,
             EventType.QUEUE_UPDATED,
+        )
+        # QUEUE_ITEMS_UPDATED carries user-driven queue mutations (drag-
+        # reorder, remove, add) — feed those into the MA→Qobuz outbound
+        # differ so cloud sees them.
+        self._unsubscribe_queue_items_events = self.mass.subscribe(
+            self._on_ma_queue_items_event,
+            EventType.QUEUE_ITEMS_UPDATED,
         )
         self._discovery = QobuzConnectDiscovery(
             device=self._device_config,
@@ -227,6 +235,9 @@ class QobuzConnectProvider(PluginProvider):
         if self._unsubscribe_queue_events is not None:
             self._unsubscribe_queue_events()
             self._unsubscribe_queue_events = None
+        if self._unsubscribe_queue_items_events is not None:
+            self._unsubscribe_queue_items_events()
+            self._unsubscribe_queue_items_events = None
         await self._sync.stop()
         if self._session:
             await self._session.stop()
@@ -393,6 +404,10 @@ class QobuzConnectProvider(PluginProvider):
     async def _on_ma_queue_event(self, event: MassEvent) -> None:
         """Forward MA queue updates into the Qobuz sync engine."""
         await self._sync.handle_ma_queue_event(event)
+
+    async def _on_ma_queue_items_event(self, event: MassEvent) -> None:
+        """Forward MA queue-item mutations to the MA→Qobuz outbound differ."""
+        await self._sync.handle_ma_queue_items_updated(event)
 
     def get_qobuz_track_id_from_queue_item(self, queue_item: Any) -> str | None:
         """Extract a Qobuz provider track id from an MA QueueItem."""

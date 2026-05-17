@@ -636,6 +636,7 @@ class CommandHandler:
             if not await self._reconcile_remove_stale(player_id, generation):
                 return
             await self._reconcile_add_missing(player_id, current_item, generation)
+            await self._reconcile_add_history(player_id, current_item, generation)
         except asyncio.CancelledError:
             raise
         except PlayerUnavailableError as err:
@@ -730,4 +731,73 @@ class CommandHandler:
             )
             # Yield so other tasks (a new SET_STATE, a seek) can preempt
             # before we burn another chunk on the Qobuz API.
+            await asyncio.sleep(0)
+
+    async def _reconcile_add_history(
+        self,
+        player_id: str,
+        current_item: QueueTrackRef,
+        generation: int,
+    ) -> None:
+        """Insert mirror tracks *before* ``current_item`` at the front of MA's queue.
+
+        Loads the "history" portion of the Qobuz playlist (tracks the user
+        has already passed, but which Qobuz still keeps in the queue) so a
+        skip-backward inside the same playlist resolves instantly from MA's
+        loaded queue instead of triggering a fresh load. Each insert call
+        uses ``insert_at_index=0`` with ``keep_played=True`` /
+        ``keep_remaining=True``, which leaves the currently-playing item's
+        audio stream untouched — MA's ``current_index`` shifts up
+        internally as the front grows.
+        """
+        engine = self._engine
+        logger = engine.bridge.logger
+        if not engine.qobuz_state.tracks:
+            return
+        tracks_refs = list(engine.qobuz_state.tracks)
+        current_key = TrackRefKey.from_ref(current_item)
+        current_idx = next(
+            (i for i, ref in enumerate(tracks_refs) if TrackRefKey.from_ref(ref) == current_key),
+            None,
+        )
+        if current_idx is None or current_idx == 0:
+            return
+        history = tracks_refs[:current_idx]
+        existing_ids: set[str] = set()
+        for item in engine.bridge.queue_items(player_id):
+            track_id = engine.bridge.qobuz_track_id_for(item)
+            if track_id:
+                existing_ids.add(track_id)
+        # Iterate chunks back-to-front so the final MA order matches the
+        # snapshot: each chunk goes in at index 0, so the *last* chunk
+        # processed (= snapshot[0..]) ends up at the absolute front.
+        for chunk_end in range(len(history), 0, -PRELOAD_CHUNK_SIZE):
+            if not engine._is_current_command(generation):
+                logger.debug("MA reconcile bailing during history-add: superseded")
+                return
+            chunk_start = max(0, chunk_end - PRELOAD_CHUNK_SIZE)
+            chunk_refs = history[chunk_start:chunk_end]
+            pending_refs = [ref for ref in chunk_refs if ref.track_id not in existing_ids]
+            if not pending_refs:
+                continue
+            resolved = await asyncio.gather(
+                *[engine.metadata.get_track_or_none(ref.track_id) for ref in pending_refs],
+            )
+            if not engine._is_current_command(generation):
+                return
+            queue_items: list[Any] = []
+            for ref, ma_track in zip(pending_refs, resolved, strict=True):
+                if ma_track is None:
+                    continue
+                queue_items.append(QueueItem.from_media_item(player_id, ma_track))
+                existing_ids.add(ref.track_id)
+            if not queue_items:
+                continue
+            await engine.bridge.insert_items(
+                player_id,
+                queue_items,
+                insert_at_index=0,
+                keep_played=True,
+                keep_remaining=True,
+            )
             await asyncio.sleep(0)
