@@ -1846,34 +1846,32 @@ async def test_queue_state_snapshot_schedules_background_preload() -> None:
     assert initial_stop_present, f"Snapshot preload must not stop the queue; calls={calls_after}"
     assert clears_after <= 1, f"Snapshot preload must not clear the queue; calls={calls_after}"
 
-    # The actual extension came via play_media(option=ADD).
-    add_calls = [
-        c
-        for c in calls_after
-        if c[0] == "play_media" and c[2].get("option") is not None and c[2]["option"].name == "ADD"
+    # The reconciler materializes the full queue in a single update_items
+    # call — no more chunked play_media(ADD) per intermediate state.
+    final_track_ids = [
+        getattr(item.media_item, "item_id", None)
+        for item in provider.mass.player_queues.queue_items
     ]
-    assert add_calls, f"Expected a play_media(option=ADD) call; got {calls_after}"
-    added_ids: list[str | None] = []
-    for call in add_calls:
-        added_ids.extend(getattr(track, "item_id", None) for track in call[1][1])
-    # Snapshot has t1..t4 with current=t2 at index 1. Preload appends from
-    # current_idx+1 onwards. ``t3`` is skipped (already in MA as ``next_item``).
-    assert added_ids == ["t4"], (
-        f"Preload must append snapshot[current_idx+1:] minus already-present items; got {added_ids}"
+    assert final_track_ids == ["t1", "t2", "t3", "t4"], (
+        f"Reconcile must materialize the full mirror order; got {final_track_ids}"
     )
 
 
 @pytest.mark.asyncio
-async def test_preload_chunks_large_queue() -> None:
-    """600-track snapshot must be appended via multiple chunked ADD calls."""
-    from music_assistant.providers.qobuz_connect.command_handler import (  # noqa: PLC0415
-        PRELOAD_CHUNK_SIZE,
-    )
+async def test_large_snapshot_materialized_in_single_update_items() -> None:
+    """Large snapshots must materialize in a single ``update_items`` — no UI flicker.
 
+    Earlier iterations chunked-added tracks via N calls to
+    ``play_media(option=ADD)`` and ``insert_items``, each firing a MA
+    ``QUEUE_ITEMS_UPDATED`` event and causing the web UI to re-render.
+    For 1600 tracks that was ~128 re-renders in seconds (the heavy
+    flickering the user reported). The reconciler now resolves all
+    missing metadata in memory and calls ``update_items`` exactly once.
+    """
     queue = _queue(PlaybackState.IDLE, track_id="old")
     provider = _FakeProvider(queue)
     engine = QobuzConnectSyncEngine(provider)
-    total_tracks = 120  # 5x the chunk size to give us multiple ADD calls
+    total_tracks = 120
 
     await engine.handle_qobuz_set_state(
         SetStateEvent(
@@ -1883,6 +1881,7 @@ async def test_preload_chunks_large_queue() -> None:
         )
     )
     await _wait_for_reconcile(engine)
+    calls_before_snapshot = len(provider.mass.player_queues.calls)
 
     await engine.handle_queue_state(
         QueueStateSnapshot(
@@ -1897,25 +1896,25 @@ async def test_preload_chunks_large_queue() -> None:
     )
     await _wait_for_preload(engine)
 
-    add_calls = [
-        c
-        for c in provider.mass.player_queues.calls
-        if c[0] == "play_media" and c[2].get("option") is not None and c[2]["option"].name == "ADD"
-    ]
-    assert len(add_calls) >= 2, (
-        f"Expected chunked ADD calls for 120 tracks; got {len(add_calls)} calls"
+    new_calls = provider.mass.player_queues.calls[calls_before_snapshot:]
+    update_items_calls = [c for c in new_calls if c[0] == "update_items"]
+    add_calls = [c for c in new_calls if c[0] == "play_media"]
+    insert_calls = [c for c in new_calls if c[0] == "load" and c[2].get("keep_played") is True]
+    assert add_calls == [], (
+        f"Reconciler must materialize in one update_items, not chunked play_media; got {add_calls}"
     )
-    for call in add_calls:
-        chunk = call[1][1]
-        assert 0 < len(chunk) <= PRELOAD_CHUNK_SIZE, (
-            f"Each chunk must be ≤ {PRELOAD_CHUNK_SIZE}; got chunk of {len(chunk)}"
-        )
-    added_ids: list[str | None] = []
-    for call in add_calls:
-        added_ids.extend(getattr(track, "item_id", None) for track in call[1][1])
-    # current_item=t0 at index 0 → preload covers t1..t119.
-    assert added_ids == [f"t{i}" for i in range(1, total_tracks)], (
-        f"Preload must cover every snapshot track after current; got {len(added_ids)} ids"
+    assert insert_calls == [], (
+        f"Reconciler must not call chunked insert_items either; got {insert_calls}"
+    )
+    assert len(update_items_calls) == 1, (
+        f"Reconciler must mutate MA exactly once; got {len(update_items_calls)}"
+    )
+    final_track_ids = [
+        getattr(item.media_item, "item_id", None)
+        for item in provider.mass.player_queues.queue_items
+    ]
+    assert final_track_ids == [f"t{i}" for i in range(total_tracks)], (
+        f"All snapshot tracks must end up in MA in mirror order; got {len(final_track_ids)} items"
     )
 
 
@@ -2010,16 +2009,12 @@ async def test_preload_skips_unresolvable_tracks_within_chunk() -> None:
     )
     await _wait_for_preload(engine)
 
-    add_calls = [
-        c
-        for c in provider.mass.player_queues.calls
-        if c[0] == "play_media" and c[2].get("option") is not None and c[2]["option"].name == "ADD"
+    final_track_ids = [
+        getattr(item.media_item, "item_id", None)
+        for item in provider.mass.player_queues.queue_items
     ]
-    added_ids: list[str | None] = []
-    for call in add_calls:
-        added_ids.extend(getattr(track, "item_id", None) for track in call[1][1])
-    assert added_ids == ["t2", "t4"], (
-        f"Unresolvable 'bad' must be skipped without aborting the rest; got {added_ids}"
+    assert final_track_ids == ["t1", "t2", "t4"], (
+        f"Unresolvable 'bad' must be skipped without aborting the rest; got {final_track_ids}"
     )
 
 
