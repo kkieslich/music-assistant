@@ -2706,6 +2706,109 @@ async def test_ma_appended_track_sends_queue_add_tracks_to_cloud() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ma_forward_reorder_sends_reorder_tracks_to_cloud() -> None:
+    """User drags a track later in MA's queue → cloud gets one REORDER_TRACKS.
+
+    Mirror has [t1, t2, t3, t4]; user drags t2 to slot 3 → MA has [t1, t3, t4, t2].
+    Detector recognizes this as a single-item move (src=1, dst=3) and emits
+    REORDER_TRACKS with the moved item's Qobuz queue_item_id and the new
+    insert position.
+    """
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.queue_version = QueueVersion(major=58, minor=2)
+    engine.qobuz_state.tracks = [
+        QueueTrackRef(queue_item_id=1, track_id="t1"),
+        QueueTrackRef(queue_item_id=2, track_id="t2"),
+        QueueTrackRef(queue_item_id=3, track_id="t3"),
+        QueueTrackRef(queue_item_id=4, track_id="t4"),
+    ]
+    # MA has same set, t2 moved to position 3.
+    provider.mass.player_queues.queue_items = [
+        SimpleNamespace(media_item=SimpleNamespace(item_id=tid), queue_item_id=f"ma-{tid}")
+        for tid in ("t1", "t3", "t4", "t2")
+    ]
+
+    await engine.handle_ma_queue_items_updated(
+        _ma_items_event("player", provider.mass.player_queues.queue_items)
+    )
+
+    assert len(session.queue_reorders) == 1, (
+        f"Forward reorder must emit REORDER_TRACKS; got reorders={session.queue_reorders}"
+    )
+    payload = session.queue_reorders[0]
+    assert payload["queue_item_ids"] == [2], (
+        f"REORDER must carry the moved Qobuz queue_item_id; got {payload}"
+    )
+    assert payload["insert_after"] == 3, (
+        f"REORDER insert_after must be the new dst index; got {payload}"
+    )
+    assert (payload["queue_version"].major, payload["queue_version"].minor) == (58, 2)
+
+
+@pytest.mark.asyncio
+async def test_ma_backward_reorder_sends_reorder_tracks_to_cloud() -> None:
+    """User drags a track earlier in MA's queue → cloud gets one REORDER_TRACKS."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.queue_version = QueueVersion(major=58, minor=3)
+    engine.qobuz_state.tracks = [
+        QueueTrackRef(queue_item_id=1, track_id="t1"),
+        QueueTrackRef(queue_item_id=2, track_id="t2"),
+        QueueTrackRef(queue_item_id=3, track_id="t3"),
+        QueueTrackRef(queue_item_id=4, track_id="t4"),
+    ]
+    # User drags t4 to position 1 → MA has [t1, t4, t2, t3].
+    provider.mass.player_queues.queue_items = [
+        SimpleNamespace(media_item=SimpleNamespace(item_id=tid), queue_item_id=f"ma-{tid}")
+        for tid in ("t1", "t4", "t2", "t3")
+    ]
+
+    await engine.handle_ma_queue_items_updated(
+        _ma_items_event("player", provider.mass.player_queues.queue_items)
+    )
+
+    assert len(session.queue_reorders) == 1
+    payload = session.queue_reorders[0]
+    assert payload["queue_item_ids"] == [4]
+    assert payload["insert_after"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ma_complex_reorder_skips_outbound_emit() -> None:
+    """Two-item reorders are not yet supported — the differ logs and skips."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.queue_version = QueueVersion(major=59, minor=0)
+    engine.qobuz_state.tracks = [
+        QueueTrackRef(queue_item_id=1, track_id="t1"),
+        QueueTrackRef(queue_item_id=2, track_id="t2"),
+        QueueTrackRef(queue_item_id=3, track_id="t3"),
+        QueueTrackRef(queue_item_id=4, track_id="t4"),
+    ]
+    # Reverse two pairs — not a single-item shift.
+    provider.mass.player_queues.queue_items = [
+        SimpleNamespace(media_item=SimpleNamespace(item_id=tid), queue_item_id=f"ma-{tid}")
+        for tid in ("t2", "t1", "t4", "t3")
+    ]
+
+    await engine.handle_ma_queue_items_updated(
+        _ma_items_event("player", provider.mass.player_queues.queue_items)
+    )
+
+    assert session.queue_reorders == [], (
+        "Complex reorder must not emit a partial REORDER message; "
+        "let the snapshot resync via the next qv bump"
+    )
+
+
+@pytest.mark.asyncio
 async def test_ma_cleared_queue_sends_clear_to_cloud() -> None:
     """Clearing MA's queue (with mirror non-empty) sends ``CTRL_SRVR_CLEAR_QUEUE``."""
     session = _FakeSession()
