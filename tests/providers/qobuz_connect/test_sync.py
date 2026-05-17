@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -25,6 +26,11 @@ from music_assistant.providers.qobuz_connect.models import (
     QueueTracksReorderedEvent,
     QueueVersion,
     SetStateEvent,
+)
+from music_assistant.providers.qobuz_connect.state import (
+    PausedSeek,
+    PendingQobuzPosition,
+    TrackRefKey,
 )
 from music_assistant.providers.qobuz_connect.sync import QobuzConnectSyncEngine
 
@@ -206,8 +212,10 @@ async def test_play_after_paused_seek_resumes_at_pending_position() -> None:
     """A later PLAYING command applies the stored paused seek once."""
     provider = _FakeProvider(_queue(PlaybackState.PAUSED))
     engine = QobuzConnectSyncEngine(provider)
-    engine.pending_paused_seek_ms = 50_000
-    cast("Any", engine)._pending_paused_seek_ref = "11:376286112"
+    engine.paused_seek = PausedSeek(
+        position_ms=50_000,
+        ref=TrackRefKey(queue_item_id=11, track_id="376286112"),
+    )
 
     await engine.handle_qobuz_set_state(
         SetStateEvent(
@@ -218,7 +226,7 @@ async def test_play_after_paused_seek_resumes_at_pending_position() -> None:
     )
     await _wait_for_reconcile(engine)
 
-    assert cast("Any", engine).pending_paused_seek_ms is None
+    assert cast("Any", engine).paused_seek is None
     assert provider.mass.player_queues.calls == [
         ("play_index", ("player", 0), {"seek_position": 50})
     ]
@@ -347,12 +355,17 @@ async def test_ma_position_past_pending_seek_clears_buffering() -> None:
     engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=11, track_id="376286112")
     engine.qobuz_state.playing_state = PlayingState.PLAYING
     engine.qobuz_state.buffer_state = BufferState.BUFFERING
-    engine._pending_qobuz_position_ms = 73_794
+    engine.qobuz_position = PendingQobuzPosition(
+        target_ms=73_794,
+        ref=TrackRefKey(queue_item_id=11, track_id="376286112"),
+        source_ms=0,
+        timestamp_ms=int(time.time() * 1000),
+    )
 
     await engine.report_state()
 
     assert engine.qobuz_state.buffer_state == BufferState.OK
-    assert cast("Any", engine)._pending_qobuz_position_ms is None
+    assert cast("Any", engine).qobuz_position is None
     assert session.renderer_states[-1]["position_ms"] == 76_200
 
 
@@ -490,8 +503,12 @@ async def test_ma_natural_advance_promotes_known_qobuz_next_item() -> None:
     engine.qobuz_state.next_item = QueueTrackRef(queue_item_id=2, track_id="397744036")
     engine.qobuz_state.playing_state = PlayingState.PLAYING
     engine.qobuz_state.position_ms = 73_794
-    engine._pending_qobuz_position_ms = 73_794
-    engine._pending_qobuz_position_ref = "1:217628808"
+    engine.qobuz_position = PendingQobuzPosition(
+        target_ms=73_794,
+        ref=TrackRefKey(queue_item_id=1, track_id="217628808"),
+        source_ms=0,
+        timestamp_ms=int(time.time() * 1000),
+    )
 
     await engine.handle_ma_queue_event(_event(queue))
 
@@ -501,7 +518,7 @@ async def test_ma_natural_advance_promotes_known_qobuz_next_item() -> None:
     )
     assert cast("Any", engine).qobuz_state.next_item is None
     assert engine.qobuz_state.position_ms == 10_000
-    assert cast("Any", engine)._pending_qobuz_position_ms is None
+    assert cast("Any", engine).qobuz_position is None
     assert session.queue_loads == []
     assert session.renderer_states[-1]["queue_item_id"] == 2
 
