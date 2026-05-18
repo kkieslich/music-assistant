@@ -130,6 +130,16 @@ class _FakePlayerQueues:
             if getattr(item, "queue_item_id", None) != item_id_or_index
         ]
 
+    async def set_shuffle(self, queue_id: str, shuffle_enabled: bool) -> None:
+        self.calls.append(("set_shuffle", (queue_id, shuffle_enabled), {}))
+        if queue_id == "player":
+            self.queue.shuffle_enabled = shuffle_enabled
+
+    def set_repeat(self, queue_id: str, repeat_mode: Any) -> None:
+        self.calls.append(("set_repeat", (queue_id, repeat_mode), {}))
+        if queue_id == "player":
+            self.queue.repeat_mode = repeat_mode
+
     def update_items(self, queue_id: str, items: list[Any]) -> None:
         self.calls.append(("update_items", (queue_id, items), {}))
         if queue_id == "player":
@@ -1152,19 +1162,57 @@ async def test_handle_queue_tracks_added_appends_to_mirror() -> None:
     await engine.stop()
 
 
-async def test_handle_mode_setters_update_mirror() -> None:
-    """SET_LOOP/SHUFFLE/AUTOPLAY mode commands flip the corresponding mirror fields."""
-    provider = _FakeProvider(_queue(PlaybackState.PLAYING))
+async def test_handle_mode_setters_update_mirror_and_propagate_to_ma() -> None:
+    """SET_LOOP/SHUFFLE update both the mirror *and* MA's queue.
+
+    User flipping repeat / shuffle in the Qobuz app should drag MA's
+    queue along. Earlier the handlers were mirror-only — MA's state
+    silently diverged, and toggling in the Qobuz app appeared to do
+    nothing.
+    """
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue)
     engine = QobuzConnectSyncEngine(provider)
 
     await engine.handle_loop_mode(LoopMode.REPEAT_ALL)
     await engine.handle_shuffle_mode(True)
     await engine.handle_autoplay_mode(False)
 
+    # Mirror tracks the cloud's view.
     assert engine.qobuz_state.loop_mode == LoopMode.REPEAT_ALL
     assert engine.qobuz_state.shuffle_mode is True
     assert engine.qobuz_state.autoplay_mode is False
+
+    # MA queue's state has been updated to match.
+    kinds = [c[0] for c in provider.mass.player_queues.calls]
+    assert "set_repeat" in kinds, f"Cloud loop must apply to MA queue; got {kinds}"
+    assert "set_shuffle" in kinds, f"Cloud shuffle must apply to MA queue; got {kinds}"
+    assert queue.shuffle_enabled is True
+    # ``set_repeat`` records the RepeatMode enum it was called with.
+    repeat_calls = [c for c in provider.mass.player_queues.calls if c[0] == "set_repeat"]
+    assert repeat_calls[0][1][1].value == "all"
     await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_cloud_loop_change_does_not_echo_back_to_cloud() -> None:
+    """Applying a cloud loop change must not bounce back through the outbound differ.
+
+    After ``handle_loop_mode`` updates the mirror + MA queue, MA's
+    ``QUEUE_UPDATED`` fires reflecting the same value. Without an origin
+    guard the differ would re-emit ``CTRL_SRVR_SET_LOOP_MODE`` straight
+    back to the cloud, creating an infinite ping-pong.
+    """
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+
+    await engine.handle_loop_mode(LoopMode.REPEAT_ALL)
+
+    # No outbound loop emission for cloud-originated changes.
+    loop_emits = [r for r in session.renderer_states if r.get("_kind") == "loop"]
+    assert loop_emits == [], f"QOBUZ-origin loop change must not emit MA→cloud; got {loop_emits}"
 
 
 async def test_handle_queue_tracks_inserted_inserts_at_position() -> None:

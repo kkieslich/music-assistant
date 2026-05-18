@@ -113,6 +113,15 @@ _MA_REPEAT_TO_LOOP: dict[str, LoopMode] = {
     "all": LoopMode.REPEAT_ALL,
 }
 
+# Reverse map for cloud→MA loop-mode application. Keyed on ``LoopMode``;
+# value is the matching ``RepeatMode`` value as a string so we don't need
+# to import MA's enum into the type signature.
+_LOOP_TO_MA_REPEAT: dict[LoopMode, str] = {
+    LoopMode.OFF: "off",
+    LoopMode.REPEAT_ONE: "one",
+    LoopMode.REPEAT_ALL: "all",
+}
+
 
 def _detect_single_item_move(
     mirror_order: list[str], ma_order: list[str]
@@ -862,12 +871,32 @@ class QobuzConnectSyncEngine:
         await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     async def handle_loop_mode(self, mode: LoopMode) -> None:
-        """Record a renderer ``SET_LOOP_MODE`` command in the mirror."""
+        """Apply a renderer ``SET_LOOP_MODE`` command to mirror + MA queue.
+
+        Wraps the MA mutation in ``Origin.QOBUZ`` so the resulting
+        ``QUEUE_UPDATED`` event doesn't echo back through
+        ``_maybe_emit_modes_to_cloud`` as an MA-originated change. The
+        mirror is also updated optimistically — by the time MA's event
+        fires, both sides match and the differ would be a no-op anyway,
+        but the origin guard belt-and-braces the case where MA's signal
+        races our mirror update.
+        """
         self.qobuz_state.loop_mode = mode
+        repeat = _LOOP_TO_MA_REPEAT.get(mode)
+        player_id = self.bridge.target_player_id()
+        if repeat is None or player_id is None:
+            return
+        async with origin_scope(self, Origin.QOBUZ):
+            self.bridge.set_repeat(player_id, repeat)
 
     async def handle_shuffle_mode(self, shuffle_on: bool) -> None:
-        """Record a renderer ``SET_SHUFFLE_MODE`` command in the mirror."""
+        """Apply a renderer ``SET_SHUFFLE_MODE`` command to mirror + MA queue."""
         self.qobuz_state.shuffle_mode = shuffle_on
+        player_id = self.bridge.target_player_id()
+        if player_id is None:
+            return
+        async with origin_scope(self, Origin.QOBUZ):
+            await self.bridge.set_shuffle(player_id, shuffle_on)
 
     async def handle_autoplay_mode(self, autoplay_on: bool) -> None:
         """Record a renderer ``SET_AUTOPLAY_MODE`` command in the mirror."""
