@@ -642,15 +642,38 @@ class QobuzConnectCodec:
 
     @staticmethod
     def parse_queue_state(message: Any) -> QueueStateSnapshot | None:
-        """Parse a full ``SRVR_CTRL_QUEUE_STATE`` queue snapshot."""
+        """Parse a full ``SRVR_CTRL_QUEUE_STATE`` queue snapshot.
+
+        The cloud carries the queue in two parts: ``tracks`` is the
+        underlying (unshuffled) track list and ``shuffledTrackIndexes`` is
+        the permutation the user sees when shuffle is on. We bake the
+        user-facing order into ``QueueStateSnapshot.tracks`` here so the
+        mirror always represents what MA should display — without this,
+        reconciliation would force MA back to the unshuffled order every
+        time the cloud reports a shuffled snapshot.
+        """
         if not message.HasField("srvrCtrlQueueState"):
             return None
         state = message.srvrCtrlQueueState
+        base_tracks = [
+            ref for track in state.tracks if (ref := _parse_track_ref(track)) is not None
+        ]
+        shuffle_on = state.shuffleMode if state.HasField("shuffleMode") else False
+        shuffled_indexes = list(state.shuffledTrackIndexes)
+        if shuffle_on and shuffled_indexes:
+            # Reorder by the cloud's shuffle permutation. Defensive bounds
+            # check — an out-of-range index just gets skipped rather than
+            # crashing the parse.
+            effective_tracks = [
+                base_tracks[i] for i in shuffled_indexes if 0 <= i < len(base_tracks)
+            ]
+        else:
+            effective_tracks = base_tracks
         return QueueStateSnapshot(
             queue_version=QueueVersion(state.queueVersion.major, state.queueVersion.minor),
             action_uuid=state.actionUuid,
-            tracks=[ref for track in state.tracks if (ref := _parse_track_ref(track)) is not None],
-            shuffle_mode=state.shuffleMode if state.HasField("shuffleMode") else False,
+            tracks=effective_tracks,
+            shuffle_mode=shuffle_on,
             autoplay_mode=state.autoplayMode if state.HasField("autoplayMode") else False,
             autoplay_tracks=[
                 ref
