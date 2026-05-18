@@ -382,6 +382,28 @@ class QobuzConnectSession:
         """Report renderer mute state to Qobuz."""
         return await self.send_message(self._codec.encode_volume_muted(muted))
 
+    async def send_set_loop_mode(self, mode: LoopMode) -> bool:
+        """Tell the Qobuz cloud to switch loop mode to ``mode``."""
+        return await self.send_message(self._codec.encode_set_loop_mode(mode))
+
+    async def send_set_shuffle_mode(
+        self,
+        *,
+        shuffle_on: bool,
+        queue_version: QueueVersion,
+        current_queue_item_id: int,
+        action_uuid: bytes,
+    ) -> bool:
+        """Tell the Qobuz cloud to enable/disable shuffle for the current queue."""
+        return await self.send_message(
+            self._codec.encode_set_shuffle_mode(
+                shuffle_on=shuffle_on,
+                queue_version=queue_version,
+                current_queue_item_id=current_queue_item_id,
+                action_uuid=action_uuid,
+            )
+        )
+
     async def send_quality_reports(self, quality: int) -> None:
         """Report device/file/max quality to Qobuz."""
         await self.send_message(self._codec.encode_file_audio_quality_changed(quality))

@@ -91,6 +91,8 @@ class QConnectMessageType(IntEnum):
     CTRL_SRVR_QUEUE_ADD_TRACKS = 68
     CTRL_SRVR_QUEUE_REMOVE_TRACKS = 69
     CTRL_SRVR_QUEUE_REORDER_TRACKS = 70
+    CTRL_SRVR_SET_SHUFFLE_MODE = 71
+    CTRL_SRVR_SET_LOOP_MODE = 72
     CTRL_SRVR_SET_PLAYER_STATE = 62
     CTRL_SRVR_ASK_FOR_QUEUE_STATE = 76
     CTRL_SRVR_ASK_FOR_RENDERER_STATE = 77
@@ -349,6 +351,8 @@ class OutboundActionKind(StrEnum):
     REMOVE = "remove"
     REORDER = "reorder"
     CLEAR = "clear"
+    SHUFFLE = "shuffle"
+    LOOP = "loop"
 
 
 @dataclass(slots=True)
