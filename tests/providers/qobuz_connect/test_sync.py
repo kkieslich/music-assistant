@@ -199,6 +199,22 @@ class _FakeSession:
         self.clear_queues.append(kwargs)
         return True
 
+    async def send_volume_changed(self, volume: int) -> bool:
+        self.renderer_states.append({"_kind": "volume", "volume": volume})
+        return True
+
+    async def send_volume_muted(self, muted: bool) -> bool:
+        self.renderer_states.append({"_kind": "muted", "muted": muted})
+        return True
+
+    async def send_set_loop_mode(self, mode: Any) -> bool:
+        self.renderer_states.append({"_kind": "loop", "mode": mode})
+        return True
+
+    async def send_set_shuffle_mode(self, **kwargs: Any) -> bool:
+        self.renderer_states.append({"_kind": "shuffle", **kwargs})
+        return True
+
 
 class _FakeProvider:
     """Provider facade needed by the sync engine."""
@@ -3280,3 +3296,97 @@ async def test_outbound_action_uuid_echo_skips_reconciler() -> None:
     assert engine.consume_outbound_action(action_uuid) is None, (
         "Ledger entry must be removed after first consume"
     )
+
+
+# ---------------------------------------------------------------------------
+# MA → cloud loop + shuffle mode propagation. The cloud's loop/shuffle path
+# was Qobuz→MA only (mirror-only update). These tests verify ``_on_ma_queue_event``
+# emits ``CTRL_SRVR_SET_LOOP_MODE`` / ``CTRL_SRVR_SET_SHUFFLE_MODE`` when MA's
+# queue state changes — and dedups so a repeat event for the same value
+# doesn't re-fire.
+# ---------------------------------------------------------------------------
+
+
+def _queue_with_modes(repeat: str = "off", shuffle: bool = False) -> Any:
+    """Build a minimal queue stub exposing repeat_mode + shuffle_enabled."""
+    return SimpleNamespace(
+        state=PlaybackState.PLAYING,
+        current_item=SimpleNamespace(track_id="t1"),
+        repeat_mode=SimpleNamespace(value=repeat),
+        shuffle_enabled=shuffle,
+    )
+
+
+def _queue_event(player_id: str, queue: Any) -> Any:
+    return SimpleNamespace(object_id=player_id, data=queue)
+
+
+@pytest.mark.asyncio
+async def test_ma_loop_mode_change_propagates_to_cloud() -> None:
+    """User toggles repeat in MA → ``CTRL_SRVR_SET_LOOP_MODE`` emits."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=1, track_id="t1")
+    engine.qobuz_state.loop_mode = LoopMode.OFF
+
+    await engine.handle_ma_queue_event(_queue_event("player", _queue_with_modes(repeat="all")))
+    loop_emits = [r for r in session.renderer_states if r.get("_kind") == "loop"]
+    assert len(loop_emits) == 1, f"Expected one loop emit; got {loop_emits}"
+    assert loop_emits[0]["mode"] == LoopMode.REPEAT_ALL
+
+    # Same value again → dedup, no second emit.
+    await engine.handle_ma_queue_event(_queue_event("player", _queue_with_modes(repeat="all")))
+    loop_emits = [r for r in session.renderer_states if r.get("_kind") == "loop"]
+    assert len(loop_emits) == 1, "Repeat same value must not re-emit"
+
+    # Switch to REPEAT_ONE → emit again.
+    await engine.handle_ma_queue_event(_queue_event("player", _queue_with_modes(repeat="one")))
+    loop_emits = [r for r in session.renderer_states if r.get("_kind") == "loop"]
+    assert len(loop_emits) == 2
+    assert loop_emits[-1]["mode"] == LoopMode.REPEAT_ONE
+
+
+@pytest.mark.asyncio
+async def test_ma_shuffle_change_propagates_to_cloud() -> None:
+    """User toggles shuffle in MA → ``CTRL_SRVR_SET_SHUFFLE_MODE`` emits."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=7, track_id="t7")
+    engine.qobuz_state.queue_version = QueueVersion(major=11, minor=2)
+    engine.qobuz_state.shuffle_mode = False
+
+    await engine.handle_ma_queue_event(_queue_event("player", _queue_with_modes(shuffle=True)))
+    shuffle_emits = [r for r in session.renderer_states if r.get("_kind") == "shuffle"]
+    assert len(shuffle_emits) == 1
+    payload = shuffle_emits[0]
+    assert payload["shuffle_on"] is True
+    assert payload["current_queue_item_id"] == 7
+    assert payload["queue_version"] == QueueVersion(major=11, minor=2)
+    assert "action_uuid" in payload
+
+    # Same shuffle value → dedup.
+    await engine.handle_ma_queue_event(_queue_event("player", _queue_with_modes(shuffle=True)))
+    shuffle_emits = [r for r in session.renderer_states if r.get("_kind") == "shuffle"]
+    assert len(shuffle_emits) == 1
+
+
+@pytest.mark.asyncio
+async def test_qobuz_origin_loop_event_does_not_echo() -> None:
+    """When an inbound Qobuz command is being applied, MA events must not echo."""
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.loop_mode = LoopMode.OFF
+
+    from music_assistant.providers.qobuz_connect.state import origin_scope  # noqa: PLC0415
+
+    async with origin_scope(engine, Origin.QOBUZ):
+        await engine.handle_ma_queue_event(_queue_event("player", _queue_with_modes(repeat="all")))
+
+    loop_emits = [r for r in session.renderer_states if r.get("_kind") == "loop"]
+    assert loop_emits == [], "QOBUZ-origin events must not echo loop changes back"
