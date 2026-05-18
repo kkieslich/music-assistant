@@ -178,6 +178,23 @@ class MABridge:
         """Toggle MA's queue shuffle from a cloud command."""
         await self._provider.mass.player_queues.set_shuffle(player_id, shuffle_enabled)
 
+    def set_shuffle_flag(self, player_id: str, shuffle_enabled: bool) -> None:
+        """Set ``PlayerQueue.shuffle_enabled`` without re-shuffling MA's items.
+
+        Used when applying a Qobuz ``QUEUE_STATE`` snapshot — the reconciler
+        rebuilds queue order to match the mirror immediately after, so all
+        we need is to flip the UI flag. Going through
+        :py:meth:`mass.player_queues.set_shuffle` would smart-shuffle MA's
+        items locally, producing an order that's instantly overwritten by
+        the reconciler.
+
+        :param player_id: Target MA player id.
+        :param shuffle_enabled: New value for the flag.
+        """
+        queue = self._provider.mass.player_queues.get(player_id)
+        if queue is not None:
+            queue.shuffle_enabled = shuffle_enabled
+
     def set_repeat(self, player_id: str, repeat_mode_value: str) -> None:
         """Set MA's queue repeat mode from a cloud command.
 

@@ -1143,6 +1143,36 @@ async def test_handle_queue_state_replaces_mirror_tracks_and_flags() -> None:
     await engine.stop()
 
 
+async def test_handle_queue_state_applies_shuffle_flag_to_ma_queue() -> None:
+    """Snapshot-only shuffle changes propagate to MA's queue flag.
+
+    Qobuz sometimes conveys shuffle changes via ``QUEUE_STATE`` alone
+    (no preceding ``SRVR_RNDR_SET_SHUFFLE_MODE``) — observed in production
+    on the shuffle-OFF path. Without this propagation, MA's UI shows the
+    stale flag while the queue order is reshuffled by the reconciler.
+    """
+    queue = _queue(PlaybackState.PLAYING)
+    queue.shuffle_enabled = True  # stale value from a previous toggle
+    provider = _FakeProvider(queue)
+    engine = QobuzConnectSyncEngine(provider)
+
+    snapshot = QueueStateSnapshot(
+        queue_version=QueueVersion(23, 1),
+        action_uuid=b"\x00" * 16,
+        tracks=[QueueTrackRef(queue_item_id=0, track_id="1065476")],
+        shuffle_mode=False,
+        autoplay_mode=False,
+    )
+    await engine.handle_queue_state(snapshot)
+
+    assert queue.shuffle_enabled is False
+    # The flag-setter bypasses MA's ``set_shuffle`` (which would re-shuffle
+    # items locally only to be immediately overwritten by the reconciler).
+    kinds = [c[0] for c in provider.mass.player_queues.calls]
+    assert "set_shuffle" not in kinds, f"snapshot path must not call set_shuffle; got {kinds}"
+    await engine.stop()
+
+
 async def test_handle_queue_tracks_added_appends_to_mirror() -> None:
     """Per-op TRACKS_ADDED delta extends the mirror's track list."""
     provider = _FakeProvider(_queue(PlaybackState.PLAYING))

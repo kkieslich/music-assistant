@@ -771,6 +771,15 @@ class QobuzConnectSyncEngine:
         self.qobuz_state.tracks = list(snapshot.tracks)
         self.qobuz_state.shuffle_mode = snapshot.shuffle_mode
         self.qobuz_state.autoplay_mode = snapshot.autoplay_mode
+        # Mirror MA's shuffle flag to the snapshot. Qobuz sometimes conveys
+        # shuffle changes via the snapshot alone (no preceding
+        # ``SRVR_RNDR_SET_SHUFFLE_MODE`` — observed for shuffle-OFF
+        # toggles), so without this MA's UI flag goes stale. The reconciler
+        # then rebuilds queue order to match the mirror, so we only need to
+        # flip the flag here.
+        player_id = self.bridge.target_player_id()
+        if player_id is not None:
+            self.bridge.set_shuffle_flag(player_id, snapshot.shuffle_mode)
         # Tracks just mutated — release the dedup gate so any prior
         # materialize (e.g. one that ran during the stale-tracks gap
         # between SET_STATE and this snapshot) doesn't silently swallow
