@@ -174,6 +174,21 @@ class MABridge:
         """Return the MA player object for ``player_id`` (or ``None``)."""
         return self._provider.mass.players.get_player(player_id)
 
+    async def set_shuffle(self, player_id: str, shuffle_enabled: bool) -> None:
+        """Toggle MA's queue shuffle from a cloud command."""
+        await self._provider.mass.player_queues.set_shuffle(player_id, shuffle_enabled)
+
+    def set_repeat(self, player_id: str, repeat_mode_value: str) -> None:
+        """Set MA's queue repeat mode from a cloud command.
+
+        Accepts MA's ``RepeatMode`` string value (``"off"`` / ``"one"`` /
+        ``"all"``) and constructs the enum at the bridge boundary so the
+        sync engine stays free of MA type imports.
+        """
+        from music_assistant_models.enums import RepeatMode  # noqa: PLC0415
+
+        self._provider.mass.player_queues.set_repeat(player_id, RepeatMode(repeat_mode_value))
+
     async def cmd_volume_set(self, player_id: str, volume: int) -> None:
         """Set the player's volume."""
         await self._provider.mass.players.cmd_volume_set(player_id, volume)
