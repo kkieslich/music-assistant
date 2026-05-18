@@ -104,6 +104,15 @@ from .state import (
 # so it can't leak.
 OUTBOUND_ACTION_TTL = 10.0
 
+# Translate MA's str-enum ``RepeatMode`` (off / one / all) to the Qobuz
+# int-enum ``LoopMode`` (OFF=1 / REPEAT_ONE=2 / REPEAT_ALL=3). Used by the
+# MA→cloud loop-mode emit path.
+_MA_REPEAT_TO_LOOP: dict[str, LoopMode] = {
+    "off": LoopMode.OFF,
+    "one": LoopMode.REPEAT_ONE,
+    "all": LoopMode.REPEAT_ALL,
+}
+
 
 def _detect_single_item_move(
     mirror_order: list[str], ma_order: list[str]
@@ -553,6 +562,51 @@ class QobuzConnectSyncEngine:
             queue_version=current_version,
         )
 
+    async def _maybe_emit_modes_to_cloud(self, queue: Any) -> None:
+        """Propagate MA-side loop + shuffle changes to the Qobuz cloud.
+
+        The cloud is the authority on these flags via
+        ``SRVR_RNDR_SET_LOOP_MODE`` / ``SRVR_RNDR_SET_SHUFFLE_MODE`` — until
+        now MA-side toggles never reached the app. Compares MA's current
+        ``repeat_mode`` / ``shuffle_enabled`` against the mirror; emits one
+        ``CTRL_SRVR_SET_LOOP_MODE`` / ``CTRL_SRVR_SET_SHUFFLE_MODE`` per
+        change, then optimistically updates the mirror so the next event
+        with the same value is a no-op.
+
+        The MA→cloud direction for both modes is best-effort: the cloud
+        echoes back via ``SRVR_CTRL_LOOP_MODE_SET`` / ``..._SHUFFLE_MODE_SET``
+        which we currently ignore (they're in the dispatcher's known-ignored
+        set, mostly because they're broadcast for *other* renderers and our
+        own echo is redundant once the mirror is updated optimistically).
+        """
+        session = self.bridge.session
+        if session is None:
+            return
+        # Map MA's str-enum ``RepeatMode`` to the cloud's int-enum
+        # ``LoopMode``. Fall through unmapped values without emitting.
+        ma_repeat = getattr(queue, "repeat_mode", None)
+        if ma_repeat is not None:
+            mapped = _MA_REPEAT_TO_LOOP.get(getattr(ma_repeat, "value", ma_repeat))
+            if mapped is not None and mapped != self.qobuz_state.loop_mode:
+                self.qobuz_state.loop_mode = mapped
+                await session.send_set_loop_mode(mapped)
+        ma_shuffle = getattr(queue, "shuffle_enabled", None)
+        if ma_shuffle is not None and bool(ma_shuffle) != self.qobuz_state.shuffle_mode:
+            new_shuffle = bool(ma_shuffle)
+            self.qobuz_state.shuffle_mode = new_shuffle
+            current_qid = (
+                self.qobuz_state.current_item.queue_item_id if self.qobuz_state.current_item else 0
+            )
+            action_uuid = self.register_outbound_action(
+                OutboundActionKind.SHUFFLE, self.qobuz_state.queue_version
+            )
+            await session.send_set_shuffle_mode(
+                shuffle_on=new_shuffle,
+                queue_version=self.qobuz_state.queue_version,
+                current_queue_item_id=current_qid,
+                action_uuid=action_uuid,
+            )
+
     async def handle_ma_queue_event(self, event: MassEvent) -> None:
         """React to MA queue updates that were not caused by Qobuz commands."""
         if self.origin == Origin.QOBUZ:
@@ -567,7 +621,14 @@ class QobuzConnectSyncEngine:
         if not player_id or event.object_id != player_id:
             return
         queue = event.data
-        if not queue or not getattr(queue, "current_item", None):
+        if not queue:
+            return
+        # Loop + shuffle propagation is queue-state-only — it doesn't
+        # depend on a current_item being set or on a playing track. Handle
+        # it before the playing-state gate below so toggling repeat /
+        # shuffle on an idle queue still reaches the cloud.
+        await self._maybe_emit_modes_to_cloud(queue)
+        if not getattr(queue, "current_item", None):
             return
         if queue.state not in (MAPlaybackState.PLAYING, MAPlaybackState.PAUSED):
             return

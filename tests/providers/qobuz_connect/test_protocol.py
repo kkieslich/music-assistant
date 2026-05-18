@@ -542,6 +542,35 @@ def test_encode_queue_reorder_tracks_round_trip() -> None:
     assert reorder.queueVersion.major == 10
 
 
+def test_encode_set_loop_mode_round_trip() -> None:
+    """CTRL_SRVR_SET_LOOP_MODE encodes the LoopMode int discriminator."""
+    codec = QobuzConnectCodec(DEVICE_UUID)
+    inner = _first_inner_message(codec.encode_set_loop_mode(LoopMode.REPEAT_ALL))
+    assert inner.messageType == QConnectMessageType.CTRL_SRVR_SET_LOOP_MODE
+    assert inner.HasField("ctrlSrvrSetLoopMode")
+    assert inner.ctrlSrvrSetLoopMode.mode == int(LoopMode.REPEAT_ALL)
+
+
+def test_encode_set_shuffle_mode_round_trip() -> None:
+    """CTRL_SRVR_SET_SHUFFLE_MODE carries shuffle flag + the playing anchor."""
+    codec = QobuzConnectCodec(DEVICE_UUID)
+    inner = _first_inner_message(
+        codec.encode_set_shuffle_mode(
+            shuffle_on=True,
+            queue_version=QueueVersion(major=12, minor=4),
+            current_queue_item_id=7,
+            action_uuid=ACTION_UUID,
+        )
+    )
+    assert inner.messageType == QConnectMessageType.CTRL_SRVR_SET_SHUFFLE_MODE
+    shuffle = inner.ctrlSrvrSetShuffleMode
+    assert shuffle.shuffleOn is True
+    assert shuffle.currentQueueItemId == 7
+    assert shuffle.actionUuid == ACTION_UUID
+    assert shuffle.queueVersion.major == 12
+    assert shuffle.queueVersion.minor == 4
+
+
 def test_encode_ask_for_queue_state_round_trip() -> None:
     """The queue-state ask must echo the queue version + carry the action UUID."""
     codec = QobuzConnectCodec(DEVICE_UUID)

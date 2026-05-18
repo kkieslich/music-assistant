@@ -261,6 +261,41 @@ class QobuzConnectCodec:
         msg.ctrlSrvrAskForQueueState.CopyFrom(ask)
         return self._encode_batch(msg)
 
+    def encode_set_loop_mode(self, mode: LoopMode) -> bytes:
+        """Encode ``CTRL_SRVR_SET_LOOP_MODE`` — tell the cloud our loop preference."""
+        loop = payload_pb2.CtrlSrvrSetLoopMode()
+        loop.mode = int(mode)
+        msg = payload_pb2.QConnectMessage()
+        msg.messageType = QConnectMessageType.CTRL_SRVR_SET_LOOP_MODE
+        msg.ctrlSrvrSetLoopMode.CopyFrom(loop)
+        return self._encode_batch(msg)
+
+    def encode_set_shuffle_mode(
+        self,
+        *,
+        shuffle_on: bool,
+        queue_version: QueueVersion,
+        current_queue_item_id: int,
+        action_uuid: bytes,
+    ) -> bytes:
+        """Encode ``CTRL_SRVR_SET_SHUFFLE_MODE`` — tell the cloud our shuffle preference.
+
+        The cloud needs the current queue_version + the queue_item_id of
+        whatever's playing right now so it can pin the playing track as the
+        shuffle anchor (it re-orders the rest around it instead of yanking
+        the audio).
+        """
+        shuffle = payload_pb2.CtrlSrvrSetShuffleMode()
+        shuffle.queueVersion.major = queue_version.major
+        shuffle.queueVersion.minor = queue_version.minor
+        shuffle.actionUuid = action_uuid
+        shuffle.shuffleOn = shuffle_on
+        shuffle.currentQueueItemId = current_queue_item_id
+        msg = payload_pb2.QConnectMessage()
+        msg.messageType = QConnectMessageType.CTRL_SRVR_SET_SHUFFLE_MODE
+        msg.ctrlSrvrSetShuffleMode.CopyFrom(shuffle)
+        return self._encode_batch(msg)
+
     def encode_clear_queue(self, queue_version: QueueVersion) -> bytes:
         """Encode ``CTRL_SRVR_CLEAR_QUEUE`` — drop all queue items."""
         clear = queue_pb2.CtrlSrvrClearQueue()

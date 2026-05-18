@@ -200,6 +200,11 @@ class QobuzConnectProvider(PluginProvider):
         self._ws_setup_lock = asyncio.Lock()
         self._unsubscribe_queue_events: Callable[[], None] | None = None
         self._unsubscribe_queue_items_events: Callable[[], None] | None = None
+        self._unsubscribe_player_events: Callable[[], None] | None = None
+        # Last value we pushed to the Qobuz cloud, so a MA ``PLAYER_UPDATED``
+        # event for an unchanged volume/mute doesn't trigger duplicate sends.
+        self._last_sent_volume: int | None = None
+        self._last_sent_muted: bool | None = None
 
     async def loaded_in_mass(self) -> None:
         """Start Qobuz Connect discovery after provider load."""
@@ -216,6 +221,18 @@ class QobuzConnectProvider(PluginProvider):
         self._unsubscribe_queue_items_events = self.mass.subscribe(
             self._on_ma_queue_items_event,
             EventType.QUEUE_ITEMS_UPDATED,
+        )
+        # PLAYER_UPDATED carries volume + mute changes from MA's UI. Without
+        # this subscription, MA-side slider drags never propagate to the
+        # Qobuz app and its volume display drifts away from MA's actual
+        # level — the cloud's view stays pinned at whatever we last sent
+        # via ``_broadcast_current_volume`` (only fired on connect /
+        # SET_ACTIVE). The result is the "huge volume drop" the user
+        # reported: cloud thinks MA is at 25, user moves Qobuz slider to
+        # 30, MA snaps from 75 to 30.
+        self._unsubscribe_player_events = self.mass.subscribe(
+            self._on_ma_player_updated,
+            EventType.PLAYER_UPDATED,
         )
         self._discovery = QobuzConnectDiscovery(
             device=self._device_config,
@@ -238,6 +255,9 @@ class QobuzConnectProvider(PluginProvider):
         if self._unsubscribe_queue_items_events is not None:
             self._unsubscribe_queue_items_events()
             self._unsubscribe_queue_items_events = None
+        if self._unsubscribe_player_events is not None:
+            self._unsubscribe_player_events()
+            self._unsubscribe_player_events = None
         await self._sync.stop()
         if self._session:
             await self._session.stop()
@@ -395,11 +415,17 @@ class QobuzConnectProvider(PluginProvider):
         if not self._session:
             return
         volume = self._initial_volume
+        muted: bool | None = None
         player_id = self.get_target_player_id()
         if player_id and (player := self.mass.players.get_player(player_id)):
             if player.state.volume_level is not None:
                 volume = player.state.volume_level
+            muted = player.state.volume_muted
         await self._session.send_volume_changed(volume)
+        self._last_sent_volume = volume
+        if muted is not None and muted != self._last_sent_muted:
+            await self._session.send_volume_muted(muted)
+            self._last_sent_muted = muted
 
     async def _on_ma_queue_event(self, event: MassEvent) -> None:
         """Forward MA queue updates into the Qobuz sync engine."""
@@ -408,6 +434,44 @@ class QobuzConnectProvider(PluginProvider):
     async def _on_ma_queue_items_event(self, event: MassEvent) -> None:
         """Forward MA queue-item mutations to the MA→Qobuz outbound differ."""
         await self._sync.handle_ma_queue_items_updated(event)
+
+    async def _on_ma_player_updated(self, event: MassEvent) -> None:
+        """Propagate MA-side volume + mute changes to the Qobuz cloud.
+
+        Fires for every ``PLAYER_UPDATED`` event MA emits. Filters on our
+        target player id and skips when:
+        - The session isn't up yet.
+        - The engine is in QOBUZ origin scope (= we're applying an inbound
+          ``SET_VOLUME``; the resulting MA event would otherwise echo
+          straight back to the cloud).
+        - The value hasn't actually changed since our last send (dedup).
+
+        Volume + mute live on the player state and share the same source
+        event, so both are handled here.
+        """
+        from .models import Origin  # noqa: PLC0415
+
+        if self._session is None:
+            return
+        if self._sync.origin == Origin.QOBUZ:
+            return
+        player_id = self.get_target_player_id()
+        if not player_id or event.object_id != player_id:
+            return
+        player = event.data
+        if player is None:
+            return
+        state = getattr(player, "state", None)
+        if state is None:
+            return
+        volume = state.volume_level
+        if volume is not None and volume != self._last_sent_volume:
+            await self._session.send_volume_changed(volume)
+            self._last_sent_volume = volume
+        muted = state.volume_muted
+        if muted is not None and muted != self._last_sent_muted:
+            await self._session.send_volume_muted(muted)
+            self._last_sent_muted = muted
 
     def get_qobuz_track_id_from_queue_item(self, queue_item: Any) -> str | None:
         """Extract a Qobuz provider track id from an MA QueueItem."""
