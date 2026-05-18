@@ -277,6 +277,63 @@ def test_parse_queue_state_snapshot() -> None:
     assert [t.track_id for t in parsed.autoplay_tracks] == ["2000001"]
 
 
+def test_parse_queue_state_snapshot_applies_shuffled_track_indexes() -> None:
+    """When ``shuffleMode=True``, parsed tracks follow ``shuffledTrackIndexes``.
+
+    The cloud's snapshot carries the *underlying* track list in ``tracks``
+    and the user-facing permutation in ``shuffledTrackIndexes``. Earlier
+    the parser surfaced only ``tracks``, so the mirror always saw the
+    unshuffled order and the reconciler force-reverted MA back to it
+    each time the Qobuz app reshuffled — the user observed MA and the
+    Qobuz app holding two different queue orders.
+    """
+    state_msg = payload_pb2.QConnectMessage()
+    state_msg.messageType = QConnectMessageType.SRVR_CTRL_QUEUE_STATE
+    state = state_msg.srvrCtrlQueueState
+    state.queueVersion.major = 1
+    state.queueVersion.minor = 11
+    state.actionUuid = ACTION_UUID
+    # tracks in their underlying order (0..3)
+    state.tracks.add(queueItemId=10, trackId=1000)
+    state.tracks.add(queueItemId=11, trackId=1001)
+    state.tracks.add(queueItemId=12, trackId=1002)
+    state.tracks.add(queueItemId=13, trackId=1003)
+    # cloud reports user-facing permutation: 2, 0, 3, 1
+    state.shuffleMode = True
+    state.shuffledTrackIndexes.extend([2, 0, 3, 1])
+
+    parsed = QobuzConnectCodec.parse_queue_state(state_msg)
+
+    assert parsed is not None
+    assert parsed.shuffle_mode is True
+    # tracks must follow the shuffled permutation, not the underlying order
+    assert [t.track_id for t in parsed.tracks] == ["1002", "1000", "1003", "1001"]
+
+
+def test_parse_queue_state_snapshot_ignores_shuffle_indexes_when_off() -> None:
+    """When ``shuffleMode=False``, the parser keeps the underlying track order."""
+    state_msg = payload_pb2.QConnectMessage()
+    state_msg.messageType = QConnectMessageType.SRVR_CTRL_QUEUE_STATE
+    state = state_msg.srvrCtrlQueueState
+    state.queueVersion.major = 1
+    state.queueVersion.minor = 12
+    state.actionUuid = ACTION_UUID
+    state.tracks.add(queueItemId=20, trackId=2000)
+    state.tracks.add(queueItemId=21, trackId=2001)
+    state.tracks.add(queueItemId=22, trackId=2002)
+    state.shuffleMode = False
+    # Even if the cloud sends shuffled indexes here we must ignore them
+    # while shuffle is off — otherwise toggling shuffle off would still
+    # leave MA's queue scrambled.
+    state.shuffledTrackIndexes.extend([2, 0, 1])
+
+    parsed = QobuzConnectCodec.parse_queue_state(state_msg)
+
+    assert parsed is not None
+    assert parsed.shuffle_mode is False
+    assert [t.track_id for t in parsed.tracks] == ["2000", "2001", "2002"]
+
+
 def test_parse_queue_tracks_inserted_delta() -> None:
     """INSERTED carries an insert-after anchor + new tracks + optional context UUID."""
     msg = payload_pb2.QConnectMessage()
