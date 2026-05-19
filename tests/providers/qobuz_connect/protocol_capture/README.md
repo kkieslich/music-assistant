@@ -82,6 +82,7 @@ Captures land in `.runs/<scenario>__client_a.json` and `…__client_b.json`.
 | `controller_burst_skip_throttled`     | Same as `controller_burst_skip` with B throttled (200ms RTT + 100kbps both ways)  | Burst under slow renderer (out-of-order arrivals; reconcile stress)  |
 | `controller_play_pause_rapid`         | A controls + B renders → 6× rapid play/pause toggles                              | State-flapping reconciliation                                        |
 | `controller_skip_then_seek`           | A controls + B renders → A skips next, waits ~150ms, then seeks to 60%           | Track-change reconcile vs. immediately-following playing seek        |
+| `controller_natural_track_advance`    | A controls + B renders → plays a *short* album, waits through track 1 → 2 advance | What does the cloud emit on auto-advance? Are bare position-only updates real? |
 
 `.runs/` is gitignored — captures contain personal Qobuz JWT auth tokens.
 If you ever need to commit a capture as a fixture, strip the auth bytes
@@ -120,6 +121,8 @@ protocol_capture/
 | `QOBUZ_CAPTURE_THROTTLE_LATENCY_MS`| Per-request latency injected on B in `controller_burst_skip_throttled` (default 200) |
 | `QOBUZ_CAPTURE_THROTTLE_DOWN_KBPS` | Download cap on B in `controller_burst_skip_throttled` (default 100) |
 | `QOBUZ_CAPTURE_THROTTLE_UP_KBPS`   | Upload cap on B in `controller_burst_skip_throttled` (default 100)   |
+| `QOBUZ_CAPTURE_NATURAL_ADVANCE_REMAINING_S` | Seconds left on track when `controller_natural_track_advance` jumps near end (default 8) |
+| `QOBUZ_CAPTURE_NATURAL_ADVANCE_WAIT_S`   | Idle wait after the jump (default 30s)                             |
 | `CAPTURE_HEADED`                   | Same as `--headed`; convenience for shell aliases                    |
 | `CAPTURE_SLOW_MO_MS`               | Same as `--slow-mo`                                                  |
 | `PWDEBUG`                          | Standard Playwright; opens the Inspector for selector tweaking       |

@@ -96,6 +96,34 @@ class CommandHandler:
         from .models import Origin  # noqa: PLC0415
         from .state import origin_scope  # noqa: PLC0415 — break import cycle
 
+        # Diagnostic trace for the natural-advance / post-advance scrub
+        # investigation. Logs every SET_STATE entry with all its fields plus
+        # the engine state at decision time. Remove once the post-advance
+        # scrub bug is understood.
+        cur = engine.qobuz_state.current_item
+        nxt = engine.qobuz_state.next_item
+        engine.bridge.logger.debug(
+            "set_state: event(state=%s pos=%s current=%s next=%s qv=%s) "
+            "engine(current=%s next=%s state=%s pos=%sms qobuz_position=%s) "
+            "is_command=%s is_position_only=%s",
+            event.playing_state,
+            event.position_ms,
+            f"{event.current_item.queue_item_id}:{event.current_item.track_id}"
+            if event.current_item
+            else "-",
+            f"{event.next_item.queue_item_id}:{event.next_item.track_id}"
+            if event.next_item
+            else "-",
+            event.queue_version,
+            f"{cur.queue_item_id}:{cur.track_id}" if cur else "-",
+            f"{nxt.queue_item_id}:{nxt.track_id}" if nxt else "-",
+            engine.qobuz_state.playing_state,
+            engine.qobuz_state.position_ms,
+            engine.qobuz_position.target_ms if engine.qobuz_position else None,
+            is_command_event,
+            is_position_only,
+        )
+
         async with origin_scope(engine, Origin.QOBUZ):
             if is_command_event:
                 engine._command_generation += 1
@@ -474,14 +502,21 @@ class CommandHandler:
 
     async def _handle_qobuz_position_only(self, position_ms: int, generation: int) -> None:
         engine = self._engine
+        logger = engine.bridge.logger
         if engine.qobuz_state.playing_state == PlayingState.PAUSED:
+            logger.debug(
+                "position_only: branch=paused-seek pos=%sms (qobuz state PAUSED)",
+                position_ms,
+            )
             engine.seek_pipeline.set_paused_seek(max(0, position_ms))
             return
         if engine.qobuz_state.playing_state == PlayingState.PLAYING:
             player_id = engine.bridge.target_player_id()
             if not player_id:
+                logger.debug("position_only: skip — no target player_id")
                 return
             queue = engine.bridge.get_queue(player_id)
+            ma_state = getattr(queue, "state", None) if queue else None
             local_ms = (
                 int(getattr(queue, "corrected_elapsed_time", 0) * 1000)
                 if queue and queue.state == MAPlaybackState.PLAYING
@@ -492,9 +527,28 @@ class CommandHandler:
                 and local_ms is not None
                 and abs(local_ms - position_ms) < SEEK_TOLERANCE_MS
             ):
+                logger.debug(
+                    "position_only: branch=already-aligned pos=%sms local=%sms",
+                    position_ms,
+                    local_ms,
+                )
                 engine.reporter.set_buffer_ok()
                 return
+            logger.debug(
+                "position_only: branch=schedule-playing-seek pos=%sms "
+                "(ma_state=%s local=%sms qobuz_position=%s)",
+                position_ms,
+                ma_state,
+                local_ms,
+                engine.qobuz_position.target_ms if engine.qobuz_position else None,
+            )
             engine.seek_pipeline.schedule_playing_seek(player_id, max(0, position_ms), generation)
+            return
+        logger.debug(
+            "position_only: skip — qobuz_state.playing_state=%s (not PLAYING/PAUSED) pos=%sms",
+            engine.qobuz_state.playing_state,
+            position_ms,
+        )
 
     # ---- MA queue replacement / prequeue ------------------------------
 
