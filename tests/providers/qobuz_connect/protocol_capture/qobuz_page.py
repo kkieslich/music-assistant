@@ -130,17 +130,173 @@ class QobuzPage:
 
     async def seek_to_fraction(self, fraction: float) -> None:
         """
-        Seek the player to a position by clicking the progress bar.
+        Seek the player by simulating a real mouse drag on the progress bar.
+
+        Direct-value approaches (native setter + ``input``/``change``
+        dispatch) do not stick: Qobuz's ``pointerdown`` handler reads
+        the current playback time and overwrites the input ``value``
+        back to that anchor in the same event tick. Diagnostics showed
+        ``before=9384 set=41140 after=82280`` — our 41140 was clobbered
+        to 82280 (= the live audio position) before our read.
+
+        The reliable path is to simulate the actual user gesture:
+        ``mousedown`` at the slider's current thumb position,
+        ``mousemove`` along the bar to the target x-coordinate (in
+        several steps so React processes intermediate values), then
+        ``mouseup``. The browser updates the input value organically
+        during the drag and Qobuz's ``pointerup`` handler reads that
+        final position and commits the seek.
 
         :param fraction: 0.0-1.0 fraction of the current track to seek to.
         """
-        scrubber = self.page.locator(".player__progressbar input[type='range']").first
-        box = await scrubber.bounding_box()
+        target = max(0.0, min(1.0, fraction))
+        slider = self.page.locator(".player__progressbar input[type='range']").first
+        box = await slider.bounding_box()
         if box is None:
             raise RuntimeError("Could not locate the player progress slider")
-        target_x = box["x"] + max(0.0, min(1.0, fraction)) * box["width"]
-        target_y = box["y"] + box["height"] / 2
-        await self.page.mouse.click(target_x, target_y)
+        # Anchor the drag at the current thumb position rather than the
+        # bar's far left — some implementations only treat motion *from*
+        # the thumb as a real drag.
+        before = await slider.evaluate(
+            "(el) => ({min: parseFloat(el.min || '0'), "
+            "max: parseFloat(el.max || '100'), value: parseFloat(el.value)})"
+        )
+        v_min = float(before["min"])
+        v_max = float(before["max"])
+        v_now = float(before["value"])
+        span = max(1.0, v_max - v_min)
+        start_frac = max(0.0, min(1.0, (v_now - v_min) / span))
+        start_x = box["x"] + start_frac * box["width"]
+        target_x = box["x"] + target * box["width"]
+        mid_y = box["y"] + box["height"] / 2
+        await self.page.mouse.move(start_x, mid_y)
+        await self.page.mouse.down()
+        steps = 12
+        for i in range(1, steps + 1):
+            x = start_x + (target_x - start_x) * (i / steps)
+            await self.page.mouse.move(x, mid_y)
+        await self.page.mouse.up()
+        after = await slider.evaluate("(el) => parseFloat(el.value)")
+        LOGGER.info(
+            "[%s] seek_to_fraction(%.2f) min=%s max=%s before=%s after=%s "
+            "(drag %.1fpx → %.1fpx at y=%.1f)",
+            self.label,
+            target,
+            v_min,
+            v_max,
+            v_now,
+            after,
+            start_x,
+            target_x,
+            mid_y,
+        )
+
+    async def jump_media_to_remaining(self, remaining_seconds: float) -> None:
+        """
+        Fast-forward the HTML5 media element to ``remaining_seconds`` before end.
+
+        Bypasses the player UI entirely — finds the underlying
+        ``<audio>``/``<video>`` element (searching shadow roots and
+        same-origin iframes) and sets ``currentTime`` directly. The Web
+        Client's media-event listeners drive the cloud-sync, so this
+        trips the same outbound traffic a real scrub would.
+
+        Must be called on the *renderer*'s page (the client that owns the
+        playing audio). After a Connect handoff the controller's page has
+        no media element, so calling this on the controller will fail
+        with ``no media element``.
+
+        :param remaining_seconds: Seconds of playback to leave between the
+            jump target and the end-of-track.
+        """
+        result = await self.page.evaluate(
+            """
+            (remainingSeconds) => {
+                // Depth-first search through a document, including
+                // every shadow root we can reach. Returns the first
+                // <audio> or <video> with a finite duration.
+                function findMediaIn(root) {
+                    if (!root) return null;
+                    const direct = root.querySelectorAll
+                        ? root.querySelectorAll('audio, video')
+                        : [];
+                    for (const m of direct) {
+                        if (isFinite(m.duration) && m.duration > 0) return m;
+                    }
+                    // Fall back: pick first match even without duration —
+                    // useful for diagnostics, the caller checks duration.
+                    if (direct.length > 0) return direct[0];
+                    // Walk shadow roots of every element under this root.
+                    const all = root.querySelectorAll
+                        ? root.querySelectorAll('*')
+                        : [];
+                    for (const el of all) {
+                        if (el.shadowRoot) {
+                            const found = findMediaIn(el.shadowRoot);
+                            if (found) return found;
+                        }
+                    }
+                    return null;
+                }
+                function findEverywhere() {
+                    let media = findMediaIn(document);
+                    if (media) return media;
+                    const iframes = document.querySelectorAll('iframe');
+                    for (const f of iframes) {
+                        try {
+                            const idoc = f.contentDocument;
+                            if (idoc) {
+                                media = findMediaIn(idoc);
+                                if (media) return media;
+                            }
+                        } catch (_) { /* cross-origin, skip */ }
+                    }
+                    return null;
+                }
+                const media = findEverywhere();
+                if (!media) {
+                    const iframeSrcs = Array.from(
+                        document.querySelectorAll('iframe')
+                    ).map(f => f.src);
+                    const hasWebAudio = typeof window.AudioContext !== 'undefined'
+                        || typeof window.webkitAudioContext !== 'undefined';
+                    return {ok: false, error: 'no media element', diag: {
+                        audiosAtRoot: document.querySelectorAll('audio').length,
+                        videosAtRoot: document.querySelectorAll('video').length,
+                        iframeCount: iframeSrcs.length,
+                        iframeSrcs,
+                        hasWebAudio,
+                        readyState: document.readyState,
+                        url: location.href,
+                    }};
+                }
+                if (!isFinite(media.duration) || media.duration <= 0) {
+                    return {ok: false, error: 'duration unknown',
+                            duration: media.duration,
+                            tagName: media.tagName,
+                            readyState: media.readyState,
+                            networkState: media.networkState,
+                            currentSrc: media.currentSrc};
+                }
+                const target = Math.max(0, media.duration - remainingSeconds);
+                media.currentTime = target;
+                return {ok: true, duration: media.duration,
+                        currentTime: media.currentTime, requested: target,
+                        tagName: media.tagName};
+            }
+            """,
+            remaining_seconds,
+        )
+        if not result.get("ok"):
+            raise RuntimeError(f"Could not jump media element on [{self.label}]: {result}")
+        LOGGER.info(
+            "[%s] jumped <%s> to %.2fs (duration=%.2fs, requested=%.2fs)",
+            self.label,
+            result["tagName"],
+            result["currentTime"],
+            result["duration"],
+            result["requested"],
+        )
 
     async def set_volume_percent(self, percent: int) -> None:
         """Set the volume by clicking on the volume rangeslider track."""

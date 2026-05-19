@@ -657,6 +657,34 @@ async def test_ma_natural_advance_promotes_known_qobuz_next_item() -> None:
 
 
 @pytest.mark.asyncio
+async def test_natural_advance_refreshes_duration_from_ma_queue() -> None:
+    """A natural promote-next must refresh ``qobuz_state.duration_ms``.
+
+    Without this the cloud keeps seeing the *previous* track's duration
+    after the advance and the Qobuz app caps the scrub slider there
+    (observed in production as "only scrub through 30s on a longer track
+    2"). MA's ``QueueItem.duration`` carries the new track's seconds, so
+    the promote reads from there.
+    """
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING, track_id="new-track")
+    queue.current_item.duration = 240  # 4:00 — the new track
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=1, track_id="old-track")
+    engine.qobuz_state.next_item = QueueTrackRef(queue_item_id=2, track_id="new-track")
+    engine.qobuz_state.playing_state = PlayingState.PLAYING
+    engine.qobuz_state.duration_ms = 30_000  # stale (old track was 30s)
+
+    await engine.handle_ma_queue_event(_event(queue))
+
+    assert engine.qobuz_state.duration_ms == 240_000, (
+        "Duration must update to the new track's duration on promote-next"
+    )
+    assert session.renderer_states[-1]["duration_ms"] == 240_000
+
+
+@pytest.mark.asyncio
 async def test_play_with_only_next_item_promotes_next_to_current() -> None:
     """Qobuz can send the selected item as nextQueueItem before PLAYING."""
     provider = _FakeProvider(_queue(PlaybackState.PAUSED, track_id="old"))

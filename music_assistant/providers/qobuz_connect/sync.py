@@ -618,47 +618,78 @@ class QobuzConnectSyncEngine:
 
     async def handle_ma_queue_event(self, event: MassEvent) -> None:
         """React to MA queue updates that were not caused by Qobuz commands."""
+        # Diagnostic trace: log every entry + which branch we took. Lets us
+        # see in a live MA log whether a natural track advance reaches us
+        # at all, which guard short-circuits it, and what current/next the
+        # mirror held at decision time. Remove once the natural-advance
+        # path is fully understood.
+        logger = self.bridge.logger
         if self.origin == Origin.QOBUZ:
+            logger.debug("ma_queue_event: skip — origin=QOBUZ")
             return
         if not self._is_active:
-            # The cloud told us we're no longer the active renderer. The
-            # post-deactivation ``stop`` and ``clear`` themselves emit MA
-            # queue events that would otherwise echo back to the cloud as
-            # MA-origin queue loads, undoing the handoff.
+            logger.debug("ma_queue_event: skip — not active")
             return
         player_id = self.bridge.target_player_id()
         if not player_id or event.object_id != player_id:
+            logger.debug(
+                "ma_queue_event: skip — object_id mismatch (event=%s target=%s)",
+                event.object_id,
+                player_id,
+            )
             return
         queue = event.data
         if not queue:
+            logger.debug("ma_queue_event: skip — no queue data")
             return
-        # Loop + shuffle propagation is queue-state-only — it doesn't
-        # depend on a current_item being set or on a playing track. Handle
-        # it before the playing-state gate below so toggling repeat /
-        # shuffle on an idle queue still reaches the cloud.
         await self._maybe_emit_modes_to_cloud(queue)
         if not getattr(queue, "current_item", None):
+            logger.debug("ma_queue_event: skip — queue.current_item is None")
             return
         if queue.state not in (MAPlaybackState.PLAYING, MAPlaybackState.PAUSED):
+            logger.debug(
+                "ma_queue_event: skip — queue.state=%s (not PLAYING/PAUSED)",
+                queue.state,
+            )
             return
         track_id = self.bridge.qobuz_track_id_for(queue.current_item)
         if not track_id:
+            logger.debug("ma_queue_event: skip — no qobuz track_id for current item")
             return
         if self.command_handler.is_reconciling():
+            logger.debug("ma_queue_event: skip — reconciling (ma_track_id=%s)", track_id)
             return
 
+        cur_id = self.qobuz_state.current_item.track_id if self.qobuz_state.current_item else None
+        next_id = self.qobuz_state.next_item.track_id if self.qobuz_state.next_item else None
+        logger.debug(
+            "ma_queue_event: ma_track=%s mirror_current=%s mirror_next=%s "
+            "qobuz_position=%s last_ma_origin=%s",
+            track_id,
+            cur_id,
+            next_id,
+            self.qobuz_position.target_ms if self.qobuz_position else None,
+            self._last_ma_origin_track_id,
+        )
+
         if self.qobuz_state.next_item and track_id == self.qobuz_state.next_item.track_id:
+            logger.debug("ma_queue_event: branch=promote-next (track matches mirror.next)")
             await self._sync_mirror_from_ma_queue(queue)
             await self.report_state(sync_from_ma=False)
             return
 
         if self.qobuz_state.current_item and self.qobuz_state.current_item.track_id == track_id:
+            logger.debug("ma_queue_event: branch=same-current (track matches mirror.current)")
             await self._sync_mirror_from_ma_queue(queue)
             await self.report_state()
             return
 
         if self._last_ma_origin_track_id == track_id:
+            logger.debug("ma_queue_event: skip — already sent ma-origin load for %s", track_id)
             return
+        logger.debug(
+            "ma_queue_event: branch=ma-origin-load (no match — track diverged from mirror)"
+        )
         self._last_ma_origin_track_id = track_id
         await self.queue_loader.send_ma_origin_load(track_id, queue)
 
@@ -952,6 +983,14 @@ class QobuzConnectSyncEngine:
             self.seek_pipeline.clear_pending_position()
             self.qobuz_state.position_ms = 0
             self.qobuz_state.position_timestamp_ms = int(time.time() * 1000)
+            # Refresh the duration we report to the cloud. Without this we
+            # keep reporting the old track's duration after a natural
+            # advance, and the Qobuz app caps the scrub slider at the
+            # previous track's length. ``QueueItem.duration`` is in
+            # seconds; the heartbeat ships ms. A missing/zero duration
+            # leaves the field at 0 (Qobuz handles unknown duration).
+            ma_duration_s = getattr(queue.current_item, "duration", None)
+            self.qobuz_state.duration_ms = int(ma_duration_s * 1000) if ma_duration_s else 0
         ma_playing_state = self._playing_state_from_ma_queue(queue)
         target_state = self.qobuz_state.playing_state
         is_confirmed = self._ma_state_confirms_qobuz_target(ma_playing_state, target_state)
