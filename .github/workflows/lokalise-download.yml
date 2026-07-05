@@ -22,6 +22,7 @@ permissions:
 
 jobs:
   download:
+    if: github.repository == 'music-assistant/server'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
