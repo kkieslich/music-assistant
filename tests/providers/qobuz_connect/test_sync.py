@@ -658,7 +658,8 @@ async def test_ma_natural_advance_promotes_known_qobuz_next_item() -> None:
 
 @pytest.mark.asyncio
 async def test_natural_advance_refreshes_duration_from_ma_queue() -> None:
-    """A natural promote-next must refresh ``qobuz_state.duration_ms``.
+    """
+    A natural promote-next must refresh ``qobuz_state.duration_ms``.
 
     Without this the cloud keeps seeing the *previous* track's duration
     after the advance and the Qobuz app caps the scrub slider there
@@ -1172,7 +1173,8 @@ async def test_handle_queue_state_replaces_mirror_tracks_and_flags() -> None:
 
 
 async def test_handle_queue_state_applies_shuffle_flag_to_ma_queue() -> None:
-    """Snapshot-only shuffle changes propagate to MA's queue flag.
+    """
+    Snapshot-only shuffle changes propagate to MA's queue flag.
 
     Qobuz sometimes conveys shuffle changes via ``QUEUE_STATE`` alone
     (no preceding ``SRVR_RNDR_SET_SHUFFLE_MODE``) — observed in production
@@ -1221,7 +1223,8 @@ async def test_handle_queue_tracks_added_appends_to_mirror() -> None:
 
 
 async def test_handle_mode_setters_update_mirror_and_propagate_to_ma() -> None:
-    """SET_LOOP/SHUFFLE update both the mirror *and* MA's queue.
+    """
+    SET_LOOP/SHUFFLE update both the mirror *and* MA's queue.
 
     User flipping repeat / shuffle in the Qobuz app should drag MA's
     queue along. Earlier the handlers were mirror-only — MA's state
@@ -1254,7 +1257,8 @@ async def test_handle_mode_setters_update_mirror_and_propagate_to_ma() -> None:
 
 @pytest.mark.asyncio
 async def test_cloud_loop_change_does_not_echo_back_to_cloud() -> None:
-    """Applying a cloud loop change must not bounce back through the outbound differ.
+    """
+    Applying a cloud loop change must not bounce back through the outbound differ.
 
     After ``handle_loop_mode`` updates the mirror + MA queue, MA's
     ``QUEUE_UPDATED`` fires reflecting the same value. Without an origin
@@ -1631,7 +1635,8 @@ async def test_session_state_triggers_ask_for_queue_state() -> None:
 
 @pytest.mark.asyncio
 async def test_set_state_triggers_ask_for_queue_state_when_session_state_missing() -> None:
-    """Renderer-role: cloud doesn't push SESSION_STATE, so SET_STATE qv triggers the ask.
+    """
+    Renderer-role: cloud doesn't push SESSION_STATE, so SET_STATE qv triggers the ask.
 
     The Qobuz Web Client captures show ``SESSION_STATE`` as the natural ask trigger,
     but the cloud only pushes it to clients in the controller role (user-login JWT).
@@ -1684,7 +1689,8 @@ async def test_ask_for_queue_state_coalesces_repeated_observations_at_same_qv() 
 
 @pytest.mark.asyncio
 async def test_ask_for_queue_state_re_fires_on_qv_bump() -> None:
-    """Every distinct ``queue_version`` the cloud announces triggers a fresh ask.
+    """
+    Every distinct ``queue_version`` the cloud announces triggers a fresh ask.
 
     The Qobuz app bumps ``queue_version`` on every queue mutation. Without
     re-asking, the mirror keeps the stale track list and the reconciler has
@@ -1765,7 +1771,8 @@ async def test_session_state_updates_mirror_queue_version() -> None:
 
 @pytest.mark.asyncio
 async def test_replace_loads_only_current_and_next_for_fast_first_audio() -> None:
-    """Initial replace must stay fast: current + next only, even if the snapshot is present.
+    """
+    Initial replace must stay fast: current + next only, even if the snapshot is present.
 
     The full snapshot is filled in via the background preload — see
     :func:`test_queue_state_snapshot_schedules_background_preload`.
@@ -1829,7 +1836,8 @@ async def test_replace_falls_back_to_current_next_without_snapshot() -> None:
 
 @pytest.mark.asyncio
 async def test_snapshot_arriving_during_set_state_bootstrap_runs_once() -> None:
-    """Snapshot arriving mid-SET_STATE-bootstrap must not double-trigger the reconciler.
+    """
+    Snapshot arriving mid-SET_STATE-bootstrap must not double-trigger the reconciler.
 
     Production race (May 17 22:02): SET_STATE arrives, ``_reconcile_task``
     spawns, ``_replace_ma_queue_from_qobuz`` awaits metadata. Snapshot
@@ -1899,7 +1907,8 @@ async def test_snapshot_arriving_during_set_state_bootstrap_runs_once() -> None:
 
 @pytest.mark.asyncio
 async def test_queue_state_snapshot_schedules_background_preload() -> None:
-    """Snapshot landing after SET_STATE must extend MA in the background, not restart it.
+    """
+    Snapshot landing after SET_STATE must extend MA in the background, not restart it.
 
     Production race: SET_STATE fills MA with 2 items, then QUEUE_STATE arrives
     80-300 ms later with the full list. The fix isn't a full re-load (which
@@ -1981,7 +1990,8 @@ async def test_queue_state_snapshot_schedules_background_preload() -> None:
 
 @pytest.mark.asyncio
 async def test_large_snapshot_materialized_in_single_update_items() -> None:
-    """Large snapshots must materialize in a single ``update_items`` — no UI flicker.
+    """
+    Large snapshots must materialize in a single ``update_items`` — no UI flicker.
 
     Earlier iterations chunked-added tracks via N calls to
     ``play_media(option=ADD)`` and ``insert_items``, each firing a MA
@@ -2217,7 +2227,8 @@ async def test_preload_cancels_on_new_set_state() -> None:
 
 @pytest.mark.asyncio
 async def test_skip_to_already_loaded_track_does_not_wipe_queue() -> None:
-    """Skip-to-track within the preloaded queue must use play_index, not replace.
+    """
+    Skip-to-track within the preloaded queue must use play_index, not replace.
 
     Mirrors plex_connect/player_remote.py:1187 (handle_skip_to) — when the
     controller picks a track already sitting in MA's queue, we jump via
@@ -2297,7 +2308,8 @@ async def test_skip_to_already_loaded_track_does_not_wipe_queue() -> None:
 
 @pytest.mark.asyncio
 async def test_replace_resets_preload_dedup_so_partial_queue_can_refill() -> None:
-    """If a replace wipes MA mid-preload, the dedup flag must be reset.
+    """
+    If a replace wipes MA mid-preload, the dedup flag must be reset.
 
     Scenario: snapshot is huge, preload is still in flight, user skip-tos
     a track that's in the snapshot but hasn't been added to MA yet.
@@ -2333,7 +2345,8 @@ async def test_replace_resets_preload_dedup_so_partial_queue_can_refill() -> Non
 
 @pytest.mark.asyncio
 async def test_natural_advance_then_metadata_set_state_preserves_preloaded_queue() -> None:
-    """Regression guard: metadata-only SET_STATE must never mutate MA's queue.
+    """
+    Regression guard: metadata-only SET_STATE must never mutate MA's queue.
 
     Before the bidirectional-sync rewrite this scenario ended in a 2-item
     queue after every track change, because ``_prequeue_next_item`` ran on
@@ -2519,7 +2532,8 @@ async def test_qobuz_app_removes_track_propagates_to_ma_queue() -> None:
 
 @pytest.mark.asyncio
 async def test_snapshot_loads_history_tracks_before_current_into_ma_queue() -> None:
-    """Tracks ahead of and *behind* ``current_idx`` in the Qobuz snapshot land in MA's queue.
+    """
+    Tracks ahead of and *behind* ``current_idx`` in the Qobuz snapshot land in MA's queue.
 
     Without history preservation, skipping back inside a 600-track playlist
     triggers a fresh ``QUEUE_LOAD_TRACKS`` round-trip. With it, the
@@ -2729,7 +2743,8 @@ async def test_reorder_does_not_disturb_audio() -> None:
 
 @pytest.mark.asyncio
 async def test_reorder_does_not_echo_to_cloud() -> None:
-    """The ``update_items`` call inside the reconciler runs under Origin.QOBUZ.
+    """
+    The ``update_items`` call inside the reconciler runs under Origin.QOBUZ.
 
     Without that scope, MA's ``QUEUE_ITEMS_UPDATED`` event would be picked
     up by our outbound differ and a wrong-direction ``REMOVE_TRACKS`` /
@@ -2894,7 +2909,8 @@ async def test_ma_appended_track_sends_queue_add_tracks_to_cloud() -> None:
 
 @pytest.mark.asyncio
 async def test_ma_forward_reorder_sends_reorder_tracks_to_cloud() -> None:
-    """User drags a track later in MA's queue → cloud gets one REORDER_TRACKS.
+    """
+    User drags a track later in MA's queue → cloud gets one REORDER_TRACKS.
 
     Mirror has [t1, t2, t3, t4]; user drags t2 to slot 3 → MA has [t1, t3, t4, t2].
     Detector recognizes this as a single-item move (src=1, dst=3) and emits
@@ -3069,7 +3085,8 @@ async def test_unrelated_error_does_not_resync() -> None:
 
 @pytest.mark.asyncio
 async def test_ma_reorder_emits_when_mirror_has_unresolvable_extras() -> None:
-    """Reorder detection works even when mirror carries items MA doesn't have.
+    """
+    Reorder detection works even when mirror carries items MA doesn't have.
 
     Some Qobuz playlists contain track_ids the metadata resolver can't
     fetch (404 / region-locked / etc.). The reconciler drops those, so
@@ -3117,7 +3134,8 @@ async def test_ma_reorder_emits_when_mirror_has_unresolvable_extras() -> None:
 
 @pytest.mark.asyncio
 async def test_qv_bump_before_snapshot_does_not_splice_stale_tracks_into_ma() -> None:
-    """SET_STATE with a new qv must not let stale mirror tracks leak into MA.
+    """
+    SET_STATE with a new qv must not let stale mirror tracks leak into MA.
 
     Production bug (May 17 23:58): user cleared the queue in Qobuz then
     started a one-track context. SET_STATE state=2 qv=67.1 arrived but
@@ -3209,7 +3227,8 @@ async def test_qv_bump_before_snapshot_does_not_splice_stale_tracks_into_ma() ->
 
 @pytest.mark.asyncio
 async def test_reconciler_preserves_duplicate_track_slots() -> None:
-    """A mirror with the same track_id at multiple positions must materialize all slots.
+    """
+    A mirror with the same track_id at multiple positions must materialize all slots.
 
     Earlier the materialize pass popped one MA item per track_id and
     skipped subsequent occurrences (the pool was empty AND
@@ -3335,7 +3354,8 @@ async def test_ma_event_during_qobuz_origin_does_not_emit_to_cloud() -> None:
 
 @pytest.mark.asyncio
 async def test_ma_items_event_during_active_reconcile_does_not_emit() -> None:
-    """While the MA-reconcile task is in flight, the outbound differ stays silent.
+    """
+    While the MA-reconcile task is in flight, the outbound differ stays silent.
 
     MA's queue diverges from the mirror mid-reconcile (we're surgically
     adding/removing items to catch up). A ``QUEUE_ITEMS_UPDATED`` event in

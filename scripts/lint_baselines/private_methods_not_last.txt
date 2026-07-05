@@ -61,6 +61,11 @@ music_assistant/providers/plex_connect/gdm.py	2
 music_assistant/providers/plex_connect/playback.py	10
 music_assistant/providers/plex_connect/queue_commands.py	3
 music_assistant/providers/plex_connect/server.py	8
+music_assistant/providers/qobuz_connect/__init__.py	1
+music_assistant/providers/qobuz_connect/command_handler.py	1
+music_assistant/providers/qobuz_connect/protocol.py	39
+music_assistant/providers/qobuz_connect/seek_pipeline.py	1
+music_assistant/providers/qobuz_connect/sync.py	18
 music_assistant/providers/qqmusic/__init__.py	22
 music_assistant/providers/samsung_wam/features/grouping/coordinator.py	1
 music_assistant/providers/samsung_wam/features/state_sync/handler.py	8

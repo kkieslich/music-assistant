@@ -1,0 +1,34 @@
+{
+  "config_entries": {
+    "target_player": {
+      "label": "Target Music Assistant player",
+      "options": {
+        "__auto__": "Auto (prefer playing player)"
+      }
+    },
+    "publish_name": {
+      "label": "Name shown in the Qobuz app"
+    },
+    "http_port": {
+      "label": "HTTP discovery port",
+      "description": "Port the Qobuz app connects to on this host. Change only if it clashes with another service or you need to open it explicitly through a firewall."
+    },
+    "max_quality": {
+      "label": "Maximum Qobuz quality to advertise",
+      "options": {
+        "27": "Hi-Res 192kHz/24 bit",
+        "7": "Hi-Res 96kHz/24 bit",
+        "6": "CD Quality 44.1kHz/16 bit",
+        "5": "MP3 320kbps",
+        "0": "Auto"
+      }
+    },
+    "initial_volume": {
+      "label": "Fallback connect volume",
+      "description": "Volume reported to the Qobuz app on connect when the target player's current volume can't be read (e.g. Auto mode with no player available). When a target player is known, its current volume is used instead."
+    }
+  },
+  "manifest": {
+    "description": "Makes Music Assistant appear as a device in the official Qobuz app via Qobuz Connect."
+  }
+}

@@ -126,7 +126,8 @@ _LOOP_TO_MA_REPEAT: dict[LoopMode, str] = {
 def _detect_single_item_move(
     mirror_order: list[str], ma_order: list[str]
 ) -> tuple[int, int] | None:
-    """Detect a single-item drag-reorder between two equal-set lists.
+    """
+    Detect a single-item drag-reorder between two equal-set lists.
 
     Returns ``(src_idx, dst_idx)`` where ``src_idx`` is the item's position
     in ``mirror_order`` and ``dst_idx`` is its new position in ``ma_order``,
@@ -355,7 +356,8 @@ class QobuzConnectSyncEngine:
             self._outbound_action_uuids.pop(uid, None)
 
     async def handle_ma_queue_items_updated(self, event: MassEvent) -> None:
-        """Propagate user-driven MA queue edits back to the Qobuz cloud.
+        """
+        Propagate user-driven MA queue edits back to the Qobuz cloud.
 
         Diffs MA's queue items against the mirror's view and emits the
         minimum ``CTRL_SRVR_QUEUE_*`` message(s) needed to bring the cloud
@@ -485,7 +487,8 @@ class QobuzConnectSyncEngine:
         )
 
     async def _emit_clear_queue(self, session: Any) -> None:
-        """Send ``CTRL_SRVR_CLEAR_QUEUE`` and update the mirror optimistically.
+        """
+        Send ``CTRL_SRVR_CLEAR_QUEUE`` and update the mirror optimistically.
 
         ``queue_version`` is sent as the *current* value — the cloud increments
         and broadcasts the new version itself via ``SRVR_CTRL_QUEUE_VERSION_CHANGED``.
@@ -530,7 +533,8 @@ class QobuzConnectSyncEngine:
         queue_item_ids: list[int],
         insert_after: int,
     ) -> None:
-        """Send ``CTRL_SRVR_QUEUE_REORDER_TRACKS`` with the current ``queue_version``.
+        """
+        Send ``CTRL_SRVR_QUEUE_REORDER_TRACKS`` with the current ``queue_version``.
 
         Optimistically applies the move to the mirror so the next reconcile
         pass is a no-op. Mirrors :meth:`handle_queue_tracks_reordered`'s
@@ -572,7 +576,8 @@ class QobuzConnectSyncEngine:
         )
 
     async def _maybe_emit_modes_to_cloud(self, queue: Any) -> None:
-        """Propagate MA-side loop + shuffle changes to the Qobuz cloud.
+        """
+        Propagate MA-side loop + shuffle changes to the Qobuz cloud.
 
         The cloud is the authority on these flags via
         ``SRVR_RNDR_SET_LOOP_MODE`` / ``SRVR_RNDR_SET_SHUFFLE_MODE`` — until
@@ -708,7 +713,8 @@ class QobuzConnectSyncEngine:
             await self.report_state()
 
     async def handle_queue_error(self, error: QueueError) -> None:
-        """Handle Qobuz queue command error and resync if it was one of ours.
+        """
+        Handle Qobuz queue command error and resync if it was one of ours.
 
         The cloud rejects ``CTRL_SRVR_QUEUE_*`` commands when their
         ``queue_version`` is stale — typically because a natural track
@@ -748,7 +754,8 @@ class QobuzConnectSyncEngine:
         await self.maybe_ask_for_queue_state()
 
     async def handle_session_state(self, event: SessionStateEvent) -> None:
-        """Apply a ``SRVR_CTRL_SESSION_STATE`` notification to the mirror + ask.
+        """
+        Apply a ``SRVR_CTRL_SESSION_STATE`` notification to the mirror + ask.
 
         The cloud emits ``SRVR_CTRL_QUEUE_STATE`` in response to an explicit
         ``CTRL_SRVR_ASK_FOR_QUEUE_STATE``. The Web Client captures show
@@ -763,7 +770,8 @@ class QobuzConnectSyncEngine:
         await self.maybe_ask_for_queue_state()
 
     async def maybe_ask_for_queue_state(self) -> None:
-        """Send ``CTRL_SRVR_ASK_FOR_QUEUE_STATE`` whenever the cloud advances ``queue_version``.
+        """
+        Send ``CTRL_SRVR_ASK_FOR_QUEUE_STATE`` whenever the cloud advances ``queue_version``.
 
         The cloud only emits ``SRVR_CTRL_QUEUE_STATE`` in response to an
         explicit ask. Every queue mutation in the Qobuz app bumps
@@ -860,7 +868,8 @@ class QobuzConnectSyncEngine:
         await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     def _absorb_cloud_qids_for_self_add(self, cloud_tracks: list[QueueTrackRef]) -> None:
-        """Patch cloud-assigned queue_item_ids onto our placeholder mirror entries.
+        """
+        Patch cloud-assigned queue_item_ids onto our placeholder mirror entries.
 
         When we sent ``CTRL_SRVR_QUEUE_ADD_TRACKS`` we registered placeholder
         ``QueueTrackRef(queue_item_id=0, track_id=X)`` entries on the mirror
@@ -897,7 +906,8 @@ class QobuzConnectSyncEngine:
         await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     async def handle_queue_cleared(self, _event: QueueClearedEvent) -> None:
-        """Apply a ``SRVR_CTRL_QUEUE_CLEARED`` notification, then reconcile MA.
+        """
+        Apply a ``SRVR_CTRL_QUEUE_CLEARED`` notification, then reconcile MA.
 
         Empties the mirror; the reconciler then removes every MA item that
         isn't the currently-playing one. Audio continues uninterrupted.
@@ -911,7 +921,8 @@ class QobuzConnectSyncEngine:
         await self.command_handler.schedule_reconcile_ma_to_mirror()
 
     async def handle_loop_mode(self, mode: LoopMode) -> None:
-        """Apply a renderer ``SET_LOOP_MODE`` command to mirror + MA queue.
+        """
+        Apply a renderer ``SET_LOOP_MODE`` command to mirror + MA queue.
 
         Wraps the MA mutation in ``Origin.QOBUZ`` so the resulting
         ``QUEUE_UPDATED`` event doesn't echo back through

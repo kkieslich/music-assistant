@@ -220,7 +220,8 @@ class SetStateEvent:
 
 @dataclass(slots=True)
 class SessionStateEvent:
-    """Decoded ``SRVR_CTRL_SESSION_STATE`` — the cloud's "you're connected" frame.
+    """
+    Decoded ``SRVR_CTRL_SESSION_STATE`` — the cloud's "you're connected" frame.
 
     Carries the queue identity (``queue_version``) the receiver must echo
     when sending ``CTRL_SRVR_ASK_FOR_QUEUE_STATE`` to obtain the full

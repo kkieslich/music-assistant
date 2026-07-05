@@ -278,7 +278,8 @@ def test_parse_queue_state_snapshot() -> None:
 
 
 def test_parse_queue_state_snapshot_applies_shuffled_track_indexes() -> None:
-    """When ``shuffleMode=True``, parsed tracks follow ``shuffledTrackIndexes``.
+    """
+    When ``shuffleMode=True``, parsed tracks follow ``shuffledTrackIndexes``.
 
     The cloud's snapshot carries the *underlying* track list in ``tracks``
     and the user-facing permutation in ``shuffledTrackIndexes``. Earlier
@@ -493,7 +494,8 @@ def test_parse_queue_error_and_version_change() -> None:
 
 
 def test_encode_subscribe_channels_session_uuid() -> None:
-    """SUBSCRIBE must carry the session_uuid in channels for the renderer role.
+    """
+    SUBSCRIBE must carry the session_uuid in channels for the renderer role.
 
     Empty channels works for controller-role Web Clients (user-login JWT) but
     the cloud closes our device-session JWT WS with a type-1 ERROR if we

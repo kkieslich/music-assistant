@@ -107,7 +107,8 @@ class QobuzConnectCodec:
         return self._pack_frame(OuterMessageType.AUTHENTICATE, msg.SerializeToString())
 
     def encode_subscribe(self, session_uuid: bytes) -> bytes:
-        """Encode websocket subscribe frame.
+        """
+        Encode websocket subscribe frame.
 
         Note on the captures: the reference Web Client sends SUBSCRIBE with
         empty channels, but it authenticates with a *user-login JWT* and
@@ -146,7 +147,8 @@ class QobuzConnectCodec:
         session_uuid: bytes,
         max_audio_quality: int,
     ) -> bytes:
-        """Encode renderer join-session message.
+        """
+        Encode renderer join-session message.
 
         The Qobuz Web Client doesn't send this (it's a controller role
         authenticating with a user JWT), but a renderer authenticating
@@ -245,7 +247,8 @@ class QobuzConnectCodec:
         queue_version: QueueVersion,
         queue_uuid: bytes,
     ) -> bytes:
-        """Encode ``CTRL_SRVR_ASK_FOR_QUEUE_STATE`` — request the full queue snapshot.
+        """
+        Encode ``CTRL_SRVR_ASK_FOR_QUEUE_STATE`` — request the full queue snapshot.
 
         ``queue_uuid`` is generated locally as an action correlator (mirrors
         the ``action_uuid`` pattern in :meth:`encode_queue_load_tracks`).
@@ -278,7 +281,8 @@ class QobuzConnectCodec:
         current_queue_item_id: int,
         action_uuid: bytes,
     ) -> bytes:
-        """Encode ``CTRL_SRVR_SET_SHUFFLE_MODE`` — tell the cloud our shuffle preference.
+        """
+        Encode ``CTRL_SRVR_SET_SHUFFLE_MODE`` — tell the cloud our shuffle preference.
 
         The cloud needs the current queue_version + the queue_item_id of
         whatever's playing right now so it can pin the playing track as the
@@ -642,7 +646,8 @@ class QobuzConnectCodec:
 
     @staticmethod
     def parse_queue_state(message: Any) -> QueueStateSnapshot | None:
-        """Parse a full ``SRVR_CTRL_QUEUE_STATE`` queue snapshot.
+        """
+        Parse a full ``SRVR_CTRL_QUEUE_STATE`` queue snapshot.
 
         The cloud carries the queue in two parts: ``tracks`` is the
         underlying (unshuffled) track list and ``shuffledTrackIndexes`` is
