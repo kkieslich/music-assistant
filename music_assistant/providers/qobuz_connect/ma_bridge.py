@@ -179,7 +179,8 @@ class MABridge:
         await self._provider.mass.player_queues.set_shuffle(player_id, shuffle_enabled)
 
     def set_shuffle_flag(self, player_id: str, shuffle_enabled: bool) -> None:
-        """Set ``PlayerQueue.shuffle_enabled`` without re-shuffling MA's items.
+        """
+        Set ``PlayerQueue.shuffle_enabled`` without re-shuffling MA's items.
 
         Used when applying a Qobuz ``QUEUE_STATE`` snapshot — the reconciler
         rebuilds queue order to match the mirror immediately after, so all
@@ -196,7 +197,8 @@ class MABridge:
             queue.shuffle_enabled = shuffle_enabled
 
     def set_repeat(self, player_id: str, repeat_mode_value: str) -> None:
-        """Set MA's queue repeat mode from a cloud command.
+        """
+        Set MA's queue repeat mode from a cloud command.
 
         Accepts MA's ``RepeatMode`` string value (``"off"`` / ``"one"`` /
         ``"all"``) and constructs the enum at the bridge boundary so the

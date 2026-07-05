@@ -101,7 +101,6 @@ async def get_config_entries(
         ConfigEntry(
             key=CONF_TARGET_PLAYER,
             type=ConfigEntryType.STRING,
-            label="Target Music Assistant player",
             default_value=PLAYER_ID_AUTO,
             required=True,
             options=[
@@ -117,26 +116,18 @@ async def get_config_entries(
         ConfigEntry(
             key=CONF_PUBLISH_NAME,
             type=ConfigEntryType.STRING,
-            label="Name shown in the Qobuz app",
             default_value="Music Assistant",
             required=True,
         ),
         ConfigEntry(
             key=CONF_HTTP_PORT,
             type=ConfigEntryType.INTEGER,
-            label="HTTP discovery port",
-            description=(
-                "Port the Qobuz app connects to on this host. "
-                "Change only if it clashes with another service or you need to open it "
-                "explicitly through a firewall."
-            ),
             default_value=8695,
             required=True,
         ),
         ConfigEntry(
             key=CONF_MAX_QUALITY,
             type=ConfigEntryType.STRING,
-            label="Maximum Qobuz quality to advertise",
             default_value="27",
             required=True,
             options=[
@@ -150,12 +141,6 @@ async def get_config_entries(
         ConfigEntry(
             key=CONF_INITIAL_VOLUME,
             type=ConfigEntryType.INTEGER,
-            label="Fallback connect volume",
-            description=(
-                "Volume reported to the Qobuz app on connect when the target player's "
-                "current volume can't be read (e.g. Auto mode with no player available). "
-                "When a target player is known, its current volume is used instead."
-            ),
             default_value=DEFAULT_INITIAL_VOLUME,
             required=True,
         ),
@@ -394,7 +379,8 @@ class QobuzConnectProvider(PluginProvider):
         await self._sync.set_volume_delta(delta)
 
     async def _on_set_active(self, active: bool) -> None:
-        """Handle SRVR_RNDR_SET_ACTIVE from the Qobuz cloud.
+        """
+        Handle SRVR_RNDR_SET_ACTIVE from the Qobuz cloud.
 
         Sent when the user picks a different renderer in the Qobuz app —
         we have to release the MA player so two devices don't keep streaming
@@ -436,7 +422,8 @@ class QobuzConnectProvider(PluginProvider):
         await self._sync.handle_ma_queue_items_updated(event)
 
     async def _on_ma_player_updated(self, event: MassEvent) -> None:
-        """Propagate MA-side volume + mute changes to the Qobuz cloud.
+        """
+        Propagate MA-side volume + mute changes to the Qobuz cloud.
 
         Fires for every ``PLAYER_UPDATED`` event MA emits. Filters on our
         target player id and skips when:

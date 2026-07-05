@@ -23,7 +23,7 @@ without falling through.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from .models import QConnectMessageType
 
@@ -233,7 +233,7 @@ class InboundDispatcher:
     # Dispatch table — populated below at class scope (`__class_getitem__`
     # style with the methods just defined). Keeps each branch one line
     # long and makes adding a new type a single entry.
-    _HANDLER_TABLE: dict[int, Any] = {}
+    _HANDLER_TABLE: ClassVar[dict[int, Any]] = {}
 
 
 InboundDispatcher._HANDLER_TABLE = {

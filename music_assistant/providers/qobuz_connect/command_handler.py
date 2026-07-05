@@ -148,7 +148,8 @@ class CommandHandler:
                 self._schedule_metadata_update(event, generation)
 
     def is_reconciling(self) -> bool:
-        """Return whether MA is still catching up to the latest Qobuz command.
+        """
+        Return whether MA is still catching up to the latest Qobuz command.
 
         Covers both the per-SET_STATE reconcile task and the snapshot-driven
         MA-reconcile task (formerly the preload). Both can have MA's queue
@@ -344,7 +345,8 @@ class CommandHandler:
         self._metadata_task = asyncio.create_task(self._run_metadata_update(event, generation))
 
     async def _run_metadata_update(self, event: SetStateEvent, generation: int) -> None:
-        """Resolve metadata for the announced track so playback start is smooth.
+        """
+        Resolve metadata for the announced track so playback start is smooth.
 
         Metadata-only ``SET_STATE`` frames (no playing_state, no position) used
         to also prequeue ``event.next_item`` via ``play_media(REPLACE_NEXT)``,
@@ -553,7 +555,8 @@ class CommandHandler:
     # ---- MA queue replacement / prequeue ------------------------------
 
     def _find_item_in_ma_queue(self, player_id: str, item: QueueTrackRef) -> int | None:
-        """Return the MA queue index for ``item`` if it is already loaded, else None.
+        """
+        Return the MA queue index for ``item`` if it is already loaded, else None.
 
         Lets ``_handle_qobuz_play`` short-circuit a full stop+clear+load
         cycle when the user is just skipping inside the same playlist that
@@ -634,7 +637,8 @@ class CommandHandler:
         current_item: QueueTrackRef,
         generation: int,
     ) -> tuple[list[Any], int]:
-        """Resolve current + next as MA tracks for the initial replace.
+        """
+        Resolve current + next as MA tracks for the initial replace.
 
         Returns ``(tracks, play_index)``. Always current + next only — the
         full snapshot is loaded by the background preload in
@@ -656,7 +660,8 @@ class CommandHandler:
         return tracks, 0
 
     async def schedule_reconcile_ma_to_mirror(self) -> None:
-        """Schedule a background pass that brings MA's queue in line with the mirror.
+        """
+        Schedule a background pass that brings MA's queue in line with the mirror.
 
         Triggered after any cloud-side queue change has updated the mirror
         (full ``SRVR_CTRL_QUEUE_STATE`` snapshot or any ``SRVR_CTRL_QUEUE_*``
@@ -720,7 +725,8 @@ class CommandHandler:
         current_item: QueueTrackRef,
         generation: int,
     ) -> None:
-        """Drive MA's queue toward the mirror with a single ``update_items`` call.
+        """
+        Drive MA's queue toward the mirror with a single ``update_items`` call.
 
         Earlier iterations ran four separate passes (remove_stale →
         add_missing → add_history → reorder), each calling ``play_media`` /

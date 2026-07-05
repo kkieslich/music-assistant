@@ -132,6 +132,7 @@ class QobuzConnectSession:
         self._should_run = False
         self._is_connected = False
         self._receive_task: asyncio.Task[None] | None = None
+        self._token_refresh_close_task: asyncio.Task[None] | None = None
         self._pending_messages: list[bytes] = []
         self._reconnect_delay = INITIAL_RECONNECT_DELAY
         self._cb = callbacks
@@ -160,7 +161,7 @@ class QobuzConnectSession:
             and self._ws
             and (previous_token != self._ws_token or previous_session_uuid != self._session_uuid)
         ):
-            asyncio.create_task(self._close_for_token_refresh())
+            self._token_refresh_close_task = asyncio.create_task(self._close_for_token_refresh())
 
     async def start(self) -> None:
         """Start websocket connection loop."""
@@ -181,6 +182,11 @@ class QobuzConnectSession:
             self._receive_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._receive_task
+        if self._token_refresh_close_task:
+            self._token_refresh_close_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._token_refresh_close_task
+            self._token_refresh_close_task = None
 
     async def send_renderer_state(
         self,
