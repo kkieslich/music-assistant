@@ -63,6 +63,22 @@ jobs:
           with open("pyproject.toml", "wb") as f:
               tomli_w.dump(data, f)
 
+      # Bundle the shared MA app credentials into the wheel so provider
+      # integrations (Qobuz, Spotify, ...) work out of the box in the image.
+      # The blob is stored as the APP_SECRETS_JSON repo secret; when it is not
+      # set (e.g. a downstream fork), the step is skipped and the build still
+      # succeeds with unprovisioned (empty) app vars.
+      - name: Provision app secrets
+        env:
+          APP_SECRETS_JSON: ${{ secrets.APP_SECRETS_JSON }}
+        run: |
+          if [ -n "$APP_SECRETS_JSON" ]; then
+            printf '%s' "$APP_SECRETS_JSON" > music_assistant/helpers/app_secrets.json
+            echo "Provisioned app_secrets.json ($(wc -c < music_assistant/helpers/app_secrets.json) bytes)"
+          else
+            echo "APP_SECRETS_JSON not set; skipping (app vars will resolve empty)"
+          fi
+
       - name: Build wheel
         run: python -m build
 
