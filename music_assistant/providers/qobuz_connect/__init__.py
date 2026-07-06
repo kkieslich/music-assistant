@@ -104,9 +104,11 @@ async def get_config_entries(
             default_value=PLAYER_ID_AUTO,
             required=True,
             options=[
-                ConfigValueOption("Auto (prefer playing player)", PLAYER_ID_AUTO),
+                # Static option title lives in strings.json; player names are
+                # dynamic data so their title is supplied inline.
+                ConfigValueOption(PLAYER_ID_AUTO),
                 *(
-                    ConfigValueOption(player.display_name, player.player_id)
+                    ConfigValueOption(player.player_id, title=player.display_name)
                     for player in sorted(
                         mass.players.all_players(False, False), key=lambda x: x.display_name
                     )
@@ -131,11 +133,13 @@ async def get_config_entries(
             default_value="27",
             required=True,
             options=[
-                ConfigValueOption("Hi-Res 192kHz/24 bit", "27"),
-                ConfigValueOption("Hi-Res 96kHz/24 bit", "7"),
-                ConfigValueOption("CD Quality 44.1kHz/16 bit", "6"),
-                ConfigValueOption("MP3 320kbps", "5"),
-                ConfigValueOption("Auto", str(AUTO_QUALITY)),
+                # Option titles are authored in strings.json (config_entries.
+                # max_quality.options.<value>); pass value-only here.
+                ConfigValueOption("27"),
+                ConfigValueOption("7"),
+                ConfigValueOption("6"),
+                ConfigValueOption("5"),
+                ConfigValueOption(str(AUTO_QUALITY)),
             ],
         ),
         ConfigEntry(
