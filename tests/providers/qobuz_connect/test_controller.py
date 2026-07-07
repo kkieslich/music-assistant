@@ -11,7 +11,9 @@ from music_assistant.providers.qobuz_connect.models import (
     DeviceConfig,
     QueueVersion,
     RendererRecord,
+    SessionRole,
 )
+from music_assistant.providers.qobuz_connect.session import SessionCallbacks
 
 DEVICE_UUID = uuid.UUID("11111111-2222-3333-4444-555555555555").bytes
 
@@ -123,3 +125,62 @@ async def test_play_item_sends_partial_player_state() -> None:
     assert name == "ctrl_player_state"
     assert kwargs["queue_item_id"] == 1
     assert kwargs["position_ms"] == 0
+
+
+async def test_on_disconnected_clears_registry_state() -> None:
+    """Losing the connection clears own/active renderer ids and is_connected."""
+    controller, _ = _controller()
+    await controller._on_add_renderer(RendererRecord(3, DEVICE_UUID, "Local Dev"))
+    await controller._on_active_renderer_changed(3)
+    assert controller.own_renderer_id == 3
+    assert controller.active_renderer_id == 3
+
+    await controller._on_disconnected()
+
+    assert controller.own_renderer_id is None
+    assert controller.active_renderer_id is None  # type: ignore[unreachable]
+    assert controller.is_connected is False
+
+
+async def test_start_wires_registry_callbacks_and_controller_role(monkeypatch: Any) -> None:
+    """start() constructs a real SessionCallbacks bound to our handlers, in CONTROLLER role."""
+    captured: dict[str, Any] = {}
+
+    class FakeSession:
+        """Records the constructor args and the start() call."""
+
+        def __init__(self, device: Any, callbacks: Any, *, token_refresher: Any, role: Any) -> None:
+            """Capture every constructor argument for assertion."""
+            captured["device"] = device
+            captured["callbacks"] = callbacks
+            captured["token_refresher"] = token_refresher
+            captured["role"] = role
+            self.started = False
+
+        async def start(self) -> None:
+            """Record that the session was started."""
+            self.started = True
+
+    monkeypatch.setattr(
+        "music_assistant.providers.qobuz_connect.session.QobuzConnectSession", FakeSession
+    )
+
+    device = DeviceConfig(
+        name="MA", uuid=str(uuid.uuid4()), http_port=8695, bind_address="0.0.0.0", max_quality=27
+    )
+
+    async def _refresher() -> None:
+        return None
+
+    controller = QobuzConnectController(device, DEVICE_UUID, _refresher, logging.getLogger("test"))
+    await controller.start()
+
+    assert captured["role"] is SessionRole.CONTROLLER
+    callbacks = captured["callbacks"]
+    assert isinstance(callbacks, SessionCallbacks)
+    assert callbacks.on_add_renderer == controller._on_add_renderer
+    assert callbacks.on_remove_renderer == controller._on_remove_renderer
+    assert callbacks.on_active_renderer_changed == controller._on_active_renderer_changed
+    assert callbacks.on_disconnected == controller._on_disconnected
+    assert controller._session is not None
+    assert controller._session.started is True  # type: ignore[attr-defined]

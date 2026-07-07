@@ -126,6 +126,10 @@ class SessionCallbacks:
     on_add_renderer: Callable[[RendererRecord], Awaitable[None]] | None = None
     on_remove_renderer: Callable[[int], Awaitable[None]] | None = None
     on_active_renderer_changed: Callable[[int], Awaitable[None]] | None = None
+    # Fired whenever the connection loop tears down the websocket (both on
+    # error and on a clean stop iteration); lets owners drop any state that
+    # is only valid while connected (e.g. renderer-registry ids).
+    on_disconnected: Callable[[], Awaitable[None]] | None = None
 
 
 class QobuzConnectSession:
@@ -557,6 +561,11 @@ class QobuzConnectSession:
             finally:
                 self._ws = None
                 self._is_connected = False
+                if self._cb.on_disconnected is not None:
+                    try:
+                        await self._cb.on_disconnected()
+                    except Exception:
+                        LOGGER.debug("on_disconnected callback failed", exc_info=True)
             if self._should_run and should_backoff:
                 await asyncio.sleep(self._reconnect_delay)
                 self._reconnect_delay = min(self._reconnect_delay * 2, MAX_RECONNECT_DELAY)
