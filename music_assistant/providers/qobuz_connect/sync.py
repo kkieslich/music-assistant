@@ -957,7 +957,20 @@ class QobuzConnectSyncEngine:
         """Set MA player volume from Qobuz app."""
         player_id = self._require_target_player_id()
         volume = max(0, min(100, int(level)))
+        player = self.bridge.get_player(player_id)
+        ptype = getattr(getattr(player, "state", None), "type", None)
+        before = getattr(player, "group_volume", None)
         await self.bridge.cmd_volume_set(player_id, volume)
+        after = getattr(self.bridge.get_player(player_id), "group_volume", None)
+        self.bridge.logger.debug(
+            "Qobuz->MA set_volume: recv=%s applied=%s player=%s type=%s group_volume %s->%s",
+            level,
+            volume,
+            player_id,
+            ptype,
+            before,
+            after,
+        )
         session = self.bridge.session
         if session:
             await session.send_volume_changed(volume)
