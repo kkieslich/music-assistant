@@ -26,6 +26,10 @@
     "initial_volume": {
       "label": "Fallback connect volume",
       "description": "Volume reported to the Qobuz app on connect when the target player's current volume can't be read (e.g. Auto mode with no player available). When a target player is known, its current volume is used instead."
+    },
+    "enable_controller": {
+      "label": "Sync MA-initiated playback to the Qobuz app",
+      "description": "Opens a second, controller-role connection to the Qobuz cloud (same device identity) so playback started from Music Assistant is mirrored in the Qobuz apps. Disable to fall back to receive-only behavior."
     }
   },
   "manifest": {
