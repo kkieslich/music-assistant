@@ -72,6 +72,9 @@ PING_INTERVAL = 10.0
 PONG_TIMEOUT = 30.0
 RECV_TIMEOUT = 1.0
 TOKEN_REFRESH_BUFFER = 60
+# When we have no valid token and a self-refresh attempt fails, wait this long
+# before retrying so a persistent failure (e.g. Qobuz logged out) doesn't spin.
+TOKEN_REFRESH_RETRY_DELAY = 30.0
 INITIAL_RECONNECT_DELAY = 1.0
 MAX_RECONNECT_DELAY = 60.0
 
@@ -119,9 +122,24 @@ class SessionCallbacks:
 class QobuzConnectSession:
     """Own the Qobuz cloud websocket and typed protocol events."""
 
-    def __init__(self, device: DeviceConfig, callbacks: SessionCallbacks) -> None:
-        """Initialize session."""
+    def __init__(
+        self,
+        device: DeviceConfig,
+        callbacks: SessionCallbacks,
+        token_refresher: Callable[[], Awaitable[JWTConnectToken | None]] | None = None,
+    ) -> None:
+        """
+        Initialize session.
+
+        :param device: The advertised Qobuz Connect device config.
+        :param callbacks: Inbound protocol event callbacks.
+        :param token_refresher: Optional coroutine that mints a fresh websocket
+            token independently of the app handshake. Called when the current
+            token is missing or about to expire so the cloud session survives
+            after the controlling app is closed.
+        """
         self.device = device
+        self._token_refresher = token_refresher
         self._device_uuid = _uuid_to_bytes(device.uuid)
         self._codec = QobuzConnectCodec(self._device_uuid)
         self._ws: ClientConnection | None = None
@@ -542,11 +560,30 @@ class QobuzConnectSession:
                 )
             ):
                 return True
+            # The app only hands us a short-lived token during the local
+            # handshake. Once it expires we mint a fresh one ourselves via the
+            # native Qobuz login instead of waiting for the app — otherwise the
+            # cloud session dies as soon as the controlling app is closed and
+            # can never be regained.
+            if self._token_refresher is not None:
+                refreshed = await self._token_refresher()
+                if refreshed and refreshed.is_valid():
+                    self._ws_token = refreshed
+                    self._token_version += 1
+                    continue
             token_version = self._token_version
             self._token_update_event.clear()
             if self._token_version != token_version:
                 continue
-            await self._token_update_event.wait()
+            # Bound the wait so a failed self-refresh is retried, and so a new
+            # app handshake (set_tokens) is still picked up promptly.
+            try:
+                await asyncio.wait_for(
+                    self._token_update_event.wait(),
+                    timeout=TOKEN_REFRESH_RETRY_DELAY,
+                )
+            except TimeoutError:
+                continue
         return False
 
     async def _close_for_token_refresh(self) -> None:
