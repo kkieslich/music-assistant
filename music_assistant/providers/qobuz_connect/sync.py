@@ -244,6 +244,21 @@ class QobuzConnectSyncEngine:
         """Position of the pending paused-seek, if any. Read-only convenience."""
         return self.paused_seek.position_ms if self.paused_seek else None
 
+    @property
+    def outbound_session(self) -> Any:
+        """
+        Session to use for MA→cloud controller verbs.
+
+        Prefers the controller-role connection (legitimate origin for
+        CTRL_SRVR_* commands); falls back to the renderer session, which
+        the cloud tolerates for queue *edits* (add/remove/reorder) but
+        not for self-driving loads.
+        """
+        controller = getattr(self.provider, "controller", None)
+        if controller is not None and controller.is_connected:
+            return controller.session
+        return self.bridge.session
+
     async def start(self) -> None:
         """Start the outbound heartbeat."""
         await self.reporter.start()
@@ -377,7 +392,7 @@ class QobuzConnectSyncEngine:
         player_id = self.bridge.target_player_id()
         if not player_id or event.object_id != player_id:
             return
-        session = self.bridge.session
+        session = self.outbound_session
         if session is None:
             return
 
@@ -593,7 +608,7 @@ class QobuzConnectSyncEngine:
         set, mostly because they're broadcast for *other* renderers and our
         own echo is redundant once the mirror is updated optimistically).
         """
-        session = self.bridge.session
+        session = self.outbound_session
         if session is None:
             return
         # Map MA's str-enum ``RepeatMode`` to the cloud's int-enum

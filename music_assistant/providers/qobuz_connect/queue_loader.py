@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 from music_assistant_models.enums import PlaybackState as MAPlaybackState
 
 from .models import (
+    OutboundActionKind,
     PlayingState,
     QueueError,
     QueueLoadAck,
@@ -62,6 +63,100 @@ class QueueLoader:
         self._engine = engine
 
     async def send_ma_origin_load(self, track_id: str, queue: Any) -> None:
+        """Push an MA-origin playback change to the Qobuz cloud."""
+        engine = self._engine
+        controller = getattr(engine.provider, "controller", None)
+        if controller is not None and controller.is_connected:
+            await self._send_controller_load(track_id, queue, controller)
+            return
+        await self._send_legacy_qweb_load(track_id, queue)
+
+    # ---- helpers --------------------------------------------------------
+
+    async def _send_controller_load(self, track_id: str, queue: Any, controller: Any) -> None:
+        """
+        Replace the cloud queue with MA's full queue via the controller role.
+
+        Mirrors the web client's mid-session album load: one
+        ``CTRL_SRVR_QUEUE_LOAD_TRACKS`` with every track id packed, then a
+        ``CTRL_SRVR_SET_PLAYER_STATE`` targeting the current item once the
+        cloud acks with its assigned queue-item ids.
+        """
+        engine = self._engine
+        player_id = engine.bridge.target_player_id()
+        if player_id is None:
+            return
+        items = list(engine.bridge.queue_items(player_id))
+        track_ids: list[int] = []
+        current_index: int | None = None
+        current_numeric = try_parse_qobuz_id(track_id)
+        if current_numeric is None:
+            engine.bridge.logger.debug(
+                "MA-origin controller load skipped: current track %s has no numeric id",
+                track_id,
+            )
+            return
+        for item in items:
+            numeric = try_parse_qobuz_id(engine.bridge.qobuz_track_id_for(item))
+            if numeric is None:
+                continue
+            if numeric == current_numeric and current_index is None:
+                current_index = len(track_ids)
+            track_ids.append(numeric)
+        if not track_ids:
+            return
+        if current_index is None:
+            current_index = 0
+        if not engine._is_active:
+            await controller.activate_self()
+        queue_version = QueueVersion(
+            engine.qobuz_state.queue_version.major,
+            engine.qobuz_state.queue_version.minor,
+        )
+        action_uuid = engine.register_outbound_action(OutboundActionKind.LOAD, queue_version)
+        future: asyncio.Future[QueueLoadAck | QueueError | None] = (
+            asyncio.get_running_loop().create_future()
+        )
+        engine._pending_queue_loads[action_uuid] = future
+        engine.bridge.logger.debug(
+            "MA-origin controller load: %d tracks, current index %d",
+            len(track_ids),
+            current_index,
+        )
+        sent = await controller.load_queue(
+            action_uuid=action_uuid,
+            track_ids=track_ids,
+            queue_version=queue_version,
+        )
+        if not sent:
+            engine._pending_queue_loads.pop(action_uuid, None)
+            engine._last_ma_origin_track_id = None
+            return
+        try:
+            result = await asyncio.wait_for(future, timeout=MA_QUEUE_LOAD_ACK_TIMEOUT_S)
+        except TimeoutError:
+            engine._pending_queue_loads.pop(action_uuid, None)
+            engine._last_ma_origin_track_id = None
+            engine.bridge.logger.warning(
+                "MA-origin controller load not acknowledged for track %s", track_id
+            )
+            return
+        if isinstance(result, QueueLoadAck):
+            if current_index < len(result.tracks):
+                await controller.play_item(
+                    result.queue_version, result.tracks[current_index].queue_item_id
+                )
+            engine.qobuz_state.playing_state = (
+                PlayingState.PLAYING
+                if queue.state == MAPlaybackState.PLAYING
+                else PlayingState.PAUSED
+            )
+            engine.reporter.set_buffer_ok()
+            await engine.report_state()
+        elif isinstance(result, QueueError):
+            engine._last_ma_origin_track_id = None
+
+    async def _send_legacy_qweb_load(self, track_id: str, queue: Any) -> None:
         """Send a ``CTRL_SRVR_QUEUE_LOAD_TRACKS`` for an MA-picked track."""
         engine = self._engine
         session = engine.bridge.session
@@ -117,8 +212,6 @@ class QueueLoader:
             await engine.report_state()
         elif isinstance(result, QueueError):
             engine._last_ma_origin_track_id = None
-
-    # ---- helpers --------------------------------------------------------
 
     def _context_uuid_for_ma_origin_load(self) -> bytes:
         """Return a valid 16-byte context UUID for the load command."""
