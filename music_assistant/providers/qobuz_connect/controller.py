@@ -113,6 +113,7 @@ class QobuzConnectController:
                 "on_add_renderer": self._on_add_renderer,
                 "on_remove_renderer": self._on_remove_renderer,
                 "on_active_renderer_changed": self._on_active_renderer_changed,
+                "on_disconnected": self._on_disconnected,
             },
         )
         values.update(renderer_callbacks)  # type: ignore[arg-type]
@@ -217,3 +218,9 @@ class QobuzConnectController:
 
     async def _on_active_renderer_changed(self, renderer_id: int) -> None:
         self._active_renderer_id = renderer_id
+
+    async def _on_disconnected(self) -> None:
+        if self._own_renderer_id is not None or self._active_renderer_id is not None:
+            self._logger.debug("Controller connection lost; clearing renderer-registry state")
+        self._own_renderer_id = None
+        self._active_renderer_id = None
