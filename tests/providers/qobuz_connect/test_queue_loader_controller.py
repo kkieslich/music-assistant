@@ -143,8 +143,8 @@ async def test_ma_origin_load_activates_self_when_inactive() -> None:
     assert controller.calls[0] == ("activate_self", None)
 
 
-async def test_ma_origin_load_falls_back_when_controller_unavailable() -> None:
-    """No controller -> the legacy qweb-style load path is used (bridge.session)."""
+async def test_ma_origin_load_falls_back_when_controller_disabled() -> None:
+    """No controller (disabled via config) -> the legacy qweb-style load path is used."""
 
     class FakeSession:
         """Records legacy qweb-style load calls."""
@@ -173,6 +173,40 @@ async def test_ma_origin_load_falls_back_when_controller_unavailable() -> None:
     await task
     assert session.calls
     assert session.calls[0]["qweb_track_session"] is True
+
+
+async def test_ma_origin_load_skips_and_warns_once_when_controller_disconnected(
+    caplog: Any,
+) -> None:
+    """Controller enabled but not connected -> skip (no legacy fallback), warn once."""
+    ref: dict[str, Any] = {}
+    controller = FakeController(ref)
+    controller.is_connected = False
+    engine = FakeEngine([_item("222")], controller)
+    ref["engine"] = engine
+    engine._last_ma_origin_track_id = "222"
+
+    class FakeSession:
+        """Fails the test if the legacy path is used."""
+
+        async def send_queue_load_tracks(self, **kwargs: Any) -> bool:
+            """Record the call so we can assert it was never made."""
+            raise AssertionError("legacy load path must not be used while reconnecting")
+
+    engine.bridge.session = FakeSession()
+    loader = QueueLoader(cast("Any", engine))
+
+    with caplog.at_level(logging.WARNING, logger="test"):
+        await loader.send_ma_origin_load("222", _queue_playing())
+        await loader.send_ma_origin_load("222", _queue_playing())
+
+    assert controller.calls == []
+    assert engine._last_ma_origin_track_id is None
+    warnings = [  # type: ignore[unreachable]
+        r for r in caplog.records if r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "controller connection unavailable" in warnings[0].message
 
 
 async def test_ma_origin_load_skips_items_without_numeric_ids() -> None:

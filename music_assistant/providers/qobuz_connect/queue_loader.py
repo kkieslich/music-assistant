@@ -49,27 +49,50 @@ def try_parse_qobuz_id(value: Any) -> int | None:
         return None
     try:
         return int(str(value))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
 class QueueLoader:
     """MA-origin queue-load round-trip with the Qobuz cloud."""
 
-    __slots__ = ("_engine",)
+    __slots__ = ("_engine", "_warned_controller_down")
 
     def __init__(self, engine: QobuzConnectSyncEngine) -> None:
         """Hold the engine for state + session access."""
         self._engine = engine
+        self._warned_controller_down = False
 
     async def send_ma_origin_load(self, track_id: str, queue: Any) -> None:
-        """Push an MA-origin playback change to the Qobuz cloud."""
+        """
+        Push an MA-origin playback change to the Qobuz cloud.
+
+        When the controller connection is disabled via config, this falls
+        back to the legacy renderer-socket load. When the controller is
+        enabled but not currently connected (reconnecting, or the
+        rendererId hasn't been discovered yet), the cloud push is skipped
+        entirely — local playback continues, but the Qobuz app won't see
+        the change mirrored until the controller reconnects. A single
+        warning is logged per outage rather than falling back, since
+        falling back would send a load on the wrong (renderer) socket.
+        """
         engine = self._engine
         controller = getattr(engine.provider, "controller", None)
-        if controller is not None and controller.is_connected:
-            await self._send_controller_load(track_id, queue, controller)
+        if controller is None:
+            await self._send_legacy_qweb_load(track_id, queue)
             return
-        await self._send_legacy_qweb_load(track_id, queue)
+        if not controller.is_connected:
+            if not self._warned_controller_down:
+                self._warned_controller_down = True
+                engine.bridge.logger.warning(
+                    "Qobuz Connect controller connection unavailable; "
+                    "MA-origin playback will not be mirrored to the Qobuz app "
+                    "until it reconnects"
+                )
+            engine._last_ma_origin_track_id = None
+            return
+        self._warned_controller_down = False
+        await self._send_controller_load(track_id, queue, controller)
 
     # ---- helpers --------------------------------------------------------
 
