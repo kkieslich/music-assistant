@@ -88,7 +88,7 @@ concern and is reachable from the engine via a single attribute
 | [`inbound_dispatcher.py`](inbound_dispatcher.py)       | Routing table: decoded inner message → typed callback                                                                             | ❌         | via proto      |
 | [`models.py`](models.py)                               | DTOs + enums shared across all of the above                                                                                       | ❌         | enum refs only |
 | [`state.py`](state.py)                                 | Ephemeral pending-action dataclasses (`PausedSeek`, `PendingPlayingSeek`, `PendingQobuzPosition`, `TrackRefKey`, `origin_scope`)   | ❌         | ❌              |
-| [`controller.py`](controller.py)                       | Persistent controller-role connection (dual-WS): renderer-registry tracking + the verb API (`load_queue`, `play_item`, `seek`, `set_playing`, `set_volume`, `set_mute`, `activate_self`) used by sync.py/queue_loader.py. No MA imports.  | ❌         | via session   |
+| [`controller.py`](controller.py)                       | Persistent controller-role connection (dual-WS): renderer-registry tracking + the verb API (`load_queue`, `play_item`, `seek`, `set_playing`, `set_volume`, `set_mute`, `activate_self`); the verb API is used by `queue_loader.py` (only). No MA imports.  | ❌         | via session   |
 | [`ma_bridge.py`](ma_bridge.py)                         | The one place sync.py touches Music Assistant — provider accessors + `mass.player_queues.*` / `mass.players.*`                    | ✅         | ❌              |
 | [`outbound_reporter.py`](outbound_reporter.py)         | Renderer→cloud emission: `report_state`, heartbeat, buffering reporter, wire-anchor logic                                         | via engine | ❌              |
 | [`seek_pipeline.py`](seek_pipeline.py)                 | Paused-seek storage, playing-seek debouncing, Qobuz-position confirmation                                                         | via engine | ❌              |
@@ -177,24 +177,29 @@ and renderer rejoin-on-error (below) recovers if it still happens.
 
 ### Controller verb map
 
-`controller.py` exposes the verb API the sync engine and `queue_loader.py`
-call; every verb goes out on the controller socket via `session.py`:
+`controller.py` exposes the verb API; every verb goes out on the
+controller socket via `session.py`. Only `queue_loader.py` calls into it
+today (`load_queue`, `play_item`, `activate_self`) — `set_playing`,
+`seek`, `set_volume` and `set_mute` are implemented but have no
+production callsite yet:
 
 | Verb                          | `controller.py` method | Wire message                                                        |
 |--------------------------------|-------------------------|-----------------------------------------------------------------------|
-| Pause / resume                 | `set_playing`           | `CTRL_SRVR_SET_PLAYER_STATE{playingState}`                            |
-| Seek                           | `seek`                  | `CTRL_SRVR_SET_PLAYER_STATE{currentPosition}` (position only)         |
+| Pause / resume                 | `set_playing`           | `CTRL_SRVR_SET_PLAYER_STATE{playingState}` (no callsite yet — verb available on QobuzConnectController) |
+| Seek                           | `seek`                  | `CTRL_SRVR_SET_PLAYER_STATE{currentPosition}` (position only) (no callsite yet — verb available on QobuzConnectController) |
 | Skip / play specific item      | `play_item`             | `CTRL_SRVR_SET_PLAYER_STATE{playingState, currentPosition: 0, currentQueueItem}` |
-| Volume                         | `set_volume`            | `CTRL_SRVR_SET_VOLUME{rendererId, volume}`                            |
-| Mute                           | `set_mute`              | `CTRL_SRVR_MUTE_VOLUME{rendererId, value}`                            |
+| Volume                         | `set_volume`            | `CTRL_SRVR_SET_VOLUME{rendererId, volume}` (no callsite yet — verb available on QobuzConnectController) |
+| Mute                           | `set_mute`              | `CTRL_SRVR_MUTE_VOLUME{rendererId, value}` (no callsite yet — verb available on QobuzConnectController) |
 | Become the active renderer     | `activate_self`         | `CTRL_SRVR_SET_ACTIVE_RENDERER{rendererId}`                           |
 | Queue replacement (MA-origin)  | `load_queue`            | `CTRL_SRVR_QUEUE_LOAD_TRACKS` — packed little-endian uint32 track ids in the (misnamed) `sessionUuid` field; the active renderer keeps rendering and switches to the new queue |
 
-`load_queue` is the only verb `queue_loader.py` calls directly
+`load_queue` is the only queue-load verb `queue_loader.py` calls directly
 (`_send_controller_load`); it falls back to the legacy renderer-socket
-`_send_legacy_qweb_load` when the controller is disabled or not
-connected — the `enable_controller` toggle promises today's (pre-dual-WS)
-behavior as a fallback path.
+`_send_legacy_qweb_load` only when the controller is disabled via the
+`enable_controller` config toggle. When the controller is enabled but not
+currently connected, MA-origin loads are skipped (not mirrored to the
+Qobuz app) rather than falling back — see "Controller-outage behavior" in
+`queue_loader.py`.
 
 ### Own-rendererId discovery
 
@@ -317,11 +322,11 @@ see "Controller connection (dual-WS)" below).
 |      28 | `RNDR_SRVR_MAX_AUDIO_QUALITY_CHANGED`    | `encode_max_audio_quality_changed`       | same                                                                                       |
 |      61 | `CTRL_SRVR_JOIN_SESSION`                 | `encode_ctrl_join_session`               | `controller.start()`, joining with the renderer's deviceUuid (shared-identity merge)      |
 |      62 | `CTRL_SRVR_SET_PLAYER_STATE` (full)      | `encode_player_state`                    | (method exists, no callsite — dead for now)                                                |
-|      62 | `CTRL_SRVR_SET_PLAYER_STATE` (partial)   | `encode_ctrl_set_player_state`           | `session.send_ctrl_player_state`, via `controller.play_item` / `set_playing` / `seek`     |
+|      62 | `CTRL_SRVR_SET_PLAYER_STATE` (partial)   | `encode_ctrl_set_player_state`           | `session.send_ctrl_player_state`, via `controller.play_item` (queue_loader.py, after MA-origin load ack); `set_playing`/`seek` (no callsite yet — verb available on QobuzConnectController) |
 |      63 | `CTRL_SRVR_SET_ACTIVE_RENDERER`          | `encode_set_active_renderer`             | `controller.activate_self` before an MA-origin load if we aren't the active renderer      |
-|      64 | `CTRL_SRVR_SET_VOLUME`                   | `encode_ctrl_set_volume`                 | `controller.set_volume`                                                                   |
-|      66 | `CTRL_SRVR_QUEUE_LOAD_TRACKS`            | `encode_queue_load_tracks`               | `queue_loader._send_controller_load` (controller connected) via `controller.load_queue`, else falls back to `queue_loader._send_legacy_qweb_load` (renderer socket, `enable_controller` off or controller unavailable) |
-|      73 | `CTRL_SRVR_MUTE_VOLUME`                  | `encode_ctrl_mute_volume`                | `controller.set_mute`                                                                     |
+|      64 | `CTRL_SRVR_SET_VOLUME`                   | `encode_ctrl_set_volume`                 | `controller.set_volume` (no callsite yet — verb available on QobuzConnectController)       |
+|      66 | `CTRL_SRVR_QUEUE_LOAD_TRACKS`            | `encode_queue_load_tracks`               | `queue_loader._send_controller_load` (controller connected) via `controller.load_queue`, else falls back to `queue_loader._send_legacy_qweb_load` (renderer socket, `enable_controller` off via config) |
+|      73 | `CTRL_SRVR_MUTE_VOLUME`                  | `encode_ctrl_mute_volume`                | `controller.set_mute` (no callsite yet — verb available on QobuzConnectController)         |
 |      79 | `CTRL_SRVR_AUTOPLAY_LOAD_TRACKS`         | `encode_autoplay_load_tracks`            | (method exists, no callsite — dead for now)                                                |
 |       — | `RNDR_SRVR_JOIN_SESSION`                 | `encode_join_session`                    | `session.start()` after SUBSCRIBE (renderer role only)                                    |
 
