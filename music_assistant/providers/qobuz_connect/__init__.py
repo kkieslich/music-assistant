@@ -48,11 +48,18 @@ from music_assistant_models.enums import ConfigEntryType, EventType
 from music_assistant_models.enums import PlaybackState as MAPlaybackState
 from music_assistant_models.errors import InvalidDataError
 
+from music_assistant.helpers.app_vars import app_var
 from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.qobuz import CONF_QUALITY as QOBUZ_CONF_QUALITY
 
 from .discovery import QobuzConnectDiscovery
-from .models import PROTOCOL_TO_QUALITY, QUALITY_TO_PROTOCOL, ConnectTokens, DeviceConfig
+from .models import (
+    PROTOCOL_TO_QUALITY,
+    QUALITY_TO_PROTOCOL,
+    ConnectTokens,
+    DeviceConfig,
+    JWTConnectToken,
+)
 from .session import QobuzConnectSession, SessionCallbacks
 from .sync import QobuzConnectSyncEngine
 
@@ -326,6 +333,7 @@ class QobuzConnectProvider(PluginProvider):
                     on_set_active=self._on_set_active,
                     on_session_state=self._sync.handle_session_state,
                 ),
+                token_refresher=self._refresh_ws_token,
             )
             self._session.set_tokens(tokens)
             await self._session.start()
@@ -382,6 +390,50 @@ class QobuzConnectProvider(PluginProvider):
         """Handle relative volume command from Qobuz."""
         await self._sync.set_volume_delta(delta)
 
+    async def _refresh_ws_token(self) -> JWTConnectToken | None:
+        """
+        Mint a fresh Qobuz Connect websocket token via the native Qobuz login.
+
+        The Qobuz app only hands the device a short-lived token during the local
+        handshake. This calls the same ``qws/createToken`` endpoint the Qobuz web
+        client uses, authenticated with the native Qobuz provider's logged-in
+        user token, so the cloud session survives token expiry without the app.
+        """
+        try:
+            qobuz_provider = self.get_qobuz_provider()
+        except InvalidDataError:
+            self.logger.warning("Cannot refresh Qobuz Connect token: Qobuz provider missing")
+            return None
+        auth_token = await qobuz_provider._auth_token()
+        if not auth_token:
+            self.logger.warning("Cannot refresh Qobuz Connect token: not logged in to Qobuz")
+            return None
+        try:
+            async with self.mass.http_session.post(
+                "https://www.qobuz.com/api.json/0.2/qws/createToken",
+                headers={
+                    "X-App-Id": app_var("qobuz_app_id"),
+                    "X-User-Auth-Token": auth_token,
+                },
+                data={"jwt": "jwt_qws"},
+            ) as response:
+                response.raise_for_status()
+                payload = await response.json()
+        except Exception as err:
+            self.logger.warning("Failed to refresh Qobuz Connect token: %s", err)
+            return None
+        jwt_qws = payload.get("jwt_qws") or {}
+        token = JWTConnectToken(
+            jwt=jwt_qws.get("jwt", ""),
+            exp=int(jwt_qws.get("exp", 0)),
+            endpoint=jwt_qws.get("endpoint", ""),
+        )
+        if not token.is_valid():
+            self.logger.warning("Qobuz createToken returned an invalid token payload")
+            return None
+        self.logger.debug("Refreshed Qobuz Connect websocket token (exp=%s)", token.exp)
+        return token
+
     async def _on_set_active(self, active: bool) -> None:
         """
         Handle SRVR_RNDR_SET_ACTIVE from the Qobuz cloud.
@@ -408,9 +460,12 @@ class QobuzConnectProvider(PluginProvider):
         muted: bool | None = None
         player_id = self.get_target_player_id()
         if player_id and (player := self.mass.players.get_player(player_id)):
-            if player.state.volume_level is not None:
-                volume = player.state.volume_level
-            muted = player.state.volume_muted
+            # group_volume/group_volume_muted resolve to the player's own level for
+            # a single player and to the aggregate for a sync group / group player,
+            # so this works whether the target is a plain player or a group.
+            if player.group_volume is not None:
+                volume = player.group_volume
+            muted = player.group_volume_muted
         await self._session.send_volume_changed(volume)
         self._last_sent_volume = volume
         if muted is not None and muted != self._last_sent_muted:
@@ -452,14 +507,15 @@ class QobuzConnectProvider(PluginProvider):
         player = event.data
         if player is None:
             return
-        state = getattr(player, "state", None)
-        if state is None:
-            return
-        volume = state.volume_level
+        # group_volume/group_volume_muted give the aggregate for a sync group /
+        # group player and the player's own level for a single player. The bare
+        # ``volume_level``/``volume_muted`` on a group are unset, which is why a
+        # sync-group target never synced its volume to the Qobuz app.
+        volume = getattr(player, "group_volume", None)
         if volume is not None and volume != self._last_sent_volume:
             await self._session.send_volume_changed(volume)
             self._last_sent_volume = volume
-        muted = state.volume_muted
+        muted = getattr(player, "group_volume_muted", None)
         if muted is not None and muted != self._last_sent_muted:
             await self._session.send_volume_muted(muted)
             self._last_sent_muted = muted
