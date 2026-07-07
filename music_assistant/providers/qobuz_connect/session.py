@@ -79,6 +79,7 @@ TOKEN_REFRESH_BUFFER = 60
 TOKEN_REFRESH_RETRY_DELAY = 30.0
 INITIAL_RECONNECT_DELAY = 1.0
 MAX_RECONNECT_DELAY = 60.0
+REJOIN_MIN_INTERVAL = 5.0
 
 
 class TokenRefreshRequired(Exception):
@@ -166,6 +167,7 @@ class QobuzConnectSession:
         self._token_refresh_close_task: asyncio.Task[None] | None = None
         self._pending_messages: list[bytes] = []
         self._reconnect_delay = INITIAL_RECONNECT_DELAY
+        self._last_rejoin_monotonic: float = 0.0
         self._cb = callbacks
         # Local import: inbound_dispatcher imports from this module
         # (SessionCallbacks), so we defer the import to break the cycle.
@@ -579,6 +581,7 @@ class QobuzConnectSession:
             await self._handle_payload(decoded.payload)
         elif decoded.msg_type.name == "ERROR":
             LOGGER.error("Qobuz websocket error %s: %s", decoded.error_code, decoded.error_message)
+            await self._maybe_rejoin_after_error()
         elif decoded.msg_type.name == "DISCONNECT":
             raise QobuzServerDisconnect
 
@@ -646,6 +649,35 @@ class QobuzConnectSession:
     async def _close_for_token_refresh(self) -> None:
         if self._ws:
             await self._ws.close()
+
+    async def _maybe_rejoin_after_error(self) -> None:
+        """
+        Re-register with the cloud after an inbound ERROR frame.
+
+        The cloud can silently deregister a renderer while its socket stays
+        open (observed when a shared-deviceUuid controller connection
+        disconnects) — every state report is then answered with a type-1
+        ERROR. Re-sending SUBSCRIBE + JOIN_SESSION restores registration.
+        Rate-limited so an ERROR storm can't loop.
+        """
+        if self.role is not SessionRole.RENDERER:
+            return
+        if not self._ws or not self._is_connected or not self._session_uuid:
+            return
+        now = time.monotonic()
+        if now - self._last_rejoin_monotonic < REJOIN_MIN_INTERVAL:
+            return
+        self._last_rejoin_monotonic = now
+        LOGGER.info("Qobuz Connect ERROR received — re-joining session as renderer")
+        await self._ws.send(self._codec.encode_subscribe(self._session_uuid))
+        await self._ws.send(
+            self._codec.encode_join_session(
+                self._device_uuid,
+                self.device.name,
+                self._session_uuid,
+                self.device.max_quality,
+            )
+        )
 
 
 def _token_expiring(token: JWTConnectToken, buffer_s: int) -> bool:
