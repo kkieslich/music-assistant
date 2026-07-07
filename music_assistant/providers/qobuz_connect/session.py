@@ -61,6 +61,8 @@ from .models import (
     QueueTracksRemovedEvent,
     QueueTracksReorderedEvent,
     QueueVersion,
+    RendererRecord,
+    SessionRole,
     SessionStateEvent,
     SetStateEvent,
 )
@@ -117,6 +119,12 @@ class SessionCallbacks:
     on_state_request: Callable[[], Awaitable[None]]
     on_set_active: Callable[[bool], Awaitable[None]]
     on_session_state: Callable[[SessionStateEvent], Awaitable[None]]
+    # Controller-role extras — only wired on the controller session; the
+    # renderer session leaves them None and the dispatcher keeps ignoring
+    # the corresponding broadcasts.
+    on_add_renderer: Callable[[RendererRecord], Awaitable[None]] | None = None
+    on_remove_renderer: Callable[[int], Awaitable[None]] | None = None
+    on_active_renderer_changed: Callable[[int], Awaitable[None]] | None = None
 
 
 class QobuzConnectSession:
@@ -127,6 +135,8 @@ class QobuzConnectSession:
         device: DeviceConfig,
         callbacks: SessionCallbacks,
         token_refresher: Callable[[], Awaitable[JWTConnectToken | None]] | None = None,
+        *,
+        role: SessionRole = SessionRole.RENDERER,
     ) -> None:
         """
         Initialize session.
@@ -137,9 +147,12 @@ class QobuzConnectSession:
             token independently of the app handshake. Called when the current
             token is missing or about to expire so the cloud session survives
             after the controlling app is closed.
+        :param role: Whether this session acts as a renderer (playback target) or
+            a controller (drives other renderers via the cloud session).
         """
         self.device = device
         self._token_refresher = token_refresher
+        self.role = role
         self._device_uuid = _uuid_to_bytes(device.uuid)
         self._codec = QobuzConnectCodec(self._device_uuid)
         self._ws: ClientConnection | None = None
@@ -183,7 +196,8 @@ class QobuzConnectSession:
 
     async def start(self) -> None:
         """Start websocket connection loop."""
-        if not self._ws_token or not self._ws_token.is_valid():
+        has_token = self._ws_token is not None and self._ws_token.is_valid()
+        if not has_token and self._token_refresher is None:
             LOGGER.error("Cannot start Qobuz Connect session without websocket token")
             return
         if self._should_run:
@@ -241,6 +255,7 @@ class QobuzConnectSession:
         autoplay_reset: bool = True,
         context_uuid: bytes | None = None,
         qweb_track_session: bool = False,
+        track_ids: list[int] | None = None,
     ) -> bool:
         """Ask the Qobuz cloud queue to load a track selected in MA."""
         return await self.send_message(
@@ -253,6 +268,7 @@ class QobuzConnectSession:
                 autoplay_reset=autoplay_reset,
                 context_uuid=context_uuid,
                 qweb_track_session=qweb_track_session,
+                track_ids=track_ids,
             )
         )
 
@@ -398,6 +414,38 @@ class QobuzConnectSession:
             )
         )
 
+    async def send_set_active_renderer(self, renderer_id: int) -> bool:
+        """Route cloud playback to ``renderer_id`` (controller role)."""
+        return await self.send_message(self._codec.encode_set_active_renderer(renderer_id))
+
+    async def send_ctrl_set_volume(self, renderer_id: int, volume: int) -> bool:
+        """Command absolute volume on a renderer (controller role)."""
+        return await self.send_message(self._codec.encode_ctrl_set_volume(renderer_id, volume))
+
+    async def send_ctrl_mute_volume(self, renderer_id: int, *, muted: bool) -> bool:
+        """Command mute state on a renderer (controller role)."""
+        return await self.send_message(
+            self._codec.encode_ctrl_mute_volume(renderer_id, muted=muted)
+        )
+
+    async def send_ctrl_player_state(
+        self,
+        *,
+        playing_state: PlayingState | None = None,
+        position_ms: int | None = None,
+        queue_version: QueueVersion | None = None,
+        queue_item_id: int | None = None,
+    ) -> bool:
+        """Send a partial ``CTRL_SRVR_SET_PLAYER_STATE`` (controller role)."""
+        return await self.send_message(
+            self._codec.encode_ctrl_set_player_state(
+                playing_state=playing_state,
+                position_ms=position_ms,
+                queue_version=queue_version,
+                queue_item_id=queue_item_id,
+            )
+        )
+
     async def send_volume_changed(self, volume: int) -> bool:
         """Report renderer volume to Qobuz."""
         return await self.send_message(self._codec.encode_volume_changed(volume))
@@ -462,7 +510,16 @@ class QobuzConnectSession:
                     self._ws = ws
                     self._is_connected = False
                     await ws.send(self._codec.encode_authenticate(self._ws_token.jwt))
-                    if self._session_uuid:
+                    if self.role is SessionRole.CONTROLLER:
+                        await ws.send(self._codec.encode_subscribe(None))
+                        await ws.send(
+                            self._codec.encode_ctrl_join_session(
+                                self._device_uuid,
+                                self.device.name,
+                                self.device.max_quality,
+                            )
+                        )
+                    elif self._session_uuid:
                         await ws.send(self._codec.encode_subscribe(self._session_uuid))
                         await ws.send(
                             self._codec.encode_join_session(
