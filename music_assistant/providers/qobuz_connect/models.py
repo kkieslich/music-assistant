@@ -85,6 +85,10 @@ class QConnectMessageType(IntEnum):
     SRVR_RNDR_SET_LOOP_MODE = 45
     SRVR_RNDR_SET_SHUFFLE_MODE = 46
     SRVR_RNDR_SET_AUTOPLAY_MODE = 47
+    CTRL_SRVR_JOIN_SESSION = 61
+    CTRL_SRVR_SET_PLAYER_STATE = 62
+    CTRL_SRVR_SET_ACTIVE_RENDERER = 63
+    CTRL_SRVR_SET_VOLUME = 64
     CTRL_SRVR_CLEAR_QUEUE = 65
     CTRL_SRVR_QUEUE_LOAD_TRACKS = 66
     CTRL_SRVR_QUEUE_INSERT_TRACKS = 67
@@ -93,11 +97,16 @@ class QConnectMessageType(IntEnum):
     CTRL_SRVR_QUEUE_REORDER_TRACKS = 70
     CTRL_SRVR_SET_SHUFFLE_MODE = 71
     CTRL_SRVR_SET_LOOP_MODE = 72
-    CTRL_SRVR_SET_PLAYER_STATE = 62
+    CTRL_SRVR_MUTE_VOLUME = 73
     CTRL_SRVR_ASK_FOR_QUEUE_STATE = 76
     CTRL_SRVR_ASK_FOR_RENDERER_STATE = 77
     CTRL_SRVR_AUTOPLAY_ADD_TRACKS = 79
     SRVR_CTRL_SESSION_STATE = 81
+    SRVR_CTRL_RENDERER_STATE_UPDATED = 82
+    SRVR_CTRL_ADD_RENDERER = 83
+    SRVR_CTRL_UPDATE_RENDERER = 84
+    SRVR_CTRL_REMOVE_RENDERER = 85
+    SRVR_CTRL_ACTIVE_RENDERER_CHANGED = 86
     SRVR_CTRL_QUEUE_ERROR_MESSAGE = 88
     SRVR_CTRL_QUEUE_CLEARED = 89
     SRVR_CTRL_QUEUE_STATE = 90
@@ -143,6 +152,13 @@ class Origin(StrEnum):
     QOBUZ = "qobuz"
     MA = "ma"
     ACK = "ack"
+
+
+class SessionRole(StrEnum):
+    """Role a cloud websocket connection declares via its JOIN message."""
+
+    RENDERER = "renderer"
+    CONTROLLER = "controller"
 
 
 @dataclass(slots=True)
@@ -233,6 +249,15 @@ class SessionStateEvent:
     session_id: int
     queue_version: QueueVersion
     track_index: int = 0
+
+
+@dataclass(slots=True)
+class RendererRecord:
+    """One renderer entry from the controller bootstrap (``SRVR_CTRL_ADD_RENDERER``)."""
+
+    renderer_id: int
+    device_uuid: bytes
+    friendly_name: str = ""
 
 
 @dataclass(slots=True)
