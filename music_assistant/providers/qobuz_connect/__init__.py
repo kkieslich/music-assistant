@@ -52,6 +52,7 @@ from music_assistant.helpers.app_vars import app_var
 from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.qobuz import CONF_QUALITY as QOBUZ_CONF_QUALITY
 
+from .controller import QobuzConnectController
 from .discovery import QobuzConnectDiscovery
 from .models import (
     PROTOCOL_TO_QUALITY,
@@ -78,6 +79,7 @@ CONF_PUBLISH_NAME = "publish_name"
 CONF_HTTP_PORT = "http_port"
 CONF_MAX_QUALITY = "max_quality"
 CONF_INITIAL_VOLUME = "initial_volume"
+CONF_ENABLE_CONTROLLER = "enable_controller"
 
 PLAYER_ID_AUTO = "__auto__"
 DEFAULT_INITIAL_VOLUME = 25
@@ -155,6 +157,12 @@ async def get_config_entries(
             default_value=DEFAULT_INITIAL_VOLUME,
             required=True,
         ),
+        ConfigEntry(
+            key=CONF_ENABLE_CONTROLLER,
+            type=ConfigEntryType.BOOLEAN,
+            default_value=True,
+            required=False,
+        ),
     )
 
 
@@ -192,6 +200,8 @@ class QobuzConnectProvider(PluginProvider):
         )
         self._discovery: QobuzConnectDiscovery | None = None
         self._session: QobuzConnectSession | None = None
+        self._enable_controller = bool(config.get_value(CONF_ENABLE_CONTROLLER))
+        self.controller: QobuzConnectController | None = None
         self._sync = QobuzConnectSyncEngine(self)
         self._ws_setup_lock = asyncio.Lock()
         self._unsubscribe_queue_events: Callable[[], None] | None = None
@@ -255,6 +265,9 @@ class QobuzConnectProvider(PluginProvider):
             self._unsubscribe_player_events()
             self._unsubscribe_player_events = None
         await self._sync.stop()
+        if self.controller is not None:
+            await self.controller.stop()
+            self.controller = None
         if self._session:
             await self._session.stop()
         if self._discovery:
@@ -308,6 +321,7 @@ class QobuzConnectProvider(PluginProvider):
                 self._session.set_tokens(tokens)
                 await self._broadcast_current_volume()
                 await self._session.send_quality_reports(self._max_quality)
+                await self._ensure_controller()
                 return
 
             self._session = QobuzConnectSession(
@@ -339,7 +353,21 @@ class QobuzConnectProvider(PluginProvider):
             await self._session.start()
             await self._broadcast_current_volume()
             await self._session.send_quality_reports(self._max_quality)
+            await self._ensure_controller()
             self.logger.info("Qobuz Connect WebSocket connected")
+
+    async def _ensure_controller(self) -> None:
+        """Start the controller-role connection if enabled and not yet running."""
+        if not self._enable_controller or self.controller is not None:
+            return
+        self.controller = QobuzConnectController(
+            self._device_config,
+            uuid.UUID(self._device_uuid).bytes,
+            self._refresh_ws_token,
+            self.logger,
+        )
+        await self.controller.start()
+        self.logger.info("Qobuz Connect controller connection started")
 
     async def _on_quality_change(self, new_quality: int) -> None:
         """Remember quality selected in Qobuz app."""
