@@ -51,6 +51,7 @@ from .models import (
     QueueTracksRemovedEvent,
     QueueTracksReorderedEvent,
     QueueVersion,
+    RendererRecord,
     SessionStateEvent,
     SetStateEvent,
 )
@@ -106,24 +107,22 @@ class QobuzConnectCodec:
         msg.jwt = jwt
         return self._pack_frame(OuterMessageType.AUTHENTICATE, msg.SerializeToString())
 
-    def encode_subscribe(self, session_uuid: bytes) -> bytes:
+    def encode_subscribe(self, session_uuid: bytes | None) -> bytes:
         """
         Encode websocket subscribe frame.
 
-        Note on the captures: the reference Web Client sends SUBSCRIBE with
-        empty channels, but it authenticates with a *user-login JWT* and
-        the cloud routes events to it as a *controller*. We authenticate
-        with a *device-session JWT* from ``/connect`` and the cloud routes
-        events to us as a *renderer*; that role apparently requires the
-        session UUID in the channel list — switching to empty channels
-        caused the cloud to reject the handshake with a type-1 ERROR
-        immediately on connect (May 2026 local test).
+        :param session_uuid: Channel to subscribe to. Renderers pass the
+            session UUID from the app handshake; controllers pass ``None``
+            (empty channel list). The role itself is declared by the JOIN
+            message that follows, not by the subscription (verified against
+            web-client captures, 2026-07-07).
         """
         msg = envelope_pb2.Subscribe()
         msg.msgId = self._next_msg_id()
         msg.msgDate = self.now_ms()
         msg.proto = QCONNECT_PROTO
-        msg.channels.append(session_uuid)
+        if session_uuid is not None:
+            msg.channels.append(session_uuid)
         return self._pack_frame(OuterMessageType.SUBSCRIBE, msg.SerializeToString())
 
     def encode_payload(
@@ -155,19 +154,7 @@ class QobuzConnectCodec:
         with a device-session JWT from ``/connect`` must — otherwise the
         cloud closes the WS with a type-1 ERROR after the SUBSCRIBE.
         """
-        device_info = common_pb2.DeviceInfo()
-        device_info.deviceUuid = device_uuid
-        device_info.friendlyName = friendly_name
-        device_info.brand = "Music Assistant"
-        device_info.model = "Qobuz Connect"
-        device_info.type = common_pb2.DEVICE_TYPE_SPEAKER
-        device_info.softwareVersion = "ma-qobuz-connect"
-
-        caps = common_pb2.DeviceCapabilities()
-        caps.minAudioQuality = 1
-        caps.maxAudioQuality = QUALITY_TO_PROTOCOL.get(max_audio_quality, 4)
-        caps.volumeRemoteControl = 2
-        device_info.capabilities.CopyFrom(caps)
+        device_info = self._build_device_info(device_uuid, friendly_name, max_audio_quality)
 
         join = payload_pb2.RndrSrvrJoinSession()
         join.sessionUuid = session_uuid
@@ -178,6 +165,25 @@ class QobuzConnectCodec:
         msg = payload_pb2.QConnectMessage()
         msg.messageType = QConnectMessageType.RNDR_SRVR_JOIN_SESSION
         msg.rndrSrvrJoinSession.CopyFrom(join)
+        return self._encode_batch(msg)
+
+    def encode_ctrl_join_session(self, device_uuid: bytes, name: str, max_quality: int) -> bytes:
+        """
+        Encode ``CTRL_SRVR_JOIN_SESSION`` — the controller-role hello.
+
+        :param device_uuid: Device identity; pass the renderer's uuid so the
+            cloud merges this connection into the existing renderer entry
+            instead of adding a duplicate picker entry.
+        :param name: Friendly name (only used if no renderer entry exists yet).
+        :param max_quality: Qobuz quality id (5/6/7/27) for the capabilities.
+        """
+        device_info = self._build_device_info(device_uuid, name, max_quality)
+
+        join = payload_pb2.CtrlSrvrJoinSession()
+        join.deviceInfo.CopyFrom(device_info)
+        msg = payload_pb2.QConnectMessage()
+        msg.messageType = QConnectMessageType.CTRL_SRVR_JOIN_SESSION
+        msg.ctrlSrvrJoinSession.CopyFrom(join)
         return self._encode_batch(msg)
 
     def encode_renderer_state(
@@ -221,13 +227,25 @@ class QobuzConnectCodec:
         autoplay_reset: bool = True,
         context_uuid: bytes | None = None,
         qweb_track_session: bool = False,
+        track_ids: list[int] | None = None,
     ) -> bytes:
-        """Encode controller queue-load command."""
+        """
+        Encode controller queue-load command.
+
+        :param track_ids: Full replacement track list; packed little-endian
+            into wire field 3 (misnamed ``sessionUuid`` in the
+            reverse-engineered proto — it carries track ids, verified
+            against web-client captures).
+        """
         queue_load = queue_pb2.CtrlSrvrQueueLoadTracks()
         queue_load.queueVersion.major = queue_version.major
         queue_load.queueVersion.minor = queue_version.minor
         queue_load.actionUuid = action_uuid
-        if qweb_track_session:
+        if track_ids is not None:
+            queue_load.sessionUuid = b"".join(
+                tid.to_bytes(4, "little", signed=False) for tid in track_ids
+            )
+        elif qweb_track_session:
             queue_load.sessionUuid = int(track_id).to_bytes(4, "little", signed=False)
         if qobuz_reference_id is not None:
             queue_load.queuePosition = queue_position
@@ -449,6 +467,64 @@ class QobuzConnectCodec:
         msg = payload_pb2.QConnectMessage()
         msg.messageType = QConnectMessageType.CTRL_SRVR_SET_PLAYER_STATE
         msg.ctrlSrvrSetPlayerState.CopyFrom(state)
+        return self._encode_batch(msg)
+
+    def encode_ctrl_set_player_state(
+        self,
+        *,
+        playing_state: PlayingState | None = None,
+        position_ms: int | None = None,
+        queue_version: QueueVersion | None = None,
+        queue_item_id: int | None = None,
+    ) -> bytes:
+        """
+        Encode ``CTRL_SRVR_SET_PLAYER_STATE`` with only the given fields.
+
+        The web client sends partial frames: pause/resume set only
+        ``playingState``, seek sets only ``currentPosition``, and
+        play-this-item sets all three (position 0).
+        """
+        state = payload_pb2.CtrlSrvrSetPlayerState()
+        if playing_state is not None:
+            state.playingState = int(playing_state)
+        if position_ms is not None:
+            state.currentPosition = position_ms
+        if queue_item_id is not None and queue_version is not None:
+            state.currentQueueItem.queueVersion.major = queue_version.major
+            state.currentQueueItem.queueVersion.minor = queue_version.minor
+            state.currentQueueItem.id = queue_item_id
+        msg = payload_pb2.QConnectMessage()
+        msg.messageType = QConnectMessageType.CTRL_SRVR_SET_PLAYER_STATE
+        msg.ctrlSrvrSetPlayerState.CopyFrom(state)
+        return self._encode_batch(msg)
+
+    def encode_set_active_renderer(self, renderer_id: int) -> bytes:
+        """Encode ``CTRL_SRVR_SET_ACTIVE_RENDERER`` — route playback to ``renderer_id``."""
+        set_active = payload_pb2.CtrlSrvrSetActiveRenderer()
+        set_active.rendererId = renderer_id
+        msg = payload_pb2.QConnectMessage()
+        msg.messageType = QConnectMessageType.CTRL_SRVR_SET_ACTIVE_RENDERER
+        msg.ctrlSrvrSetActiveRenderer.CopyFrom(set_active)
+        return self._encode_batch(msg)
+
+    def encode_ctrl_set_volume(self, renderer_id: int, volume: int) -> bytes:
+        """Encode ``CTRL_SRVR_SET_VOLUME`` — command absolute volume on a renderer."""
+        set_volume = payload_pb2.CtrlSrvrSetVolume()
+        set_volume.rendererId = renderer_id
+        set_volume.volume = volume
+        msg = payload_pb2.QConnectMessage()
+        msg.messageType = QConnectMessageType.CTRL_SRVR_SET_VOLUME
+        msg.ctrlSrvrSetVolume.CopyFrom(set_volume)
+        return self._encode_batch(msg)
+
+    def encode_ctrl_mute_volume(self, renderer_id: int, *, muted: bool) -> bytes:
+        """Encode ``CTRL_SRVR_MUTE_VOLUME`` — command mute state on a renderer."""
+        mute = payload_pb2.CtrlSrvrMuteVolume()
+        mute.rendererId = renderer_id
+        mute.value = muted
+        msg = payload_pb2.QConnectMessage()
+        msg.messageType = QConnectMessageType.CTRL_SRVR_MUTE_VOLUME
+        msg.ctrlSrvrMuteVolume.CopyFrom(mute)
         return self._encode_batch(msg)
 
     def encode_volume_changed(self, volume: int) -> bytes:
@@ -779,6 +855,32 @@ class QobuzConnectCodec:
         evt = message.srvrRndrSetAutoplayMode
         return evt.autoplayOn if evt.HasField("autoplayOn") else None
 
+    @staticmethod
+    def parse_add_renderer(msg: Any) -> RendererRecord | None:
+        """Parse ``SRVR_CTRL_ADD_RENDERER`` into a :class:`RendererRecord`."""
+        if not msg.HasField("srvrCtrlAddRenderer"):
+            return None
+        add = msg.srvrCtrlAddRenderer
+        return RendererRecord(
+            renderer_id=add.rendererId,
+            device_uuid=bytes(add.renderer.deviceUuid),
+            friendly_name=add.renderer.friendlyName,
+        )
+
+    @staticmethod
+    def parse_remove_renderer(msg: Any) -> int | None:
+        """Parse ``SRVR_CTRL_REMOVE_RENDERER`` into the removed renderer id."""
+        if not msg.HasField("srvrCtrlRemoveRenderer"):
+            return None
+        return int(msg.srvrCtrlRemoveRenderer.rendererId)
+
+    @staticmethod
+    def parse_active_renderer_changed(msg: Any) -> int | None:
+        """Parse ``SRVR_CTRL_ACTIVE_RENDERER_CHANGED`` into the new active id."""
+        if not msg.HasField("srvrCtrlActiveRendererChanged"):
+            return None
+        return int(msg.srvrCtrlActiveRendererChanged.rendererId)
+
     def encode_volume_muted(self, muted: bool) -> bytes:
         """Encode a renderer ``RNDR_SRVR_VOLUME_MUTED`` event for the Qobuz app."""
         body = payload_pb2.RndrSrvrVolumeMuted()
@@ -787,6 +889,23 @@ class QobuzConnectCodec:
         msg.messageType = QConnectMessageType.RNDR_SRVR_VOLUME_MUTED
         msg.rndrSrvrVolumeMuted.CopyFrom(body)
         return self._encode_batch(msg)
+
+    def _build_device_info(self, device_uuid: bytes, name: str, max_quality: int) -> Any:
+        """Build the ``DeviceInfo`` shared by renderer and controller JOIN messages."""
+        device_info = common_pb2.DeviceInfo()
+        device_info.deviceUuid = device_uuid
+        device_info.friendlyName = name
+        device_info.brand = "Music Assistant"
+        device_info.model = "Qobuz Connect"
+        device_info.type = common_pb2.DEVICE_TYPE_SPEAKER
+        device_info.softwareVersion = "ma-qobuz-connect"
+
+        caps = common_pb2.DeviceCapabilities()
+        caps.minAudioQuality = 1
+        caps.maxAudioQuality = QUALITY_TO_PROTOCOL.get(max_quality, 4)
+        caps.volumeRemoteControl = 2
+        device_info.capabilities.CopyFrom(caps)
+        return device_info
 
     def _encode_batch(self, *messages: Any) -> bytes:
         batch = payload_pb2.QConnectBatch()

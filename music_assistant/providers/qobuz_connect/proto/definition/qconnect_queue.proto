@@ -79,7 +79,7 @@ message CtrlSrvrClearQueue {
 message CtrlSrvrQueueLoadTracks {
   optional QueueVersion  queueVersion            = 1;
   optional bytes         actionUuid              = 2 [(nanopb).type = FT_POINTER];
-  optional bytes         sessionUuid             = 3 [(nanopb).type = FT_POINTER]; // 16b
+  optional bytes         sessionUuid             = 3 [(nanopb).type = FT_POINTER]; // MISNAMED: packed little-endian uint32 track ids (queue load list), not a session uuid
   optional uint32        queuePosition           = 4;
   optional fixed32       qobuzReferenceUuid      = 5;
   optional int32         shufflePivotQueueItemId = 6;
