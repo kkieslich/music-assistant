@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from tests.providers.qobuz_connect.protocol_capture.scenarios import (
     controller_burst_skip,
     controller_burst_skip_throttled,
+    controller_full_lifecycle,
     controller_natural_track_advance,
     controller_paused_scrub_then_skip,
     controller_play_pause_rapid,
@@ -40,6 +41,7 @@ SCENARIOS: dict[str, ScenarioFn] = {
     "rapid_skip": rapid_skip.run,
     "quality_change": quality_change.run,
     "controller_burst_skip": controller_burst_skip.run,
+    "controller_full_lifecycle": controller_full_lifecycle.run,
     "controller_playing_seek_scrub": controller_playing_seek_scrub.run,
     "controller_paused_scrub_then_skip": controller_paused_scrub_then_skip.run,
     "controller_burst_skip_throttled": controller_burst_skip_throttled.run,
