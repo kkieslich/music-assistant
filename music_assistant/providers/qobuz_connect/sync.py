@@ -332,11 +332,11 @@ class QobuzConnectSyncEngine:
     async def handle_qobuz_set_state(self, event: SetStateEvent) -> None:
         """Apply a full Qobuz SET_STATE event to MA (delegates)."""
         await self.command_handler.handle_set_state(event)
-        # Renderer-role caveat: we authenticate with a device-session JWT and
-        # the cloud doesn't push us ``SRVR_CTRL_SESSION_STATE`` like it does
-        # to the controller-role Web Client. So the SET_STATE queueVersion
-        # is the first place we learn the right value to ask for queue
-        # state with.
+        # Renderer-role caveat: the cloud routes ``SRVR_CTRL_SESSION_STATE``
+        # to controller-role connections (declared via the JOIN message,
+        # e.g. the controller-role Web Client), not to this renderer
+        # connection. So the SET_STATE queueVersion is the first place we
+        # learn the right value to ask for queue state with.
         await self.maybe_ask_for_queue_state()
 
     def register_outbound_action(
