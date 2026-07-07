@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .http_recorder import HttpRecorder
 from .qobuz_page import QobuzPage
 from .ws_recorder import WsRecorder
 
@@ -51,6 +52,7 @@ class ClientHandle:
     page: Page
     qobuz: QobuzPage
     recorder: WsRecorder
+    http_recorder: HttpRecorder
     storage_state_path: Path
 
 
@@ -76,6 +78,8 @@ class CaptureSession:
         path_b = self.out_dir / f"{scenario_name}__client_b.json"
         self.a.recorder.write(path_a)
         self.b.recorder.write(path_b)
+        self.a.http_recorder.write(self.out_dir / f"{scenario_name}__client_a_http.json")
+        self.b.http_recorder.write(self.out_dir / f"{scenario_name}__client_b_http.json")
         return path_a, path_b
 
 
@@ -91,10 +95,13 @@ async def _open_client(
     page = await context.new_page()
     qobuz = QobuzPage(page, label=label)
     recorder = WsRecorder(page)
+    http_recorder = HttpRecorder(page)
 
-    # Recorder attaches BEFORE navigation so we capture the AUTHENTICATE /
-    # SUBSCRIBE frames Qobuz sends right after the WebSocket opens.
+    # Recorders attach BEFORE navigation so we capture the AUTHENTICATE /
+    # SUBSCRIBE frames Qobuz sends right after the WebSocket opens, plus the
+    # initial token-fetch HTTP calls made while the SPA boots.
     await recorder.start()
+    await http_recorder.start()
     await qobuz.open()
     await qobuz.accept_cookies_if_present()
 
@@ -136,6 +143,7 @@ async def _open_client(
         page=page,
         qobuz=qobuz,
         recorder=recorder,
+        http_recorder=http_recorder,
         storage_state_path=storage_state_path,
     )
 
@@ -222,5 +230,7 @@ async def capture_session(
             finally:
                 await a_handle.recorder.stop()
                 await b_handle.recorder.stop()
+                await a_handle.http_recorder.stop()
+                await b_handle.http_recorder.stop()
         finally:
             await browser.close()

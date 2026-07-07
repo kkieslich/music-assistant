@@ -26,6 +26,7 @@ from tests.providers.qobuz_connect.protocol_capture.scenarios import (
     quality_change,
     queue_mutations,
     rapid_skip,
+    token_probe,
 )
 
 if TYPE_CHECKING:
@@ -45,4 +46,5 @@ SCENARIOS: dict[str, ScenarioFn] = {
     "controller_play_pause_rapid": controller_play_pause_rapid.run,
     "controller_skip_then_seek": controller_skip_then_seek.run,
     "controller_natural_track_advance": controller_natural_track_advance.run,
+    "token_probe": token_probe.run,
 }
