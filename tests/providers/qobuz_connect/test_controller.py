@@ -20,22 +20,27 @@ class FakeSession:
     """Records controller verb sends."""
 
     def __init__(self) -> None:
+        """Initialize a connected fake session with an empty call log."""
         self.is_connected = True
         self.calls: list[tuple[str, Any]] = []
 
     async def send_set_active_renderer(self, renderer_id: int) -> bool:
+        """Record a SET_ACTIVE_RENDERER send."""
         self.calls.append(("set_active_renderer", renderer_id))
         return True
 
     async def send_queue_load_tracks(self, **kwargs: Any) -> bool:
+        """Record a CTRL_SRVR_QUEUE_LOAD_TRACKS send."""
         self.calls.append(("queue_load_tracks", kwargs))
         return True
 
     async def send_ctrl_player_state(self, **kwargs: Any) -> bool:
+        """Record a controller SetPlayerState send."""
         self.calls.append(("ctrl_player_state", kwargs))
         return True
 
     async def send_ctrl_set_volume(self, renderer_id: int, volume: int) -> bool:
+        """Record a controller SET_VOLUME send."""
         self.calls.append(("ctrl_set_volume", (renderer_id, volume)))
         return True
 
@@ -55,6 +60,7 @@ def _controller() -> tuple[QobuzConnectController, FakeSession]:
 
 
 async def test_add_renderer_with_own_uuid_sets_own_id() -> None:
+    """A renderer record with our device uuid sets own_renderer_id."""
     controller, _ = _controller()
     await controller._on_add_renderer(RendererRecord(3, DEVICE_UUID, "Local Dev"))
     await controller._on_add_renderer(RendererRecord(9, b"\x02" * 16, "Other"))
@@ -63,6 +69,7 @@ async def test_add_renderer_with_own_uuid_sets_own_id() -> None:
 
 
 async def test_remove_renderer_clears_own_id() -> None:
+    """Removing our renderer clears own_renderer_id and disconnects."""
     controller, _ = _controller()
     await controller._on_add_renderer(RendererRecord(3, DEVICE_UUID, "Local Dev"))
     await controller._on_remove_renderer(3)
@@ -71,6 +78,7 @@ async def test_remove_renderer_clears_own_id() -> None:
 
 
 async def test_activate_self_sends_set_active_and_skips_when_active() -> None:
+    """activate_self sends SET_ACTIVE_RENDERER once and no-ops when already active."""
     controller, fake = _controller()
     await controller._on_add_renderer(RendererRecord(3, DEVICE_UUID, "Local Dev"))
     assert await controller.activate_self() is True
@@ -82,6 +90,7 @@ async def test_activate_self_sends_set_active_and_skips_when_active() -> None:
 
 
 async def test_verbs_guard_when_own_id_unknown() -> None:
+    """Verbs return False and send nothing while own renderer id is unknown."""
     controller, fake = _controller()
     assert await controller.activate_self() is False
     assert await controller.set_volume(50) is False
@@ -89,6 +98,7 @@ async def test_verbs_guard_when_own_id_unknown() -> None:
 
 
 async def test_load_queue_passes_track_ids() -> None:
+    """load_queue forwards track_ids and the caller-minted action_uuid."""
     controller, fake = _controller()
     await controller._on_add_renderer(RendererRecord(3, DEVICE_UUID, "Local Dev"))
     action_uuid = uuid.uuid4().bytes
@@ -105,6 +115,7 @@ async def test_load_queue_passes_track_ids() -> None:
 
 
 async def test_play_item_sends_partial_player_state() -> None:
+    """play_item sends a PLAYING player state at position 0 for the item."""
     controller, fake = _controller()
     await controller._on_add_renderer(RendererRecord(3, DEVICE_UUID, "Local Dev"))
     await controller.play_item(QueueVersion(22, 1), 1)
