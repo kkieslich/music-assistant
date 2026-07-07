@@ -513,6 +513,9 @@ class QobuzConnectProvider(PluginProvider):
         # sync-group target never synced its volume to the Qobuz app.
         volume = getattr(player, "group_volume", None)
         if volume is not None and volume != self._last_sent_volume:
+            self.logger.debug(
+                "MA->Qobuz volume: sending group_volume=%s (player=%s)", volume, event.object_id
+            )
             await self._session.send_volume_changed(volume)
             self._last_sent_volume = volume
         muted = getattr(player, "group_volume_muted", None)
