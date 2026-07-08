@@ -227,8 +227,10 @@ controller-side knowledge, exactly like the reference web client (which
 starts reporting `RNDR_SRVR_STATE_UPDATED` in the same millisecond it
 receives SET_ACTIVE). Sources for that knowledge:
 
-- `SRVR_CTRL_SESSION_STATE.trackIndex` (connect-time) — which queue index
-  is current.
+- `SRVR_CTRL_SESSION_STATE.trackIndex` (connect-time) — the queue *read
+  pointer*: the index of the NEXT track to pull, i.e. current + 1 (live
+  2026-07-08: phone on index 2 → trackIndex 3; equivalently a 1-based
+  current index). The mirror stores `max(0, trackIndex - 1)`.
 - `SRVR_CTRL_QUEUE_STATE` (asked-for snapshot) — the track list.
 - `SRVR_CTRL_RENDERER_STATE_UPDATED` (type 82, ~1/s while another
   renderer plays) — live playing state, position, duration, and
