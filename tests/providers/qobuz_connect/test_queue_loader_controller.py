@@ -127,6 +127,8 @@ async def test_ma_origin_load_sends_full_queue_via_controller() -> None:
     load_calls = [c for c in controller.calls if c[0] == "load_queue"]
     assert load_calls
     assert load_calls[0][1]["track_ids"] == [111, 222, 333]
+    # The cloud rejects loads whose contextUuid is not exactly 16 bytes.
+    assert len(load_calls[0][1]["context_uuid"]) == 16
     play_calls = [c for c in controller.calls if c[0] == "play_item"]
     assert play_calls == [("play_item", 101)]  # index 1 -> cloud id 100+1
     assert engine.reported == 1

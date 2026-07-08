@@ -245,6 +245,12 @@ class QobuzConnectCodec:
             queue_load.sessionUuid = b"".join(
                 tid.to_bytes(4, "little", signed=False) for tid in track_ids
             )
+            # The reference web client always sends these two with explicit
+            # presence on full-list loads; the cloud rejects loads without
+            # them / without a 16-byte contextUuid (ERROR_QUEUE_LOAD_TRACKS
+            # "byte array must have length 16", observed live 2026-07-08).
+            queue_load.shufflePivotQueueItemId = 0
+            queue_load.shuffleMode = False
         elif qweb_track_session:
             queue_load.sessionUuid = int(track_id).to_bytes(4, "little", signed=False)
         if qobuz_reference_id is not None:
