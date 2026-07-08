@@ -100,6 +100,21 @@ def test_app_origin_remove_of_current_picks_successor() -> None:
     assert result.state.current_id == 2
 
 
+def test_remove_current_with_no_successor_clears_current() -> None:
+    """Removing the current track with nothing after it clears current_id (no wrap to top)."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1, 2), current_id=2, active=True
+    )
+    result = reduce(
+        state,
+        CloudTracksRemoved(
+            now_ms=1, version=QueueVersion(6, 1), action_uuid=b"\x09" * 16, queue_item_ids=(2,)
+        ),
+    )
+    assert tuple(t.queue_item_id for t in result.state.tracks) == (0, 1)
+    assert result.state.current_id is None
+
+
 def test_cleared_empties_tracks_and_current() -> None:
     """A cloud clear empties the list and drops the current anchor."""
     state = CanonicalState(

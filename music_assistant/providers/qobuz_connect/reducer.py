@@ -79,7 +79,7 @@ def _reduce_list_inbound(state: CanonicalState, event: Event) -> ReduceResult:
         tracks = tuple(t for t in state.tracks if t.queue_item_id not in removed)
         # Current-change on removal only updates the anchor here; MaPlayTrack
         # (restarting audio) is wired in the transport lane (Task 4).
-        current_id = _successor_if_removed(state, removed, tracks)
+        current_id = _successor_if_removed(state, removed)
         return _with_resync(
             dataclasses.replace(
                 state, cloud_version=event.version, tracks=tracks, current_id=current_id
@@ -116,19 +116,17 @@ def _current_from_pointer(tracks: tuple[QueueTrackRef, ...], track_index: int) -
     return tracks[idx].queue_item_id
 
 
-def _successor_if_removed(
-    state: CanonicalState, removed: set[int], tracks: tuple[QueueTrackRef, ...]
-) -> int | None:
+def _successor_if_removed(state: CanonicalState, removed: set[int]) -> int | None:
     if state.current_id not in removed:
         return state.current_id
     old_ids = [t.queue_item_id for t in state.tracks]
     if state.current_id not in old_ids:
-        return tracks[0].queue_item_id if tracks else None
+        return None
     start = old_ids.index(state.current_id)
     for qid in old_ids[start + 1 :]:
         if qid not in removed:
             return qid
-    return tracks[0].queue_item_id if tracks else None
+    return None
 
 
 def _reorder(
