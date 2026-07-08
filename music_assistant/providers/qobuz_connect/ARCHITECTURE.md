@@ -203,6 +203,19 @@ aren't already active. On connection loss (`on_disconnected` callback,
 fired from the session's connection loop) both ids are cleared and are
 re-discovered from the next bootstrap.
 
+### Eager connect (controller mode)
+
+The connection is opened at provider load, self-minting the websocket
+token via `qws/createToken` — NOT on the app's local handshake (the
+legacy renderer behavior). Waiting for the handshake loses the first
+handoff after a restart: the phone's SET_ACTIVE races our
+connect+join and the app bounces playback back when no renderer
+answers (live 2026-07-08). For the same reason, a handshake must never
+swap tokens on an already-connected controller-role session — a token
+swap closes and reopens the socket at the exact moment the cloud needs
+it up. Renderer role keeps the lazy handshake-driven connect (it needs
+the handshake's session uuid to join).
+
 ### Playback takeover on activation
 
 **A controller-joined connection never receives a renderer-directed
