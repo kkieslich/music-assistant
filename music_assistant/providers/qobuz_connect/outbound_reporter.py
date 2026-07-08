@@ -192,6 +192,11 @@ class OutboundReporter:
         try:
             while True:
                 await asyncio.sleep(STATE_REPORT_INTERVAL_S)
+                # The cloud rejects renderer-state reports from a renderer it
+                # doesn't consider active ("non active renderer", live
+                # 2026-07-08) — stay silent until (re)activated.
+                if not self._engine._is_active:
+                    continue
                 with contextlib.suppress(Exception):
                     await self.report_state()
         except asyncio.CancelledError:

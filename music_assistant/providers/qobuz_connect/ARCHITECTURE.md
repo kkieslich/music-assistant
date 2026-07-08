@@ -247,6 +247,24 @@ than a full reconnect. Queued outbound frames older than ~2s are dropped
 on reconnect instead of flushed: the cloud rejects stale envelope
 timestamps ("Message too old") and the rejection can drop the connection.
 
+**Not every type-1 error means deregistration.** The cloud also rejects
+individual *reports* on semantic grounds — "Current track not found in
+queue nor autoplay" (stale current anchor after a queue clear) and
+"Renderer state updated message received from non active renderer"
+(reporting while not the target). Rejoining on those just churns the
+session (live 2026-07-08 evening cascade); they're excluded via
+`REPORT_SEMANTIC_ERRORS`. Related invariants that prevent the errors at
+the source:
+
+- Our own `QUEUE_CLEARED` echo clears `current_item` (report gate), and
+  a queue snapshot prunes a `current_item` that's no longer in it.
+- Losing the websocket drops `_is_active` (a fresh connection is never
+  the active renderer) and the heartbeat only reports while active.
+- MA's `play_media` replaces a queue via a transient clear-then-load, so
+  an empty MA queue only propagates to the cloud as `CLEAR_QUEUE` after
+  a `CLEAR_EMIT_GRACE` debounce, and only if it's still empty then —
+  emitting immediately wiped the phone's queue mid-replace.
+
 ## Inbound messages (Qobuz → this provider)
 
 All inbound traffic is one of these QConnect inner message types,

@@ -383,8 +383,22 @@ class QobuzConnectProvider(PluginProvider):
             on_renderer_state_updated=(
                 self._sync.handle_renderer_state_updated if self.controller else None
             ),
-            on_disconnected=self.controller._on_disconnected if self.controller else None,
+            on_disconnected=self._on_ws_disconnected if self.controller else None,
         )
+
+    async def _on_ws_disconnected(self) -> None:
+        """
+        Handle loss of the cloud websocket (controller mode).
+
+        The cloud's registry entry for this connection is gone: a fresh
+        connection is never the session's active renderer until SET_ACTIVE
+        (or our own ``activate_self``) says so again, so the engine must
+        drop its active flag or its heartbeat reports get rejected with
+        "Renderer state updated message received from non active renderer".
+        """
+        if self.controller:
+            await self.controller._on_disconnected()
+        self._sync.handle_connection_lost()
 
     async def _on_quality_change(self, new_quality: int) -> None:
         """Remember quality selected in Qobuz app."""

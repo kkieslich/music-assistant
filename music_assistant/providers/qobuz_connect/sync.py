@@ -105,6 +105,13 @@ from .state import (
 # so it can't leak.
 OUTBOUND_ACTION_TTL = 10.0
 
+# Grace period before an empty MA queue is propagated to the cloud as
+# CLEAR_QUEUE. MA's ``play_media`` replaces a queue via a transient
+# clear-then-load, and clearing the cloud queue mid-replace destroys the
+# phone's session (live 2026-07-08). The emit only happens if MA's queue is
+# still empty when the grace period expires.
+CLEAR_EMIT_GRACE = 2.0
+
 # Translate MA's str-enum ``RepeatMode`` (off / one / all) to the Qobuz
 # int-enum ``LoopMode`` (OFF=1 / REPEAT_ONE=2 / REPEAT_ALL=3). Used by the
 # MA→cloud loop-mode emit path.
@@ -244,6 +251,8 @@ class QobuzConnectSyncEngine:
         # takeover of the (stale) mirror queue — the MA-origin load that
         # follows immediately replaces it.
         self._suppress_takeover_once = False
+        # Delayed CLEAR_QUEUE emission (see ``CLEAR_EMIT_GRACE``).
+        self._pending_clear_task: asyncio.Task[None] | None = None
 
     @property
     def pending_paused_seek_ms(self) -> int | None:
@@ -274,6 +283,7 @@ class QobuzConnectSyncEngine:
         await self.reporter.stop()
         self.command_handler.cancel_tasks()
         self.seek_pipeline.cancel_pending_seek()
+        self._cancel_pending_clear_emit()
 
     async def report_state(self, *, sync_from_ma: bool = True) -> None:
         """Report canonical renderer state to the Qobuz app (delegates)."""
@@ -290,6 +300,7 @@ class QobuzConnectSyncEngine:
         the underlying MA queue.
         """
         self._is_active = False
+        self._cancel_pending_clear_emit()
         # Preserve the cloud's queue view across deactivation: the cloud
         # never resends SESSION_STATE/QUEUE_STATE unprompted, so wiping the
         # track list here would leave a later re-handoff with nothing to
@@ -428,6 +439,18 @@ class QobuzConnectSyncEngine:
         """Skip the takeover for the next activation (MA-origin ``activate_self``)."""
         self._suppress_takeover_once = True
 
+    def handle_connection_lost(self) -> None:
+        """
+        Drop active status when the cloud connection is lost (controller mode).
+
+        A fresh connection is never the session's active renderer until the
+        cloud re-sends SET_ACTIVE or an MA-origin action re-activates via
+        ``activate_self`` — reporting renderer state before then is rejected.
+        """
+        self._is_active = False
+        self._suppress_takeover_once = False
+        self._cancel_pending_clear_emit()
+
     def register_outbound_action(
         self, kind: OutboundActionKind, queue_version: QueueVersion
     ) -> bytes:
@@ -513,8 +536,14 @@ class QobuzConnectSyncEngine:
             return  # no diff
 
         if not ma_qobuz_ids and mirror_track_ids:
-            await self._emit_clear_queue(session)
+            # MA's queue is empty *right now*, but ``play_media`` replaces a
+            # queue via a transient clear-then-load — emitting CLEAR_QUEUE
+            # immediately wipes the phone's queue mid-replace (live
+            # 2026-07-08). Emit after a grace period, only if MA's queue is
+            # still empty by then.
+            self._schedule_clear_emit(session)
             return
+        self._cancel_pending_clear_emit()
 
         removed_track_ids = mirror_set - ma_set
         added_track_ids = ma_set - mirror_set
@@ -915,6 +944,15 @@ class QobuzConnectSyncEngine:
         self.qobuz_state.tracks = list(snapshot.tracks)
         self.qobuz_state.shuffle_mode = snapshot.shuffle_mode
         self.qobuz_state.autoplay_mode = snapshot.autoplay_mode
+        # Prune a current-track anchor that no longer exists in the cloud's
+        # queue (e.g. stale mirror after a reconnect straddling a queue
+        # replacement) — reporting it would be rejected by the cloud.
+        current = self.qobuz_state.current_item
+        if current is not None and all(
+            track.queue_item_id != current.queue_item_id for track in snapshot.tracks
+        ):
+            self.qobuz_state.current_item = None
+            self.qobuz_state.next_item = None
         # Mirror MA's shuffle flag to the snapshot. Qobuz sometimes conveys
         # shuffle changes via the snapshot alone (no preceding
         # ``SRVR_RNDR_SET_SHUFFLE_MODE`` — observed for shuffle-OFF
@@ -1021,7 +1059,13 @@ class QobuzConnectSyncEngine:
         self.qobuz_state.queue_version = _event.queue_version
         self.qobuz_state.tracks = []
         if echo is not None:
-            return  # MA already cleared; reconciler would be a no-op
+            # MA already cleared; reconciler would be a no-op. Drop the
+            # current-track anchor too — reporting an item against the
+            # now-empty cloud queue is answered with "Current track not
+            # found in queue nor autoplay" (live 2026-07-08).
+            self.qobuz_state.current_item = None
+            self.qobuz_state.next_item = None
+            return
         self.command_handler.reset_reconcile_dedup()
         await self.command_handler.schedule_reconcile_ma_to_mirror()
 
@@ -1224,3 +1268,35 @@ class QobuzConnectSyncEngine:
         index = max(0, min(self.qobuz_state.track_index, len(tracks) - 1))
         self.qobuz_state.current_item = tracks[index]
         self.qobuz_state.next_item = tracks[index + 1] if index + 1 < len(tracks) else None
+
+    def _schedule_clear_emit(self, session: Any) -> None:
+        """(Re)arm the delayed CLEAR_QUEUE emission."""
+        self._cancel_pending_clear_emit()
+        self._pending_clear_task = asyncio.create_task(self._emit_clear_after_grace(session))
+
+    def _cancel_pending_clear_emit(self) -> None:
+        """Cancel a pending delayed CLEAR_QUEUE emission, if any."""
+        task = self._pending_clear_task
+        if task is not None and not task.done() and asyncio.current_task() is not task:
+            task.cancel()
+        self._pending_clear_task = None
+
+    async def _emit_clear_after_grace(self, session: Any) -> None:
+        """Emit CLEAR_QUEUE after the grace period if MA's queue is still empty."""
+        try:
+            await asyncio.sleep(CLEAR_EMIT_GRACE)
+            player_id = self.bridge.target_player_id()
+            items = list(self.bridge.queue_items(player_id)) if player_id else []
+            if any(self.bridge.qobuz_track_id_for(item) for item in items):
+                return  # queue repopulated — the emptiness was a transient replace
+            if not self._is_active:
+                return
+            self.bridge.logger.debug("MA queue still empty after grace — clearing cloud queue")
+            await self._emit_clear_queue(session)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.bridge.logger.exception("Failed to emit delayed Qobuz Connect queue clear")
+        finally:
+            if asyncio.current_task() is self._pending_clear_task:
+                self._pending_clear_task = None

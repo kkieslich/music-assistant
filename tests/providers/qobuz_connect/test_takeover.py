@@ -17,7 +17,9 @@ from typing import Any, cast
 from music_assistant_models.enums import PlaybackState
 
 from music_assistant.providers.qobuz_connect.models import (
+    OutboundActionKind,
     PlayingState,
+    QueueClearedEvent,
     QueueStateSnapshot,
     QueueTrackRef,
     QueueVersion,
@@ -203,3 +205,52 @@ async def test_slim_play_command_falls_back_to_mirror_track_index() -> None:
     assert engine.qobuz_state.current_item is not None
     assert engine.qobuz_state.current_item.track_id == "102"
     engine.command_handler.cancel_tasks()
+
+
+async def test_clear_echo_drops_current_anchor() -> None:
+    """Our own QUEUE_CLEARED echo must silence the stale current-track report."""
+    engine = _engine()
+    engine.qobuz_state.tracks = _tracks(3)
+    engine.qobuz_state.current_item = engine.qobuz_state.tracks[1]
+    engine.qobuz_state.next_item = engine.qobuz_state.tracks[2]
+    action_uuid = engine.register_outbound_action(OutboundActionKind.CLEAR, QueueVersion(30, 1))
+
+    await engine.handle_queue_cleared(
+        QueueClearedEvent(queue_version=QueueVersion(31, 1), action_uuid=action_uuid)
+    )
+
+    assert engine.qobuz_state.current_item is None
+    # mypy keeps current_item narrowed from the assignment above; runtime
+    # cleared it via the echo path.
+    assert engine.qobuz_state.next_item is None  # type: ignore[unreachable]
+    assert engine.qobuz_state.tracks == []
+
+
+async def test_snapshot_prunes_stale_current_anchor() -> None:
+    """A snapshot without the mirror's current item must drop the anchor."""
+    engine = _engine()
+    engine.qobuz_state.current_item = QueueTrackRef(queue_item_id=99, track_id="dead")
+
+    await engine.handle_queue_state(
+        QueueStateSnapshot(
+            queue_version=QueueVersion(31, 1),
+            action_uuid=b"\x02" * 16,
+            tracks=_tracks(2),
+        )
+    )
+
+    assert engine.qobuz_state.current_item is None
+    # mypy keeps current_item narrowed from the assignment above.
+    engine.command_handler.cancel_tasks()  # type: ignore[unreachable]
+
+
+async def test_connection_lost_drops_active_flag() -> None:
+    """A fresh connection is never active — reports must stop until reactivation."""
+    engine = _engine()
+    engine.set_active(active=True)
+    engine.suppress_takeover_once()
+
+    engine.handle_connection_lost()
+
+    assert engine._is_active is False
+    assert engine._suppress_takeover_once is False

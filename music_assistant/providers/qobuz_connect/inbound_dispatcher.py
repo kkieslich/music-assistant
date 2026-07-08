@@ -76,7 +76,7 @@ class InboundDispatcher:
         callbacks: SessionCallbacks,
         *,
         label: str = "",
-        on_error_message: Callable[[], Awaitable[None]] | None = None,
+        on_error_message: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         """
         Hold the codec + callback bundle this dispatcher will fan out to.
@@ -116,7 +116,7 @@ class InboundDispatcher:
         message = msg.error.message if msg.HasField("error") else ""
         self._logger.warning("Qobuz Connect message error %s: %s", code, message)
         if self._on_error_message is not None:
-            await self._on_error_message()
+            await self._on_error_message(str(message))
 
     async def _on_set_state(self, msg: Any) -> None:
         if event := self._codec.parse_set_state(msg):

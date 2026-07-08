@@ -85,6 +85,14 @@ REJOIN_MIN_INTERVAL = 5.0
 # ("Message too old", observed live 2026-07-08) and the rejection can drop
 # the connection — queued frames past this age are discarded, not flushed.
 PENDING_MAX_AGE = 2.0
+# Message-level errors that reject a single *report* on semantic grounds
+# (stale current-track anchor, reporting while not the active renderer).
+# These do NOT mean the cloud deregistered us — re-joining would just churn
+# the session. Matched case-insensitively against the error message.
+REPORT_SEMANTIC_ERRORS = (
+    "current track not found",
+    "non active renderer",
+)
 
 
 class TokenRefreshRequired(Exception):
@@ -604,7 +612,7 @@ class QobuzConnectSession:
             await self._handle_payload(decoded.payload)
         elif decoded.msg_type.name == "ERROR":
             LOGGER.error("Qobuz websocket error %s: %s", decoded.error_code, decoded.error_message)
-            await self._maybe_rejoin_after_error()
+            await self._maybe_rejoin_after_error(decoded.error_message or "")
         elif decoded.msg_type.name == "DISCONNECT":
             raise QobuzServerDisconnect
 
@@ -677,7 +685,7 @@ class QobuzConnectSession:
         if self._ws:
             await self._ws.close()
 
-    async def _maybe_rejoin_after_error(self) -> None:
+    async def _maybe_rejoin_after_error(self, message: str = "") -> None:
         """
         Re-register with the cloud after an inbound ERROR frame.
 
@@ -685,8 +693,14 @@ class QobuzConnectSession:
         open — every state report is then answered with a message-level
         type-1 error. Re-sending the role-appropriate SUBSCRIBE + JOIN
         restores registration. Rate-limited so an error storm can't loop.
+        Semantic per-report rejections (see ``REPORT_SEMANTIC_ERRORS``) are
+        excluded — they don't indicate lost registration.
         """
         if not self._ws or not self._is_connected:
+            return
+        lowered = message.lower()
+        if any(marker in lowered for marker in REPORT_SEMANTIC_ERRORS):
+            LOGGER.debug("Skipping rejoin for semantic report error: %s", message)
             return
         session_uuid = self._session_uuid
         if self.role is SessionRole.RENDERER and session_uuid is None:
