@@ -11,31 +11,71 @@ from __future__ import annotations
 
 import dataclasses
 
-from .models import QueueTrackRef, QueueVersion
+from .models import PlayingState, QueueTrackRef, QueueVersion
 from .sync_types import (
     CanonicalState,
+    CloudActiveRendererChanged,
+    CloudAddRenderer,
     CloudAutoplayTracksLoaded,
     CloudCleared,
     CloudLoadAck,
     CloudQueueError,
+    CloudRemoveRenderer,
+    CloudRendererStateUpdated,
+    CloudSessionState,
+    CloudSetActive,
+    CloudSetState,
     CloudSnapshot,
+    CloudStateRequest,
     CloudTracksAdded,
     CloudTracksInserted,
     CloudTracksRemoved,
     CloudTracksReordered,
     CloudVersionChanged,
+    Connected,
+    Disconnected,
     Effect,
     Event,
+    MaPause,
+    MaPlayTrack,
     MaQueueChanged,
+    MaReleasePlayer,
+    MaResume,
     MaResyncQueue,
+    MaSeek,
+    MaTransportChanged,
     Proposal,
     ProposalKind,
     ProposalTimeout,
     PushAdd,
     PushClear,
     PushLoad,
+    PushPlayerState,
     ReduceResult,
+    ReportState,
 )
+
+# Events handled by the transport/session lane. CloudLoadAck also appears in
+# _LIST_CONFIRM above; it lands here only when it isn't the echo of one of
+# our own pending proposals (e.g. a queue load initiated elsewhere).
+_TRANSPORT_INBOUND = (
+    CloudSetState,
+    CloudRendererStateUpdated,
+    CloudStateRequest,
+    CloudSetActive,
+    CloudSessionState,
+    CloudActiveRendererChanged,
+    CloudAddRenderer,
+    CloudRemoveRenderer,
+    MaTransportChanged,
+    Connected,
+    Disconnected,
+    CloudLoadAck,
+)
+
+# Position drift beyond this is treated as an explicit seek rather than a
+# heartbeat/position-only update.
+_SEEK_THRESHOLD_MS = 1500
 
 _LIST_INBOUND = (
     CloudSnapshot,
@@ -90,6 +130,8 @@ def reduce(state: CanonicalState, event: Event) -> ReduceResult:
         # Fall through to the ordinary app-origin inbound handling below.
     if isinstance(event, _LIST_INBOUND):
         return _reduce_list_inbound(state, event)
+    if isinstance(event, _TRANSPORT_INBOUND):
+        return _reduce_transport(state, event)
     return ReduceResult(state, ())
 
 
@@ -157,6 +199,145 @@ def _reduce_list_inbound(state: CanonicalState, event: Event) -> ReduceResult:
             ),
         )
     return ReduceResult(state, ())
+
+
+def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
+    """Route a transport/session-lane event to its handler."""
+    if isinstance(event, CloudSetActive):
+        return _takeover(state) if event.active else _deactivate(state)
+    if isinstance(event, CloudSetState):
+        return _apply_transport(
+            state,
+            playing=event.playing,
+            position_ms=event.position_ms,
+            current_id=event.current_ref.queue_item_id if event.current_ref else None,
+        )
+    if isinstance(event, CloudRendererStateUpdated):
+        # Another renderer's live state feeds canonical truth only while we
+        # aren't active; once we're active it's our own echo or irrelevant.
+        if state.active:
+            return ReduceResult(state, ())
+        new = dataclasses.replace(
+            state,
+            playing=event.playing or state.playing,
+            position_ms=event.position_ms if event.position_ms is not None else state.position_ms,
+        )
+        return ReduceResult(new, ())
+    if isinstance(event, CloudStateRequest):
+        return ReduceResult(state, (ReportState(),))
+    if isinstance(event, MaTransportChanged):
+        return _ma_transport(state, event)
+    if isinstance(event, CloudSessionState):
+        current_id = _current_from_pointer(state.tracks, event.track_index)
+        new = dataclasses.replace(state, cloud_version=event.version, current_id=current_id)
+        return ReduceResult(new, ())
+    if isinstance(event, CloudActiveRendererChanged):
+        return ReduceResult(dataclasses.replace(state, active_rid=event.renderer_id), ())
+    if isinstance(event, CloudAddRenderer):
+        # Own-renderer matching against device_uuid needs uuid-comparison
+        # context the pure reducer doesn't hold; the coordinator resolves
+        # own-ness and drives own_rid through the events the reducer does
+        # understand (e.g. CloudActiveRendererChanged).
+        return ReduceResult(state, ())
+    if isinstance(event, CloudRemoveRenderer):
+        return _remove_renderer(state, event)
+    if isinstance(event, Connected):
+        return ReduceResult(state, ())
+    if isinstance(event, Disconnected):
+        return ReduceResult(dataclasses.replace(state, active=False, pending=()), ())
+    if isinstance(event, CloudLoadAck):
+        current_id = _current_from_load_ack(event)
+        new = dataclasses.replace(state, cloud_version=event.version, current_id=current_id)
+        return ReduceResult(new, (ReportState(),))
+    return ReduceResult(state, ())
+
+
+def _apply_transport(
+    state: CanonicalState,
+    *,
+    playing: PlayingState | None,
+    position_ms: int | None,
+    current_id: int | None,
+) -> ReduceResult:
+    """
+    Apply a cloud transport command under the audio-never-interrupted rule.
+
+    Exactly one branch fires, in strict priority order: a changed current
+    track (the only audio-restarting case), else a play/pause toggle, else
+    an explicit seek, else a bare position/heartbeat update with no effect.
+
+    :param state: Canonical state before the transport command.
+    :param playing: Reported playing state, or None if not carried.
+    :param position_ms: Reported position, or None if not carried.
+    :param current_id: Reported current queue-item id, or None if not carried.
+    """
+    if current_id is not None and current_id != state.current_id:
+        new = dataclasses.replace(
+            state,
+            current_id=current_id,
+            playing=playing or state.playing,
+            position_ms=position_ms or 0,
+        )
+        return ReduceResult(new, (MaPlayTrack(track_id=current_id, position_ms=position_ms or 0),))
+    if playing is not None and playing != state.playing:
+        new = dataclasses.replace(state, playing=playing)
+        effect = MaPause() if playing is PlayingState.PAUSED else MaResume()
+        return ReduceResult(new, (effect,))
+    if position_ms is not None and abs(position_ms - state.position_ms) > _SEEK_THRESHOLD_MS:
+        new = dataclasses.replace(state, position_ms=position_ms)
+        return ReduceResult(new, (MaSeek(position_ms),))
+    # Position/heartbeat only: no MA effect, ever.
+    return ReduceResult(
+        dataclasses.replace(state, position_ms=position_ms or state.position_ms), ()
+    )
+
+
+def _takeover(state: CanonicalState) -> ReduceResult:
+    """Activate this renderer and adopt canonical current, playing it once if it's live."""
+    active = dataclasses.replace(state, active=True)
+    if state.current_id is not None and state.playing is PlayingState.PLAYING:
+        return ReduceResult(
+            active, (MaPlayTrack(track_id=state.current_id, position_ms=state.position_ms),)
+        )
+    return ReduceResult(active, (ReportState(),))
+
+
+def _deactivate(state: CanonicalState) -> ReduceResult:
+    """Give up the renderer role and release the MA player."""
+    return ReduceResult(dataclasses.replace(state, active=False), (MaReleasePlayer(),))
+
+
+def _ma_transport(state: CanonicalState, event: MaTransportChanged) -> ReduceResult:
+    """Fold MA's own transport report into canonical state and push it to cloud."""
+    current_id = event.current_track_id if event.current_track_id is not None else state.current_id
+    new = dataclasses.replace(
+        state, playing=event.playing, current_id=current_id, position_ms=event.position_ms
+    )
+    effect = PushPlayerState(
+        playing=event.playing,
+        position_ms=event.position_ms,
+        queue_version=state.cloud_version,
+        queue_item_id=current_id,
+    )
+    return ReduceResult(new, (effect,))
+
+
+def _remove_renderer(state: CanonicalState, event: CloudRemoveRenderer) -> ReduceResult:
+    """Clear own/active renderer bookkeeping when the matching renderer leaves."""
+    active_rid = None if state.active_rid == event.renderer_id else state.active_rid
+    own_rid = None if state.own_rid == event.renderer_id else state.own_rid
+    if active_rid == state.active_rid and own_rid == state.own_rid:
+        return ReduceResult(state, ())
+    new = dataclasses.replace(state, active_rid=active_rid, own_rid=own_rid)
+    return ReduceResult(new, ())
+
+
+def _current_from_load_ack(event: CloudLoadAck) -> int | None:
+    """Resolve the new current queue-item id from a load ack's clamped position."""
+    if not event.tracks:
+        return None
+    idx = max(0, min(event.queue_position, len(event.tracks) - 1))
+    return event.tracks[idx].queue_item_id
 
 
 def _with_resync(new: CanonicalState) -> ReduceResult:
