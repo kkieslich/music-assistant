@@ -380,6 +380,9 @@ class QobuzConnectProvider(PluginProvider):
             on_active_renderer_changed=(
                 self.controller._on_active_renderer_changed if self.controller else None
             ),
+            on_renderer_state_updated=(
+                self._sync.handle_renderer_state_updated if self.controller else None
+            ),
             on_disconnected=self.controller._on_disconnected if self.controller else None,
         )
 
@@ -490,6 +493,8 @@ class QobuzConnectProvider(PluginProvider):
             await self._broadcast_current_volume()
             if self._session:
                 await self._session.send_quality_reports(self._max_quality)
+            if self._enable_controller:
+                await self._sync.takeover_playback()
             return
         self.logger.info("Qobuz Connect deactivated by cloud; releasing MA player")
         await self._sync.release_target_player()

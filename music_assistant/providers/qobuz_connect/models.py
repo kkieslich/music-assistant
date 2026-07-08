@@ -262,6 +262,24 @@ class RendererRecord:
 
 
 @dataclass(slots=True)
+class RendererStateUpdate:
+    """
+    Decoded ``SRVR_CTRL_RENDERER_STATE_UPDATED`` — the active renderer's state broadcast.
+
+    This is the only live signal a controller-joined connection gets about
+    what the currently active renderer is playing; it feeds the mirror so
+    we can take over playback on ``SRVR_RNDR_SET_ACTIVE``.
+    """
+
+    renderer_id: int
+    playing_state: PlayingState | None = None
+    position_ms: int | None = None
+    duration_ms: int | None = None
+    current_queue_index: int | None = None
+    next_queue_item_id: int | None = None
+
+
+@dataclass(slots=True)
 class QueueLoadAck:
     """Server acknowledgement for a controller queue-load command."""
 
@@ -367,6 +385,12 @@ class QobuzMirror:
     loop_mode: LoopMode = LoopMode.OFF
     shuffle_mode: bool = False
     autoplay_mode: bool = False
+    # Index of the session's current track within ``tracks``. Fed by
+    # SRVR_CTRL_SESSION_STATE (trackIndex) and SRVR_CTRL_RENDERER_STATE_UPDATED
+    # (currentQueueIndex) — controller-joined connections never receive a
+    # renderer-directed SET_STATE with track refs, so this is how we know
+    # which track to take over on activation.
+    track_index: int = 0
 
 
 class OutboundActionKind(StrEnum):

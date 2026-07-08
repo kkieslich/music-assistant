@@ -83,6 +83,7 @@ from .models import (
     QueueTracksRemovedEvent,
     QueueTracksReorderedEvent,
     QueueVersion,
+    RendererStateUpdate,
     SessionStateEvent,
     SetStateEvent,
 )
@@ -238,6 +239,11 @@ class QobuzConnectSyncEngine:
         # "haven't asked yet"; reset on deactivation / reactivation so
         # reconnects re-ask.
         self._last_asked_qv: tuple[int, int] | None = None
+        # Set by the queue loader right before its ``activate_self()``:
+        # that activation's SRVR_RNDR_SET_ACTIVE echo must NOT trigger a
+        # takeover of the (stale) mirror queue — the MA-origin load that
+        # follows immediately replaces it.
+        self._suppress_takeover_once = False
 
     @property
     def pending_paused_seek_ms(self) -> int | None:
@@ -284,7 +290,20 @@ class QobuzConnectSyncEngine:
         the underlying MA queue.
         """
         self._is_active = False
-        self.qobuz_state = QobuzMirror()
+        # Preserve the cloud's queue view across deactivation: the cloud
+        # never resends SESSION_STATE/QUEUE_STATE unprompted, so wiping the
+        # track list here would leave a later re-handoff with nothing to
+        # take over. ``current_item`` must NOT survive — it's the heartbeat
+        # reporter's gate, and a deactivated renderer must go silent.
+        old = self.qobuz_state
+        self.qobuz_state = QobuzMirror(
+            queue_version=old.queue_version,
+            tracks=old.tracks,
+            track_index=old.track_index,
+            loop_mode=old.loop_mode,
+            shuffle_mode=old.shuffle_mode,
+            autoplay_mode=old.autoplay_mode,
+        )
         self.paused_seek = None
         self.qobuz_position = None
         self.playing_seek = None
@@ -338,6 +357,76 @@ class QobuzConnectSyncEngine:
         # connection. So the SET_STATE queueVersion is the first place we
         # learn the right value to ask for queue state with.
         await self.maybe_ask_for_queue_state()
+
+    async def handle_renderer_state_updated(self, update: RendererStateUpdate) -> None:
+        """
+        Mirror the active renderer's ``SRVR_CTRL_RENDERER_STATE_UPDATED`` broadcast.
+
+        While another renderer (e.g. the phone) is playing, these broadcasts
+        are the only live signal about the session's playing state, position
+        and current track index — the state we take over from when the cloud
+        activates us.
+        """
+        controller = getattr(self.provider, "controller", None)
+        own_id = controller.own_renderer_id if controller is not None else None
+        if controller is not None and own_id is not None:
+            if update.renderer_id == own_id:
+                return  # our own report echoed back
+            if controller.active_renderer_id == own_id:
+                return  # we are the active renderer; ignore stale broadcasts
+        if update.playing_state is not None:
+            self.qobuz_state.playing_state = update.playing_state
+        if update.position_ms is not None:
+            self.qobuz_state.position_ms = update.position_ms
+            self.qobuz_state.position_timestamp_ms = int(time.time() * 1000)
+        if update.duration_ms is not None:
+            self.qobuz_state.duration_ms = update.duration_ms
+        if update.current_queue_index is not None:
+            self.qobuz_state.track_index = update.current_queue_index
+
+    async def takeover_playback(self) -> None:
+        """
+        Continue the session's playback locally after the cloud activated us.
+
+        Controller-joined connections never receive a renderer-directed
+        ``SET_STATE`` with track refs (handoff capture + live 2026-07-08):
+        on ``SRVR_RNDR_SET_ACTIVE`` the reference web client starts playback
+        by itself from its controller-side mirror. Synthesize the rich
+        SET_STATE the renderer role used to receive and feed it through the
+        normal command path.
+        """
+        if self._suppress_takeover_once:
+            self._suppress_takeover_once = False
+            return
+        if self.qobuz_state.current_item is None:
+            self._derive_current_from_track_index()
+        # Refresh the snapshot in the background — queue edits made while we
+        # were inactive don't reach us unprompted.
+        await self.maybe_ask_for_queue_state()
+        current = self.qobuz_state.current_item
+        if current is None or self.qobuz_state.playing_state is not PlayingState.PLAYING:
+            # Idle or paused session — just announce ourselves; playback
+            # starts when a play command arrives.
+            await self.report_state(sync_from_ma=False)
+            return
+        self.bridge.logger.info(
+            "Taking over Qobuz playback: track=%s position=%sms",
+            current.track_id,
+            self.qobuz_state.position_ms,
+        )
+        await self.command_handler.handle_set_state(
+            SetStateEvent(
+                playing_state=PlayingState.PLAYING,
+                position_ms=self.qobuz_state.position_ms or 0,
+                queue_version=self.qobuz_state.queue_version,
+                current_item=current,
+                next_item=self.qobuz_state.next_item,
+            )
+        )
+
+    def suppress_takeover_once(self) -> None:
+        """Skip the takeover for the next activation (MA-origin ``activate_self``)."""
+        self._suppress_takeover_once = True
 
     def register_outbound_action(
         self, kind: OutboundActionKind, queue_version: QueueVersion
@@ -782,6 +871,7 @@ class QobuzConnectSyncEngine:
         ``_last_asked_qv`` coalesces all entry points and re-asks on qv bumps.
         """
         self.qobuz_state.queue_version = event.queue_version
+        self.qobuz_state.track_index = event.track_index
         await self.maybe_ask_for_queue_state()
 
     async def maybe_ask_for_queue_state(self) -> None:
@@ -1125,3 +1215,12 @@ class QobuzConnectSyncEngine:
         if not player_id:
             raise PlayerUnavailableError("No Music Assistant player available for Qobuz Connect")
         return player_id
+
+    def _derive_current_from_track_index(self) -> None:
+        """Point ``current_item``/``next_item`` at ``tracks[track_index]``."""
+        tracks = self.qobuz_state.tracks
+        if not tracks:
+            return
+        index = max(0, min(self.qobuz_state.track_index, len(tracks) - 1))
+        self.qobuz_state.current_item = tracks[index]
+        self.qobuz_state.next_item = tracks[index + 1] if index + 1 < len(tracks) else None

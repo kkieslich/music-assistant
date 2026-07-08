@@ -176,3 +176,39 @@ def test_parse_add_and_remove_renderer_and_active_changed() -> None:
     changed.messageType = QConnectMessageType.SRVR_CTRL_ACTIVE_RENDERER_CHANGED
     changed.srvrCtrlActiveRendererChanged.rendererId = 4
     assert codec.parse_active_renderer_changed(changed) == 4
+
+
+def test_parse_renderer_state_updated() -> None:
+    """The type-82 broadcast decodes into a RendererStateUpdate with presence-aware fields."""
+    codec = _codec()
+    msg = payload_pb2.QConnectMessage()
+    msg.messageType = QConnectMessageType.SRVR_CTRL_RENDERER_STATE_UPDATED
+    msg.srvrCtrlRendererStateUpdated.rendererId = 2
+    msg.srvrCtrlRendererStateUpdated.state.playingState = PlayingState.PLAYING
+    msg.srvrCtrlRendererStateUpdated.state.currentPosition.value = 42000
+    msg.srvrCtrlRendererStateUpdated.state.duration = 174000
+    msg.srvrCtrlRendererStateUpdated.state.currentQueueIndex = 3
+
+    update = codec.parse_renderer_state_updated(msg)
+    assert update is not None
+    assert update.renderer_id == 2
+    assert update.playing_state is PlayingState.PLAYING
+    assert update.position_ms == 42000
+    assert update.duration_ms == 174000
+    assert update.current_queue_index == 3
+    assert update.next_queue_item_id is None
+
+
+def test_parse_renderer_state_updated_sparse_fields() -> None:
+    """Fields the renderer didn't report come back as None, not zero."""
+    codec = _codec()
+    msg = payload_pb2.QConnectMessage()
+    msg.messageType = QConnectMessageType.SRVR_CTRL_RENDERER_STATE_UPDATED
+    msg.srvrCtrlRendererStateUpdated.rendererId = 2
+    msg.srvrCtrlRendererStateUpdated.state.playingState = PlayingState.PLAYING
+
+    update = codec.parse_renderer_state_updated(msg)
+    assert update is not None
+    assert update.position_ms is None
+    assert update.duration_ms is None
+    assert update.current_queue_index is None

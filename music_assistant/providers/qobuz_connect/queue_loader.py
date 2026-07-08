@@ -131,6 +131,7 @@ class QueueLoader:
         if current_index is None:
             current_index = 0
         if not engine._is_active:
+            engine.suppress_takeover_once()
             await controller.activate_self()
         queue_version = QueueVersion(
             engine.qobuz_state.queue_version.major,

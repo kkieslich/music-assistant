@@ -49,7 +49,6 @@ LOGGER = logging.getLogger(__name__)
 # See ARCHITECTURE.md (Tier-3).
 _KNOWN_IGNORED_MESSAGE_TYPES: frozenset[int] = frozenset(
     {
-        82,  # SRVR_CTRL_RENDERER_STATE_UPDATED
         84,  # SRVR_CTRL_UPDATE_RENDERER
         87,  # SRVR_CTRL_VOLUME_CHANGED
         97,  # SRVR_CTRL_LOOP_MODE_SET
@@ -287,6 +286,20 @@ class InboundDispatcher:
             self._logger.debug("Qobuz ACTIVE_RENDERER_CHANGED id=%s", renderer_id)
             await self._cb.on_active_renderer_changed(renderer_id)
 
+    async def _on_renderer_state_updated(self, msg: Any) -> None:
+        if self._cb.on_renderer_state_updated is None:
+            self._logger.debug("Qobuz broadcast ignored: type=%s", msg.messageType)
+            return
+        if update := self._codec.parse_renderer_state_updated(msg):
+            self._logger.debug(
+                "Qobuz RENDERER_STATE_UPDATED id=%s state=%s pos=%s idx=%s",
+                update.renderer_id,
+                update.playing_state,
+                update.position_ms,
+                update.current_queue_index,
+            )
+            await self._cb.on_renderer_state_updated(update)
+
     # Dispatch table — populated below at class scope (`__class_getitem__`
     # style with the methods just defined). Keeps each branch one line
     # long and makes adding a new type a single entry.
@@ -318,5 +331,8 @@ InboundDispatcher._HANDLER_TABLE = {
     QConnectMessageType.SRVR_CTRL_REMOVE_RENDERER: InboundDispatcher._on_remove_renderer,
     QConnectMessageType.SRVR_CTRL_ACTIVE_RENDERER_CHANGED: (
         InboundDispatcher._on_active_renderer_changed
+    ),
+    QConnectMessageType.SRVR_CTRL_RENDERER_STATE_UPDATED: (
+        InboundDispatcher._on_renderer_state_updated
     ),
 }

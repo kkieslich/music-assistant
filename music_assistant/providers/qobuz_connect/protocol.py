@@ -52,6 +52,7 @@ from .models import (
     QueueTracksReorderedEvent,
     QueueVersion,
     RendererRecord,
+    RendererStateUpdate,
     SessionStateEvent,
     SetStateEvent,
 )
@@ -89,10 +90,6 @@ class QobuzConnectCodec:
         """Initialize codec."""
         self.device_uuid = device_uuid
         self._msg_counter = 0
-
-    def _next_msg_id(self) -> int:
-        self._msg_counter += 1
-        return self._msg_counter
 
     @staticmethod
     def now_ms() -> int:
@@ -887,6 +884,35 @@ class QobuzConnectCodec:
             return None
         return int(msg.srvrCtrlActiveRendererChanged.rendererId)
 
+    @staticmethod
+    def parse_renderer_state_updated(msg: Any) -> RendererStateUpdate | None:
+        """Parse ``SRVR_CTRL_RENDERER_STATE_UPDATED`` into a :class:`RendererStateUpdate`."""
+        if not msg.HasField("srvrCtrlRendererStateUpdated"):
+            return None
+        upd = msg.srvrCtrlRendererStateUpdated
+        state = upd.state
+        playing_state: PlayingState | None = None
+        if state.HasField("playingState"):
+            try:
+                playing_state = PlayingState(state.playingState)
+            except ValueError:
+                playing_state = None
+        position_ms: int | None = None
+        if state.HasField("currentPosition") and state.currentPosition.HasField("value"):
+            position_ms = int(state.currentPosition.value)
+        return RendererStateUpdate(
+            renderer_id=int(upd.rendererId),
+            playing_state=playing_state,
+            position_ms=position_ms,
+            duration_ms=int(state.duration) if state.HasField("duration") else None,
+            current_queue_index=(
+                int(state.currentQueueIndex) if state.HasField("currentQueueIndex") else None
+            ),
+            next_queue_item_id=(
+                int(state.nextQueueItemId) if state.HasField("nextQueueItemId") else None
+            ),
+        )
+
     def encode_volume_muted(self, muted: bool) -> bytes:
         """Encode a renderer ``RNDR_SRVR_VOLUME_MUTED`` event for the Qobuz app."""
         body = payload_pb2.RndrSrvrVolumeMuted()
@@ -912,6 +938,10 @@ class QobuzConnectCodec:
         caps.volumeRemoteControl = 2
         device_info.capabilities.CopyFrom(caps)
         return device_info
+
+    def _next_msg_id(self) -> int:
+        self._msg_counter += 1
+        return self._msg_counter
 
     def _encode_batch(self, *messages: Any) -> bytes:
         batch = payload_pb2.QConnectBatch()

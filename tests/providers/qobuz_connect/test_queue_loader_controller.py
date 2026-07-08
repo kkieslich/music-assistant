@@ -98,11 +98,16 @@ class FakeEngine:
         self._is_active = True
         self._last_ma_origin_track_id: str | None = None
         self.reported = 0
+        self.takeover_suppressed = 0
 
     def register_outbound_action(self, kind: OutboundActionKind, _qv: QueueVersion) -> bytes:
         """Return a fixed action_uuid, asserting the LOAD kind is used."""
         assert kind == OutboundActionKind.LOAD
         return b"\x0a" * 16
+
+    def suppress_takeover_once(self) -> None:
+        """Count takeover suppressions requested before ``activate_self``."""
+        self.takeover_suppressed += 1
 
     async def report_state(self) -> None:
         """Count report_state calls."""
@@ -143,6 +148,9 @@ async def test_ma_origin_load_activates_self_when_inactive() -> None:
     ref["engine"] = engine
     await QueueLoader(cast("Any", engine)).send_ma_origin_load("222", _queue_playing())
     assert controller.calls[0] == ("activate_self", None)
+    # The SET_ACTIVE echo of a self-initiated activation must not trigger
+    # a takeover of the stale mirror queue.
+    assert engine.takeover_suppressed == 1
 
 
 async def test_ma_origin_load_falls_back_when_controller_disabled() -> None:
