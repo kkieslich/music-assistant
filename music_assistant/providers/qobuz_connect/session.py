@@ -80,6 +80,10 @@ TOKEN_REFRESH_RETRY_DELAY = 30.0
 INITIAL_RECONNECT_DELAY = 1.0
 MAX_RECONNECT_DELAY = 60.0
 REJOIN_MIN_INTERVAL = 5.0
+# The cloud rejects frames whose envelope timestamp is older than ~2s
+# ("Message too old", observed live 2026-07-08) and the rejection can drop
+# the connection — queued frames past this age are discarded, not flushed.
+PENDING_MAX_AGE = 2.0
 
 
 class TokenRefreshRequired(Exception):
@@ -169,7 +173,7 @@ class QobuzConnectSession:
         self._is_connected = False
         self._receive_task: asyncio.Task[None] | None = None
         self._token_refresh_close_task: asyncio.Task[None] | None = None
-        self._pending_messages: list[bytes] = []
+        self._pending_messages: list[tuple[float, bytes]] = []
         self._reconnect_delay = INITIAL_RECONNECT_DELAY
         self._last_rejoin_monotonic: float = 0.0
         self._cb = callbacks
@@ -506,7 +510,7 @@ class QobuzConnectSession:
                 LOGGER.debug("Qobuz websocket closed while sending; message queued")
             except Exception:
                 LOGGER.exception("Failed to send Qobuz websocket message")
-        self._pending_messages.append(data)
+        self._pending_messages.append((time.monotonic(), data))
         return False
 
     async def _connection_loop(self) -> None:
@@ -616,12 +620,16 @@ class QobuzConnectSession:
             return
         pending = self._pending_messages
         self._pending_messages = []
-        for index, data in enumerate(pending):
+        cutoff = time.monotonic() - PENDING_MAX_AGE
+        fresh = [(ts, data) for ts, data in pending if ts >= cutoff]
+        if dropped := len(pending) - len(fresh):
+            LOGGER.debug("Dropped %d stale queued Qobuz frame(s) on reconnect", dropped)
+        for index, (_ts, data) in enumerate(fresh):
             try:
                 await self._ws.send(data)
             except websockets.ConnectionClosed:
                 LOGGER.debug("Qobuz websocket closed while flushing messages")
-                self._pending_messages = pending[index:] + self._pending_messages
+                self._pending_messages = fresh[index:] + self._pending_messages
                 break
             except Exception:
                 LOGGER.exception("Failed to flush Qobuz websocket message")
@@ -671,27 +679,38 @@ class QobuzConnectSession:
         """
         Re-register with the cloud after an inbound ERROR frame.
 
-        The cloud can silently deregister a renderer while its socket stays
-        open (observed when a shared-deviceUuid controller connection
-        disconnects) — every state report is then answered with a type-1
-        ERROR. Re-sending SUBSCRIBE + JOIN_SESSION restores registration.
-        Rate-limited so an ERROR storm can't loop.
+        The cloud can silently deregister a device while its socket stays
+        open — every state report is then answered with a message-level
+        type-1 error. Re-sending the role-appropriate SUBSCRIBE + JOIN
+        restores registration. Rate-limited so an error storm can't loop.
         """
-        if self.role is not SessionRole.RENDERER:
+        if not self._ws or not self._is_connected:
             return
-        if not self._ws or not self._is_connected or not self._session_uuid:
+        session_uuid = self._session_uuid
+        if self.role is SessionRole.RENDERER and session_uuid is None:
             return
         now = time.monotonic()
         if now - self._last_rejoin_monotonic < REJOIN_MIN_INTERVAL:
             return
         self._last_rejoin_monotonic = now
-        LOGGER.info("Qobuz Connect ERROR received — re-joining session as renderer")
-        await self._ws.send(self._codec.encode_subscribe(self._session_uuid))
+        LOGGER.info("Qobuz Connect ERROR received — re-joining session (role=%s)", self.role.value)
+        if self.role is SessionRole.CONTROLLER:
+            await self._ws.send(self._codec.encode_subscribe(None))
+            await self._ws.send(
+                self._codec.encode_ctrl_join_session(
+                    self._device_uuid,
+                    self.device.name,
+                    self.device.max_quality,
+                )
+            )
+            return
+        assert session_uuid is not None
+        await self._ws.send(self._codec.encode_subscribe(session_uuid))
         await self._ws.send(
             self._codec.encode_join_session(
                 self._device_uuid,
                 self.device.name,
-                self._session_uuid,
+                session_uuid,
                 self.device.max_quality,
             )
         )

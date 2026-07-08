@@ -60,6 +60,7 @@ from .models import (
     ConnectTokens,
     DeviceConfig,
     JWTConnectToken,
+    SessionRole,
 )
 from .session import QobuzConnectSession, SessionCallbacks
 from .sync import QobuzConnectSyncEngine
@@ -201,7 +202,16 @@ class QobuzConnectProvider(PluginProvider):
         self._discovery: QobuzConnectDiscovery | None = None
         self._session: QobuzConnectSession | None = None
         self._enable_controller = bool(config.get_value(CONF_ENABLE_CONTROLLER))
-        self.controller: QobuzConnectController | None = None
+        # Registry state + verb API over the single shared cloud session.
+        self.controller: QobuzConnectController | None = (
+            QobuzConnectController(
+                uuid.UUID(self._device_uuid).bytes,
+                self.logger,
+                lambda: self._session,
+            )
+            if self._enable_controller
+            else None
+        )
         self._sync = QobuzConnectSyncEngine(self)
         self._ws_setup_lock = asyncio.Lock()
         self._unsubscribe_queue_events: Callable[[], None] | None = None
@@ -265,9 +275,6 @@ class QobuzConnectProvider(PluginProvider):
             self._unsubscribe_player_events()
             self._unsubscribe_player_events = None
         await self._sync.stop()
-        if self.controller is not None:
-            await self.controller.stop()
-            self.controller = None
         if self._session:
             await self._session.stop()
         if self._discovery:
@@ -321,19 +328,23 @@ class QobuzConnectProvider(PluginProvider):
                 self._session.set_tokens(tokens)
                 await self._broadcast_current_volume()
                 await self._session.send_quality_reports(self._max_quality)
-                await self._ensure_controller()
                 return
 
+            # Single dual-role socket, like the reference web client: joined
+            # via CtrlSrvrJoinSession it both reports renderer state and
+            # sends controller verbs, so there is no second connection to
+            # race against (renderer-role join is the legacy fallback when
+            # the controller feature is disabled).
             self._session = QobuzConnectSession(
                 self._device_config,
                 self._build_session_callbacks(),
                 token_refresher=self._refresh_ws_token,
+                role=SessionRole.CONTROLLER if self._enable_controller else SessionRole.RENDERER,
             )
             self._session.set_tokens(tokens)
             await self._session.start()
             await self._broadcast_current_volume()
             await self._session.send_quality_reports(self._max_quality)
-            await self._ensure_controller()
             self.logger.info("Qobuz Connect WebSocket connected")
 
     def _build_session_callbacks(self) -> SessionCallbacks:
@@ -364,21 +375,13 @@ class QobuzConnectProvider(PluginProvider):
             on_state_request=self._sync.report_state,
             on_set_active=self._on_set_active,
             on_session_state=self._sync.handle_session_state,
+            on_add_renderer=self.controller._on_add_renderer if self.controller else None,
+            on_remove_renderer=self.controller._on_remove_renderer if self.controller else None,
+            on_active_renderer_changed=(
+                self.controller._on_active_renderer_changed if self.controller else None
+            ),
+            on_disconnected=self.controller._on_disconnected if self.controller else None,
         )
-
-    async def _ensure_controller(self) -> None:
-        """Start the controller-role connection if enabled and not yet running."""
-        if not self._enable_controller or self.controller is not None:
-            return
-        self.controller = QobuzConnectController(
-            self._device_config,
-            uuid.UUID(self._device_uuid).bytes,
-            self._refresh_ws_token,
-            self.logger,
-            self._build_session_callbacks(),
-        )
-        await self.controller.start()
-        self.logger.info("Qobuz Connect controller connection started")
 
     async def _on_quality_change(self, new_quality: int) -> None:
         """Remember quality selected in Qobuz app."""

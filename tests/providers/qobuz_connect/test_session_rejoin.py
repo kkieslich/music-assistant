@@ -94,11 +94,54 @@ async def test_rejoin_is_rate_limited() -> None:
     assert REJOIN_MIN_INTERVAL > 0
 
 
-async def test_controller_session_does_not_rejoin_as_renderer() -> None:
-    """Test that controller sessions do not rejoin on ERROR."""
+def _inner_field_name(frame: bytes) -> str:
+    """Return the union field name of the first inner message in a PAYLOAD frame."""
+    from typing import Any  # noqa: PLC0415
+
+    from music_assistant.providers.qobuz_connect.proto import (  # noqa: PLC0415
+        qconnect_envelope_pb2 as _envelope_pb2,
+    )
+    from music_assistant.providers.qobuz_connect.proto import (  # noqa: PLC0415
+        qconnect_payload_pb2 as _payload_pb2,
+    )
+
+    envelope_pb2: Any = _envelope_pb2
+    payload_pb2: Any = _payload_pb2
+    # Strip outer frame: type byte + varint length.
+    length = 0
+    shift = 0
+    pos = 1
+    while True:
+        byte = frame[pos]
+        length |= (byte & 0x7F) << shift
+        pos += 1
+        if not byte & 0x80:
+            break
+        shift += 7
+    payload_msg = envelope_pb2.Payload()
+    payload_msg.ParseFromString(frame[pos : pos + length])
+    batch = payload_pb2.QConnectBatch()
+    batch.ParseFromString(payload_msg.payload)
+    for fld, _val in batch.messages[0].ListFields():
+        if fld.message_type:
+            return str(fld.name)
+    return ""
+
+
+async def test_controller_session_rejoins_with_ctrl_join() -> None:
+    """A controller-role session re-sends SUBSCRIBE(empty) + CtrlSrvrJoinSession on ERROR."""
     session, fake = _session(role=SessionRole.CONTROLLER)
     await session._handle_message(_error_frame())
-    assert fake.sent == []
+    assert len(fake.sent) == 2
+    assert _inner_field_name(fake.sent[1]) == "ctrlSrvrJoinSession"
+
+
+async def test_renderer_rejoin_sends_renderer_join() -> None:
+    """The renderer-role rejoin still re-sends RndrSrvrJoinSession."""
+    session, fake = _session()
+    await session._handle_message(_error_frame())
+    assert len(fake.sent) == 2
+    assert _inner_field_name(fake.sent[1]) == "rndrSrvrJoinSession"
 
 
 async def test_renderer_rejoins_after_inner_error_message() -> None:
