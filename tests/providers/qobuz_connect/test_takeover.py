@@ -64,17 +64,32 @@ def _install_spy(engine: QobuzConnectSyncEngine) -> _SetStateSpy:
 
 
 async def test_session_state_stores_track_index() -> None:
-    """SESSION_STATE's trackIndex lands on the mirror."""
+    """SESSION_STATE's trackIndex (a next-track read pointer) maps to current index."""
     engine = _engine()
     await engine.handle_session_state(
         SessionStateEvent(
             session_uuid=b"\x01" * 16,
             session_id=1,
             queue_version=QueueVersion(30, 1),
-            track_index=2,
+            track_index=3,
         )
     )
+    # trackIndex=3 means "next track is index 3" -> current is index 2
     assert engine.qobuz_state.track_index == 2
+
+
+async def test_session_state_track_index_zero_clamps() -> None:
+    """A fresh queue (pointer 0, nothing played) resolves to index 0."""
+    engine = _engine()
+    await engine.handle_session_state(
+        SessionStateEvent(
+            session_uuid=b"\x01" * 16,
+            session_id=1,
+            queue_version=QueueVersion(30, 1),
+            track_index=0,
+        )
+    )
+    assert engine.qobuz_state.track_index == 0
 
 
 async def test_renderer_state_updated_feeds_mirror_while_inactive() -> None:

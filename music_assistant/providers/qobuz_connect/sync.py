@@ -900,7 +900,12 @@ class QobuzConnectSyncEngine:
         ``_last_asked_qv`` coalesces all entry points and re-asks on qv bumps.
         """
         self.qobuz_state.queue_version = event.queue_version
-        self.qobuz_state.track_index = event.track_index
+        # SESSION_STATE's trackIndex is the queue *read pointer* — the index
+        # of the NEXT track to pull, i.e. current + 1 (live 2026-07-08: the
+        # phone was on index 2, trackIndex said 3, and a takeover of
+        # tracks[trackIndex] started one track too far). Type-82 broadcasts
+        # carry the actual current index and need no adjustment.
+        self.qobuz_state.track_index = max(0, event.track_index - 1)
         await self.maybe_ask_for_queue_state()
 
     async def maybe_ask_for_queue_state(self) -> None:
