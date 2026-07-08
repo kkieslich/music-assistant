@@ -10,6 +10,7 @@ from music_assistant.providers.qobuz_connect.models import (
 from music_assistant.providers.qobuz_connect.reducer import reduce
 from music_assistant.providers.qobuz_connect.sync_types import (
     CanonicalState,
+    CloudRendererStateUpdated,
     CloudSetActive,
     CloudSetState,
     MaPause,
@@ -113,3 +114,46 @@ def test_setactive_takeover_paused_does_not_play() -> None:
     )
     result = reduce(state, CloudSetActive(now_ms=1, active=True))
     assert not any(isinstance(e, MaPlayTrack) for e in result.effects)
+
+
+def test_renderer_state_updated_while_inactive_folds_current_index() -> None:
+    """Another renderer's broadcast advances canonical current_id via current_index (no -1)."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0, 1, 2),
+        current_id=0,
+        playing=PlayingState.PLAYING,
+        active=False,
+    )
+    result = reduce(
+        state,
+        CloudRendererStateUpdated(
+            now_ms=1, renderer_id=9, playing=PlayingState.PLAYING, position_ms=1000, current_index=2
+        ),
+    )
+    assert result.state.current_id == 2  # tracks[2].queue_item_id, no -1
+    assert result.effects == ()  # not the active renderer -> no MA effect
+
+
+def test_heartbeat_position_zero_is_preserved() -> None:
+    """A position-only update to 0 (rewind) is not swallowed as 'absent'."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0, 1),
+        current_id=0,
+        playing=PlayingState.PLAYING,
+        position_ms=500,
+        active=True,
+    )
+    result = reduce(
+        state,
+        CloudSetState(
+            now_ms=1,
+            version=None,
+            playing=PlayingState.PLAYING,
+            position_ms=0,
+            current_ref=_refs(0)[0],
+            next_ref=None,
+        ),
+    )
+    assert result.state.position_ms == 0
