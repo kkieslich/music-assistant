@@ -217,8 +217,13 @@ def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
         # aren't active; once we're active it's our own echo or irrelevant.
         if state.active:
             return ReduceResult(state, ())
+        current_id = state.current_id
+        if event.current_index is not None and state.tracks:
+            idx = max(0, min(event.current_index, len(state.tracks) - 1))
+            current_id = state.tracks[idx].queue_item_id
         new = dataclasses.replace(
             state,
+            current_id=current_id,
             playing=event.playing or state.playing,
             position_ms=event.position_ms if event.position_ms is not None else state.position_ms,
         )
@@ -288,7 +293,10 @@ def _apply_transport(
         return ReduceResult(new, (MaSeek(position_ms),))
     # Position/heartbeat only: no MA effect, ever.
     return ReduceResult(
-        dataclasses.replace(state, position_ms=position_ms or state.position_ms), ()
+        dataclasses.replace(
+            state, position_ms=position_ms if position_ms is not None else state.position_ms
+        ),
+        (),
     )
 
 
