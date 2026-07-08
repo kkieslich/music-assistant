@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from .models import QConnectMessageType
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from .protocol import QobuzConnectCodec
     from .session import SessionCallbacks
 
@@ -67,12 +69,32 @@ def _format_track_ref(ref: Any) -> str:
 class InboundDispatcher:
     """Routes a decoded inner ``QConnectMessage`` to the right callback."""
 
-    __slots__ = ("_cb", "_codec")
+    __slots__ = ("_cb", "_codec", "_logger", "_on_error_message")
 
-    def __init__(self, codec: QobuzConnectCodec, callbacks: SessionCallbacks) -> None:
-        """Hold the codec + callback bundle this dispatcher will fan out to."""
+    def __init__(
+        self,
+        codec: QobuzConnectCodec,
+        callbacks: SessionCallbacks,
+        *,
+        label: str = "",
+        on_error_message: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        """
+        Hold the codec + callback bundle this dispatcher will fan out to.
+
+        :param codec: Codec used to parse inner messages.
+        :param callbacks: Provider callback bundle to fan out to.
+        :param label: Optional connection label (e.g. the session role) used
+            as a child-logger suffix so renderer and controller connection
+            log lines are distinguishable.
+        :param on_error_message: Optional hook invoked for message-level
+            errors (``messageType`` 1) — the shape the cloud uses to reject
+            frames from a deregistered renderer.
+        """
         self._codec = codec
         self._cb = callbacks
+        self._logger = LOGGER.getChild(label) if label else LOGGER
+        self._on_error_message = on_error_message
 
     async def dispatch(self, msg: Any) -> None:
         """Parse and forward a single inner message."""
@@ -82,15 +104,24 @@ class InboundDispatcher:
             await handler(self, msg)
             return
         if msg_type in _KNOWN_IGNORED_MESSAGE_TYPES:
-            LOGGER.debug("Qobuz broadcast ignored: type=%s", msg_type)
+            self._logger.debug("Qobuz broadcast ignored: type=%s", msg_type)
             return
-        LOGGER.debug("Unhandled Qobuz Connect message type: %s", msg_type)
+        self._logger.debug("Unhandled Qobuz Connect message type: %s", msg_type)
 
     # ---- per-type handlers (kept short; the table maps to each) ----------
 
+    async def _on_error(self, msg: Any) -> None:
+        # Message-level rejection — observed live when the cloud has
+        # deregistered this renderer but the socket is still open.
+        code = msg.error.code if msg.HasField("error") else "?"
+        message = msg.error.message if msg.HasField("error") else ""
+        self._logger.warning("Qobuz Connect message error %s: %s", code, message)
+        if self._on_error_message is not None:
+            await self._on_error_message()
+
     async def _on_set_state(self, msg: Any) -> None:
         if event := self._codec.parse_set_state(msg):
-            LOGGER.debug(
+            self._logger.debug(
                 "Qobuz SET_STATE state=%s pos=%s current=%s next=%s qv=%s",
                 event.playing_state,
                 event.position_ms,
@@ -117,27 +148,27 @@ class InboundDispatcher:
         if not msg.HasField("srvrRndrSetActive"):
             return
         active = bool(msg.srvrRndrSetActive.active)
-        LOGGER.debug("Qobuz SET_ACTIVE active=%s", active)
+        self._logger.debug("Qobuz SET_ACTIVE active=%s", active)
         await self._cb.on_set_active(active)
 
     async def _on_set_loop_mode(self, msg: Any) -> None:
         if (mode := self._codec.parse_set_loop_mode(msg)) is not None:
-            LOGGER.debug("Qobuz SET_LOOP_MODE mode=%s", mode)
+            self._logger.debug("Qobuz SET_LOOP_MODE mode=%s", mode)
             await self._cb.on_loop_mode(mode)
 
     async def _on_set_shuffle_mode(self, msg: Any) -> None:
         if (shuffle := self._codec.parse_set_shuffle_mode(msg)) is not None:
-            LOGGER.debug("Qobuz SET_SHUFFLE_MODE on=%s", shuffle)
+            self._logger.debug("Qobuz SET_SHUFFLE_MODE on=%s", shuffle)
             await self._cb.on_shuffle_mode(shuffle)
 
     async def _on_set_autoplay_mode(self, msg: Any) -> None:
         if (autoplay := self._codec.parse_set_autoplay_mode(msg)) is not None:
-            LOGGER.debug("Qobuz SET_AUTOPLAY_MODE on=%s", autoplay)
+            self._logger.debug("Qobuz SET_AUTOPLAY_MODE on=%s", autoplay)
             await self._cb.on_autoplay_mode(autoplay)
 
     async def _on_queue_load_ack(self, msg: Any) -> None:
         if ack := self._codec.parse_queue_load_ack(msg):
-            LOGGER.debug(
+            self._logger.debug(
                 "Qobuz queue-load ACK qv=%s tracks=%s",
                 ack.queue_version,
                 [_format_track_ref(track) for track in ack.tracks],
@@ -146,7 +177,7 @@ class InboundDispatcher:
 
     async def _on_autoplay_load_ack(self, msg: Any) -> None:
         if ack := self._codec.parse_autoplay_load_ack(msg):
-            LOGGER.debug(
+            self._logger.debug(
                 "Qobuz autoplay-load ACK qv=%s tracks=%s",
                 ack.queue_version,
                 [_format_track_ref(track) for track in ack.tracks],
@@ -163,7 +194,7 @@ class InboundDispatcher:
 
     async def _on_queue_state(self, msg: Any) -> None:
         if snapshot := self._codec.parse_queue_state(msg):
-            LOGGER.debug(
+            self._logger.debug(
                 "Qobuz QUEUE_STATE qv=%s tracks=%d shuffle=%s autoplay=%s",
                 snapshot.queue_version,
                 len(snapshot.tracks),
@@ -174,7 +205,7 @@ class InboundDispatcher:
 
     async def _on_queue_tracks_added(self, msg: Any) -> None:
         if added := self._codec.parse_queue_tracks_added(msg):
-            LOGGER.debug(
+            self._logger.debug(
                 "Qobuz QUEUE_TRACKS_ADDED qv=%s tracks=%s",
                 added.queue_version,
                 [_format_track_ref(track) for track in added.tracks],
@@ -183,7 +214,7 @@ class InboundDispatcher:
 
     async def _on_queue_tracks_inserted(self, msg: Any) -> None:
         if inserted := self._codec.parse_queue_tracks_inserted(msg):
-            LOGGER.debug(
+            self._logger.debug(
                 "Qobuz QUEUE_TRACKS_INSERTED qv=%s after=%s tracks=%s",
                 inserted.queue_version,
                 inserted.insert_after,
@@ -193,7 +224,7 @@ class InboundDispatcher:
 
     async def _on_queue_tracks_removed(self, msg: Any) -> None:
         if removed := self._codec.parse_queue_tracks_removed(msg):
-            LOGGER.debug(
+            self._logger.debug(
                 "Qobuz QUEUE_TRACKS_REMOVED qv=%s ids=%s",
                 removed.queue_version,
                 removed.queue_item_ids,
@@ -202,7 +233,7 @@ class InboundDispatcher:
 
     async def _on_queue_tracks_reordered(self, msg: Any) -> None:
         if reordered := self._codec.parse_queue_tracks_reordered(msg):
-            LOGGER.debug(
+            self._logger.debug(
                 "Qobuz QUEUE_TRACKS_REORDERED qv=%s after=%s ids=%s",
                 reordered.queue_version,
                 reordered.insert_after,
@@ -212,16 +243,16 @@ class InboundDispatcher:
 
     async def _on_queue_cleared(self, msg: Any) -> None:
         if cleared := self._codec.parse_queue_cleared(msg):
-            LOGGER.debug("Qobuz QUEUE_CLEARED qv=%s", cleared.queue_version)
+            self._logger.debug("Qobuz QUEUE_CLEARED qv=%s", cleared.queue_version)
             await self._cb.on_queue_cleared(cleared)
 
     async def _on_state_request(self, _msg: Any) -> None:
-        LOGGER.debug("Qobuz requested renderer state")
+        self._logger.debug("Qobuz requested renderer state")
         await self._cb.on_state_request()
 
     async def _on_session_state(self, msg: Any) -> None:
         if event := self._codec.parse_session_state(msg):
-            LOGGER.debug(
+            self._logger.debug(
                 "Qobuz SESSION_STATE sessionId=%s qv=%s.%s trackIndex=%s",
                 event.session_id,
                 event.queue_version.major,
@@ -232,28 +263,28 @@ class InboundDispatcher:
 
     async def _on_add_renderer(self, msg: Any) -> None:
         if self._cb.on_add_renderer is None:
-            LOGGER.debug("Qobuz broadcast ignored: type=%s", msg.messageType)
+            self._logger.debug("Qobuz broadcast ignored: type=%s", msg.messageType)
             return
         if record := self._codec.parse_add_renderer(msg):
-            LOGGER.debug(
+            self._logger.debug(
                 "Qobuz ADD_RENDERER id=%s name=%s", record.renderer_id, record.friendly_name
             )
             await self._cb.on_add_renderer(record)
 
     async def _on_remove_renderer(self, msg: Any) -> None:
         if self._cb.on_remove_renderer is None:
-            LOGGER.debug("Qobuz broadcast ignored: type=%s", msg.messageType)
+            self._logger.debug("Qobuz broadcast ignored: type=%s", msg.messageType)
             return
         if (renderer_id := self._codec.parse_remove_renderer(msg)) is not None:
-            LOGGER.debug("Qobuz REMOVE_RENDERER id=%s", renderer_id)
+            self._logger.debug("Qobuz REMOVE_RENDERER id=%s", renderer_id)
             await self._cb.on_remove_renderer(renderer_id)
 
     async def _on_active_renderer_changed(self, msg: Any) -> None:
         if self._cb.on_active_renderer_changed is None:
-            LOGGER.debug("Qobuz broadcast ignored: type=%s", msg.messageType)
+            self._logger.debug("Qobuz broadcast ignored: type=%s", msg.messageType)
             return
         if (renderer_id := self._codec.parse_active_renderer_changed(msg)) is not None:
-            LOGGER.debug("Qobuz ACTIVE_RENDERER_CHANGED id=%s", renderer_id)
+            self._logger.debug("Qobuz ACTIVE_RENDERER_CHANGED id=%s", renderer_id)
             await self._cb.on_active_renderer_changed(renderer_id)
 
     # Dispatch table — populated below at class scope (`__class_getitem__`
@@ -263,6 +294,7 @@ class InboundDispatcher:
 
 
 InboundDispatcher._HANDLER_TABLE = {
+    QConnectMessageType.ERROR: InboundDispatcher._on_error,
     QConnectMessageType.SRVR_RNDR_SET_STATE: InboundDispatcher._on_set_state,
     QConnectMessageType.SRVR_RNDR_SET_VOLUME: InboundDispatcher._on_set_volume,
     QConnectMessageType.SRVR_RNDR_SET_MAX_AUDIO_QUALITY: InboundDispatcher._on_set_max_quality,

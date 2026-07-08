@@ -177,7 +177,15 @@ class QobuzConnectSession:
         # (SessionCallbacks), so we defer the import to break the cycle.
         from .inbound_dispatcher import InboundDispatcher  # noqa: PLC0415
 
-        self._dispatcher = InboundDispatcher(self._codec, callbacks)
+        self._dispatcher = InboundDispatcher(
+            self._codec,
+            callbacks,
+            label=self.role.value,
+            # The cloud rejects frames from a deregistered renderer with
+            # message-level errors (type 1), not outer ERROR frames — both
+            # must funnel into the same rate-limited rejoin.
+            on_error_message=self._maybe_rejoin_after_error,
+        )
 
     @property
     def is_connected(self) -> bool:

@@ -71,6 +71,7 @@ class OuterMessageType(IntEnum):
 class QConnectMessageType(IntEnum):
     """QConnect payload message types used by this provider."""
 
+    ERROR = 1
     RNDR_SRVR_JOIN_SESSION = 21
     RNDR_SRVR_STATE_UPDATED = 23
     RNDR_SRVR_VOLUME_CHANGED = 25
