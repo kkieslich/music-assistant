@@ -123,17 +123,32 @@ def test_encode_ctrl_set_player_state_partial_fields() -> None:
 
 
 def test_encode_queue_load_tracks_packs_track_ids() -> None:
-    """Multi-track load packs N little-endian uint32 ids into wire field 3."""
+    """
+    Multi-track load matches the reference web-client shape.
+
+    N little-endian uint32 ids packed into wire field 3, plus the fields the
+    cloud validates: contextUuid (exactly 16 bytes — omitting it is rejected
+    with ERROR_QUEUE_LOAD_TRACKS "byte array must have length 16", observed
+    live 2026-07-08) and explicitly-present shufflePivotQueueItemId=0 /
+    shuffleMode=False.
+    """
+    context_uuid = uuid.UUID("99999999-8888-7777-6666-555555555555").bytes
     frame = _codec().encode_queue_load_tracks(
         action_uuid=ACTION_UUID,
         track_id="",
         queue_version=QueueVersion(21, 1),
         track_ids=[3879017, 3879018],
+        context_uuid=context_uuid,
     )
     inner = _first_inner_message(frame)
     load = inner.ctrlSrvrQueueLoadTracks
     expected = (3879017).to_bytes(4, "little") + (3879018).to_bytes(4, "little")
     assert load.sessionUuid == expected
+    assert load.contextUuid == context_uuid
+    assert load.HasField("shufflePivotQueueItemId")
+    assert load.shufflePivotQueueItemId == 0
+    assert load.HasField("shuffleMode")
+    assert load.shuffleMode is False
 
 
 def test_parse_add_and_remove_renderer_and_active_changed() -> None:

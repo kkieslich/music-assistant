@@ -150,6 +150,9 @@ class QueueLoader:
             action_uuid=action_uuid,
             track_ids=track_ids,
             queue_version=queue_version,
+            # Fresh per load, like the reference web client — the cloud
+            # validates this as a mandatory 16-byte array.
+            context_uuid=uuid.uuid4().bytes,
         )
         if not sent:
             engine._pending_queue_loads.pop(action_uuid, None)
