@@ -262,6 +262,13 @@ class QobuzConnectProvider(PluginProvider):
             self.mass.streams.bind_ip,
             self._http_port,
         )
+        # Controller mode connects to the cloud eagerly, self-minting the
+        # websocket token via qws/createToken. Waiting for the app's local
+        # handshake (the legacy renderer behavior) loses the FIRST handoff:
+        # the phone's SET_ACTIVE races our connect+join and the app bounces
+        # playback back when no renderer answers.
+        if self._enable_controller:
+            self.mass.create_task(self._setup_websocket(None))
 
     async def unload(self, is_removed: bool = False) -> None:
         """Unload provider and stop network services."""
@@ -321,11 +328,22 @@ class QobuzConnectProvider(PluginProvider):
         """Handle Qobuz app connection callback."""
         self.mass.create_task(self._setup_websocket(tokens))
 
-    async def _setup_websocket(self, tokens: ConnectTokens) -> None:
+    async def _setup_websocket(self, tokens: ConnectTokens | None) -> None:
         """Set up Qobuz Connect WebSocket command handling."""
         async with self._ws_setup_lock:
             if self._session is not None:
-                self._session.set_tokens(tokens)
+                # Swapping tokens closes and reopens the socket — never do
+                # that to a healthy controller-role connection: the local
+                # handshake happens at the exact moment the phone hands off,
+                # and the cloud needs the connection up to route SET_ACTIVE.
+                # (The handshake token adds nothing there; we self-mint via
+                # qws/createToken.) Only feed tokens to a session that is
+                # still struggling to connect, or to a legacy renderer-role
+                # session, which needs the handshake session uuid to join.
+                if tokens is not None and not (
+                    self._enable_controller and self._session.is_connected
+                ):
+                    self._session.set_tokens(tokens)
                 await self._broadcast_current_volume()
                 await self._session.send_quality_reports(self._max_quality)
                 return
@@ -341,7 +359,8 @@ class QobuzConnectProvider(PluginProvider):
                 token_refresher=self._refresh_ws_token,
                 role=SessionRole.CONTROLLER if self._enable_controller else SessionRole.RENDERER,
             )
-            self._session.set_tokens(tokens)
+            if tokens is not None:
+                self._session.set_tokens(tokens)
             await self._session.start()
             await self._broadcast_current_volume()
             await self._session.send_quality_reports(self._max_quality)
