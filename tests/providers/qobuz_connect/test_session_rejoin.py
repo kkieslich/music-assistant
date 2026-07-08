@@ -158,3 +158,37 @@ async def test_inner_error_rejoin_shares_rate_limit_with_outer() -> None:
     await session._handle_message(_inner_error_frame())
     await session._handle_message(_error_frame())
     assert len(fake.sent) == 2  # second trigger within REJOIN_MIN_INTERVAL
+
+
+def _inner_semantic_error_frame(message: str) -> bytes:
+    from typing import Any  # noqa: PLC0415
+
+    from music_assistant.providers.qobuz_connect.proto import (  # noqa: PLC0415
+        qconnect_payload_pb2 as _payload_pb2,
+    )
+
+    payload_pb2: Any = _payload_pb2
+    codec = QobuzConnectCodec(uuid.uuid4().bytes)
+    msg = payload_pb2.QConnectMessage()
+    msg.messageType = 1  # MESSAGE_TYPE_ERROR
+    msg.error.code = "1"
+    msg.error.message = message
+    return codec._encode_batch(msg)
+
+
+async def test_semantic_report_errors_do_not_rejoin() -> None:
+    """Per-report semantic rejections must not churn the session with a rejoin."""
+    for text in (
+        "Current track not found in queue nor autoplay",
+        "Renderer state updated message received from non active renderer: 3",
+    ):
+        session, fake = _session()
+        await session._handle_message(_inner_semantic_error_frame(text))
+        assert fake.sent == [], f"rejoin frames sent for semantic error: {text}"
+
+
+async def test_deregistration_error_still_rejoins() -> None:
+    """The deregistration error shape keeps triggering the rejoin."""
+    session, fake = _session()
+    await session._handle_message(_inner_semantic_error_frame("renderer not registered"))
+    assert len(fake.sent) == 2

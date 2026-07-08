@@ -11,6 +11,7 @@ from typing import Any, cast
 import pytest
 from music_assistant_models.enums import MediaType, PlaybackState
 
+from music_assistant.providers.qobuz_connect import sync as sync_module
 from music_assistant.providers.qobuz_connect.models import (
     BufferState,
     LoopMode,
@@ -3308,8 +3309,9 @@ async def test_ma_complex_reorder_skips_outbound_emit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ma_cleared_queue_sends_clear_to_cloud() -> None:
+async def test_ma_cleared_queue_sends_clear_to_cloud(monkeypatch: pytest.MonkeyPatch) -> None:
     """Clearing MA's queue (with mirror non-empty) sends ``CTRL_SRVR_CLEAR_QUEUE``."""
+    monkeypatch.setattr(sync_module, "CLEAR_EMIT_GRACE", 0)
     session = _FakeSession()
     queue = _queue(PlaybackState.PLAYING)
     provider = _FakeProvider(queue, session=session)
@@ -3323,10 +3325,40 @@ async def test_ma_cleared_queue_sends_clear_to_cloud() -> None:
 
     await engine.handle_ma_queue_items_updated(_ma_items_event("player", []))
 
+    # the clear is debounced — it only fires if MA's queue stays empty
+    pending = engine._pending_clear_task
+    assert pending is not None
+    await pending
     assert len(session.clear_queues) == 1, (
         f"Outbound CLEAR_QUEUE expected; sent={session.clear_queues}"
     )
     assert engine.qobuz_state.tracks == [], "Mirror must clear optimistically"
+
+
+async def test_transient_empty_ma_queue_does_not_clear_cloud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A queue that repopulates within the grace period must NOT clear the cloud queue."""
+    monkeypatch.setattr(sync_module, "CLEAR_EMIT_GRACE", 0)
+    session = _FakeSession()
+    queue = _queue(PlaybackState.PLAYING)
+    provider = _FakeProvider(queue, session=session)
+    engine = QobuzConnectSyncEngine(provider)
+    engine.qobuz_state.queue_version = QueueVersion(major=52, minor=0)
+    engine.qobuz_state.tracks = [QueueTrackRef(queue_item_id=1, track_id="t1")]
+    provider.mass.player_queues.queue_items = []
+
+    await engine.handle_ma_queue_items_updated(_ma_items_event("player", []))
+    # queue repopulates before the grace period fires (play_media replace)
+    provider.mass.player_queues.queue_items = [
+        SimpleNamespace(media_item=SimpleNamespace(item_id="t9"), queue_item_id="q9")
+    ]
+    pending = engine._pending_clear_task
+    assert pending is not None
+    await pending
+
+    assert session.clear_queues == []
+    assert engine.qobuz_state.tracks, "Mirror must stay intact"
 
 
 @pytest.mark.asyncio
