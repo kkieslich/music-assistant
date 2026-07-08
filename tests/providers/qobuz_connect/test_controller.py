@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import uuid
 from typing import Any
@@ -16,6 +17,19 @@ from music_assistant.providers.qobuz_connect.models import (
 from music_assistant.providers.qobuz_connect.session import SessionCallbacks
 
 DEVICE_UUID = uuid.UUID("11111111-2222-3333-4444-555555555555").bytes
+
+
+def _base_callbacks() -> SessionCallbacks:
+    """Build a provider-style callback bundle with a distinct sentinel per field."""
+
+    def _make(name: str) -> Any:
+        async def _handler(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        _handler.__name__ = name
+        return _handler
+
+    return SessionCallbacks(**{f.name: _make(f.name) for f in dataclasses.fields(SessionCallbacks)})
 
 
 class FakeSession:
@@ -55,7 +69,9 @@ def _controller() -> tuple[QobuzConnectController, FakeSession]:
     async def _refresher() -> None:
         return None
 
-    controller = QobuzConnectController(device, DEVICE_UUID, _refresher, logging.getLogger("test"))
+    controller = QobuzConnectController(
+        device, DEVICE_UUID, _refresher, logging.getLogger("test"), _base_callbacks()
+    )
     fake = FakeSession()
     controller._session = fake  # type: ignore[assignment]
     return controller, fake
@@ -172,7 +188,10 @@ async def test_start_wires_registry_callbacks_and_controller_role(monkeypatch: A
     async def _refresher() -> None:
         return None
 
-    controller = QobuzConnectController(device, DEVICE_UUID, _refresher, logging.getLogger("test"))
+    base = _base_callbacks()
+    controller = QobuzConnectController(
+        device, DEVICE_UUID, _refresher, logging.getLogger("test"), base
+    )
     await controller.start()
 
     assert captured["role"] is SessionRole.CONTROLLER
@@ -184,3 +203,77 @@ async def test_start_wires_registry_callbacks_and_controller_role(monkeypatch: A
     assert callbacks.on_disconnected == controller._on_disconnected
     assert controller._session is not None
     assert controller._session.started is True  # type: ignore[attr-defined]
+
+
+async def test_start_shares_renderer_directed_callbacks_and_noops_queue_deltas(
+    monkeypatch: Any,
+) -> None:
+    """
+    Renderer-directed handlers are shared; queue-delta handlers are nooped.
+
+    The cloud routes renderer-directed unicast frames (SET_STATE, SET_ACTIVE,
+    SET_VOLUME, ...) to the most recently joined connection with a given
+    deviceUuid — observed live 2026-07-08: after the controller joined, play
+    commands landed on the controller socket and were noop-swallowed, leaving
+    the renderer a zombie. The controller session must therefore share the
+    provider's renderer-directed handlers, while the non-idempotent queue
+    delta handlers stay noop (those are session broadcasts the renderer
+    connection already applies; double-applying would corrupt the mirror).
+    """
+    captured: dict[str, Any] = {}
+
+    class FakeSession:
+        """Captures the callbacks bundle."""
+
+        def __init__(self, device: Any, callbacks: Any, *, token_refresher: Any, role: Any) -> None:
+            """Capture the constructor arguments."""
+            captured["callbacks"] = callbacks
+
+        async def start(self) -> None:
+            """No-op start."""
+
+    monkeypatch.setattr(
+        "music_assistant.providers.qobuz_connect.session.QobuzConnectSession", FakeSession
+    )
+    device = DeviceConfig(
+        name="MA", uuid=str(uuid.uuid4()), http_port=8695, bind_address="0.0.0.0", max_quality=27
+    )
+
+    async def _refresher() -> None:
+        return None
+
+    base = _base_callbacks()
+    controller = QobuzConnectController(
+        device, DEVICE_UUID, _refresher, logging.getLogger("test"), base
+    )
+    await controller.start()
+    callbacks = captured["callbacks"]
+
+    # Renderer-directed + idempotent handlers are shared from the base bundle.
+    for shared in (
+        "on_set_state",
+        "on_volume",
+        "on_volume_delta",
+        "on_quality",
+        "on_loop_mode",
+        "on_shuffle_mode",
+        "on_autoplay_mode",
+        "on_state_request",
+        "on_set_active",
+        "on_session_state",
+        "on_queue_load_ack",
+        "on_queue_error",
+    ):
+        assert getattr(callbacks, shared) == getattr(base, shared), shared
+
+    # Non-idempotent queue delta handlers must NOT be the base handlers.
+    for nooped in (
+        "on_queue_version",
+        "on_queue_state",
+        "on_queue_tracks_added",
+        "on_queue_tracks_inserted",
+        "on_queue_tracks_removed",
+        "on_queue_tracks_reordered",
+        "on_queue_cleared",
+    ):
+        assert getattr(callbacks, nooped) != getattr(base, nooped), nooped

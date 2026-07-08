@@ -20,7 +20,7 @@ Depends on:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from .models import PlayingState, SessionRole
 
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
         QueueVersion,
         RendererRecord,
     )
-    from .session import QobuzConnectSession
+    from .session import QobuzConnectSession, SessionCallbacks
 
 
 class QobuzConnectController:
@@ -46,6 +46,7 @@ class QobuzConnectController:
         device_uuid: bytes,
         token_refresher: Callable[[], Awaitable[JWTConnectToken | None]],
         logger: logging.Logger,
+        base_callbacks: SessionCallbacks,
     ) -> None:
         """
         Initialize controller.
@@ -56,11 +57,17 @@ class QobuzConnectController:
         :param token_refresher: Coroutine minting a websocket JWT via the
             native Qobuz login (same one the renderer session uses).
         :param logger: Provider logger.
+        :param base_callbacks: The provider's renderer callback bundle. The
+            cloud routes renderer-directed unicast frames to the most
+            recently joined connection with a given deviceUuid, so this
+            connection must handle them with the same handlers as the
+            renderer session.
         """
         self._device = device
         self._device_uuid = device_uuid
         self._token_refresher = token_refresher
         self._logger = logger
+        self._base_callbacks = base_callbacks
         self._session: QobuzConnectSession | None = None
         self._own_renderer_id: int | None = None
         self._active_renderer_id: int | None = None
@@ -97,29 +104,35 @@ class QobuzConnectController:
         # __init__ — keep import-time cycles impossible.
         import dataclasses  # noqa: PLC0415
 
-        from .session import QobuzConnectSession, SessionCallbacks  # noqa: PLC0415
+        from .session import QobuzConnectSession  # noqa: PLC0415
 
         async def _noop(*_args: object, **_kwargs: object) -> None:
             return None
 
-        # Queue/state events are handled by the RENDERER connection (it
-        # receives the same SRVR_CTRL_* messages); the controller only
-        # cares about the renderer registry.
-        values = {f.name: _noop for f in dataclasses.fields(SessionCallbacks)}
-        # Cast to suppress type mismatch on callback reassignment
-        renderer_callbacks = cast(
-            "dict[str, object]",
-            {
-                "on_add_renderer": self._on_add_renderer,
-                "on_remove_renderer": self._on_remove_renderer,
-                "on_active_renderer_changed": self._on_active_renderer_changed,
-                "on_disconnected": self._on_disconnected,
-            },
-        )
-        values.update(renderer_callbacks)  # type: ignore[arg-type]
+        # Renderer-directed unicast frames (SET_STATE, SET_ACTIVE, volume,
+        # quality, modes, state requests) follow the most recently joined
+        # same-deviceUuid connection — i.e. this one — so they run through
+        # the same provider handlers as on the renderer socket. Queue DELTA
+        # broadcasts fan out to every session socket and mutate the mirror
+        # non-idempotently, so those stay noop here; the renderer connection
+        # applies them exactly once. Load acks / queue errors are idempotent
+        # and may be delivered to the issuing socket only — shared.
         self._session = QobuzConnectSession(
             self._device,
-            SessionCallbacks(**values),
+            dataclasses.replace(
+                self._base_callbacks,
+                on_queue_version=_noop,
+                on_queue_state=_noop,
+                on_queue_tracks_added=_noop,
+                on_queue_tracks_inserted=_noop,
+                on_queue_tracks_removed=_noop,
+                on_queue_tracks_reordered=_noop,
+                on_queue_cleared=_noop,
+                on_add_renderer=self._on_add_renderer,
+                on_remove_renderer=self._on_remove_renderer,
+                on_active_renderer_changed=self._on_active_renderer_changed,
+                on_disconnected=self._on_disconnected,
+            ),
             token_refresher=self._token_refresher,
             role=SessionRole.CONTROLLER,
         )

@@ -163,13 +163,27 @@ The controller connection joins with the **same deviceUuid** as the
 renderer. The cloud merges it into the renderer's existing identity
 (same `rendererId`) instead of creating a second picker entry — a
 controller joining with a fresh/different deviceUuid would show up as a
-separate device. The merged connection also receives renderer-directed
-frames (`SRVR_RNDR_SET_STATE`) alongside the renderer socket.
+separate device.
+
+**Routing steal** (observed live 2026-07-08): the cloud routes
+renderer-directed *unicast* frames (`SRVR_RNDR_SET_STATE`, `SET_ACTIVE`,
+`SET_VOLUME`, quality/mode commands, state requests) to the **most
+recently joined** connection with that deviceUuid — they are NOT
+duplicated to both sockets. Because the controller joins after the
+renderer, it becomes the delivery target for those commands. The
+controller session therefore shares the provider's renderer-directed
+handlers (see `controller.py::start`); only the non-idempotent queue
+*delta* broadcasts — which do fan out to every session socket — stay
+noop on the controller so the renderer connection applies them exactly
+once. Load acks and queue errors are idempotent under duplicate delivery
+and are shared too.
 
 **Hazard**: when the shared-uuid controller connection disconnects, the
 cloud deregisters the renderer (`SRVR_CTRL_REMOVE_RENDERER`) even though
 the renderer's own WS is still open; the renderer's subsequent
-`RNDR_SRVR_STATE_UPDATED` reports then come back as type-1 ERROR frames.
+`RNDR_SRVR_STATE_UPDATED` reports then come back as **message-level
+type-1 errors inside PAYLOAD batches** (not outer ERROR frames) — the
+rejoin-on-error path handles both shapes.
 Two mitigations: the controller connection is treated as persistent
 (started alongside the renderer, reconnects with backoff, stopped only
 when the provider stops — never opened transiently for a single verb),

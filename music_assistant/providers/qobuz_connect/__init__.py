@@ -326,27 +326,7 @@ class QobuzConnectProvider(PluginProvider):
 
             self._session = QobuzConnectSession(
                 self._device_config,
-                SessionCallbacks(
-                    on_set_state=self._sync.handle_qobuz_set_state,
-                    on_queue_load_ack=self._sync.handle_queue_load_ack,
-                    on_queue_error=self._sync.handle_queue_error,
-                    on_queue_version=self._sync.handle_queue_version,
-                    on_queue_state=self._sync.handle_queue_state,
-                    on_queue_tracks_added=self._sync.handle_queue_tracks_added,
-                    on_queue_tracks_inserted=self._sync.handle_queue_tracks_inserted,
-                    on_queue_tracks_removed=self._sync.handle_queue_tracks_removed,
-                    on_queue_tracks_reordered=self._sync.handle_queue_tracks_reordered,
-                    on_queue_cleared=self._sync.handle_queue_cleared,
-                    on_volume=self._on_volume_command,
-                    on_volume_delta=self._on_volume_delta_command,
-                    on_quality=self._on_quality_change,
-                    on_loop_mode=self._sync.handle_loop_mode,
-                    on_shuffle_mode=self._sync.handle_shuffle_mode,
-                    on_autoplay_mode=self._sync.handle_autoplay_mode,
-                    on_state_request=self._sync.report_state,
-                    on_set_active=self._on_set_active,
-                    on_session_state=self._sync.handle_session_state,
-                ),
+                self._build_session_callbacks(),
                 token_refresher=self._refresh_ws_token,
             )
             self._session.set_tokens(tokens)
@@ -355,6 +335,36 @@ class QobuzConnectProvider(PluginProvider):
             await self._session.send_quality_reports(self._max_quality)
             await self._ensure_controller()
             self.logger.info("Qobuz Connect WebSocket connected")
+
+    def _build_session_callbacks(self) -> SessionCallbacks:
+        """
+        Build the callback bundle shared by the renderer and controller sessions.
+
+        The cloud routes renderer-directed unicast frames to the most
+        recently joined connection with our deviceUuid, so both connections
+        must dispatch them into the same handlers.
+        """
+        return SessionCallbacks(
+            on_set_state=self._sync.handle_qobuz_set_state,
+            on_queue_load_ack=self._sync.handle_queue_load_ack,
+            on_queue_error=self._sync.handle_queue_error,
+            on_queue_version=self._sync.handle_queue_version,
+            on_queue_state=self._sync.handle_queue_state,
+            on_queue_tracks_added=self._sync.handle_queue_tracks_added,
+            on_queue_tracks_inserted=self._sync.handle_queue_tracks_inserted,
+            on_queue_tracks_removed=self._sync.handle_queue_tracks_removed,
+            on_queue_tracks_reordered=self._sync.handle_queue_tracks_reordered,
+            on_queue_cleared=self._sync.handle_queue_cleared,
+            on_volume=self._on_volume_command,
+            on_volume_delta=self._on_volume_delta_command,
+            on_quality=self._on_quality_change,
+            on_loop_mode=self._sync.handle_loop_mode,
+            on_shuffle_mode=self._sync.handle_shuffle_mode,
+            on_autoplay_mode=self._sync.handle_autoplay_mode,
+            on_state_request=self._sync.report_state,
+            on_set_active=self._on_set_active,
+            on_session_state=self._sync.handle_session_state,
+        )
 
     async def _ensure_controller(self) -> None:
         """Start the controller-role connection if enabled and not yet running."""
@@ -365,6 +375,7 @@ class QobuzConnectProvider(PluginProvider):
             uuid.UUID(self._device_uuid).bytes,
             self._refresh_ws_token,
             self.logger,
+            self._build_session_callbacks(),
         )
         await self.controller.start()
         self.logger.info("Qobuz Connect controller connection started")

@@ -58,6 +58,25 @@ def _error_frame() -> bytes:
     return codec._pack_frame(OuterMessageType.ERROR, b"")
 
 
+def _inner_error_frame() -> bytes:
+    # PAYLOAD frame whose batch carries a message-level error (messageType 1)
+    # — the shape the cloud actually uses when it answers state reports from
+    # a deregistered renderer (observed live 2026-07-08).
+    from typing import Any  # noqa: PLC0415
+
+    from music_assistant.providers.qobuz_connect.proto import (  # noqa: PLC0415
+        qconnect_payload_pb2 as _payload_pb2,
+    )
+
+    payload_pb2: Any = _payload_pb2
+    codec = QobuzConnectCodec(uuid.uuid4().bytes)
+    msg = payload_pb2.QConnectMessage()
+    msg.messageType = 1  # MESSAGE_TYPE_ERROR
+    msg.error.code = "1"
+    msg.error.message = "renderer not registered"
+    return codec._encode_batch(msg)
+
+
 async def test_renderer_rejoins_after_error_frame() -> None:
     """Test that renderer re-joins after receiving an ERROR frame."""
     session, fake = _session()
@@ -80,3 +99,19 @@ async def test_controller_session_does_not_rejoin_as_renderer() -> None:
     session, fake = _session(role=SessionRole.CONTROLLER)
     await session._handle_message(_error_frame())
     assert fake.sent == []
+
+
+async def test_renderer_rejoins_after_inner_error_message() -> None:
+    """A message-level error inside a PAYLOAD batch also triggers the rejoin."""
+    session, fake = _session()
+    await session._handle_message(_inner_error_frame())
+    # SUBSCRIBE + JOIN_SESSION were re-sent.
+    assert len(fake.sent) == 2
+
+
+async def test_inner_error_rejoin_shares_rate_limit_with_outer() -> None:
+    """Inner and outer error paths share one rate-limit window."""
+    session, fake = _session()
+    await session._handle_message(_inner_error_frame())
+    await session._handle_message(_error_frame())
+    assert len(fake.sent) == 2  # second trigger within REJOIN_MIN_INTERVAL
