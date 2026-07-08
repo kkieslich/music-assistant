@@ -62,6 +62,7 @@ from .models import (
     QueueTracksReorderedEvent,
     QueueVersion,
     RendererRecord,
+    RendererStateUpdate,
     SessionRole,
     SessionStateEvent,
     SetStateEvent,
@@ -130,6 +131,7 @@ class SessionCallbacks:
     on_add_renderer: Callable[[RendererRecord], Awaitable[None]] | None = None
     on_remove_renderer: Callable[[int], Awaitable[None]] | None = None
     on_active_renderer_changed: Callable[[int], Awaitable[None]] | None = None
+    on_renderer_state_updated: Callable[[RendererStateUpdate], Awaitable[None]] | None = None
     # Fired whenever the connection loop tears down the websocket (both on
     # error and on a clean stop iteration); lets owners drop any state that
     # is only valid while connected (e.g. renderer-registry ids).

@@ -404,6 +404,12 @@ class CommandHandler:
             if not engine._is_current_command(generation, item):
                 return
         if item is None:
+            # Controller-joined connections get play commands without track
+            # refs — the cloud expects us to know the session's current
+            # track from the queue mirror (snapshot + trackIndex).
+            engine._derive_current_from_track_index()
+            item = engine.qobuz_state.current_item
+        if item is None:
             engine.bridge.logger.debug("Ignoring Qobuz PLAYING without current or next queue item")
             return
         if not engine._is_current_command(generation, item):

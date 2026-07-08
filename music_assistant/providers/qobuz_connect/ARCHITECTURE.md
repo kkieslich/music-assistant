@@ -203,6 +203,39 @@ aren't already active. On connection loss (`on_disconnected` callback,
 fired from the session's connection loop) both ids are cleared and are
 re-discovered from the next bootstrap.
 
+### Playback takeover on activation
+
+**A controller-joined connection never receives a renderer-directed
+`SET_STATE` with track refs** (handoff capture `handoff__client_b.json` +
+live 2026-07-08). When the user hands playback to us, the only
+renderer-directed message is `SRVR_RNDR_SET_ACTIVE(active=true)` — the
+cloud expects the new target to *continue the session by itself* from
+controller-side knowledge, exactly like the reference web client (which
+starts reporting `RNDR_SRVR_STATE_UPDATED` in the same millisecond it
+receives SET_ACTIVE). Sources for that knowledge:
+
+- `SRVR_CTRL_SESSION_STATE.trackIndex` (connect-time) — which queue index
+  is current.
+- `SRVR_CTRL_QUEUE_STATE` (asked-for snapshot) — the track list.
+- `SRVR_CTRL_RENDERER_STATE_UPDATED` (type 82, ~1/s while another
+  renderer plays) — live playing state, position, duration, and
+  `currentQueueIndex` when the renderer reports one.
+
+`sync.takeover_playback()` (called from `_on_set_active`) derives
+`current_item = tracks[track_index]`, and if the previous renderer was
+PLAYING, synthesizes the rich `SET_STATE` the renderer role used to
+receive and feeds it through the normal command pipeline. Play commands
+arriving later without track refs (`_handle_qobuz_play`) fall back to the
+same derivation. Two guards:
+
+- The queue loader calls `suppress_takeover_once()` before its own
+  `activate_self()` — the activation echo of an MA-origin load must not
+  resurrect the stale mirror queue.
+- `current_item` stays `None` while we are not the target (it gates the
+  heartbeat reporter — inactive renderers must stay silent, and
+  deactivation clears it while preserving `tracks`/`track_index`, which
+  the cloud never resends unprompted).
+
 ### Rejoin-on-error
 
 The cloud can silently deregister a device while its socket stays open;
