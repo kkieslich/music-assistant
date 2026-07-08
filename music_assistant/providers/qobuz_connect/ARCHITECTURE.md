@@ -61,7 +61,7 @@ actually fetches the audio.
     ├─ session.py sends RNDR_SRVR_JOIN_SESSION (renderer joins)
     └─ if `enable_controller` is on, controller.py opens a second,
        persistent session in CONTROLLER role (see "Controller connection
-       (dual-WS)" below) — same JWT type as the renderer, different JOIN
+       (see "The single dual-role connection" below) — same JWT type, different JOIN
        message
 
 4.  Steady state: bidirectional message loop
@@ -88,7 +88,7 @@ concern and is reachable from the engine via a single attribute
 | [`inbound_dispatcher.py`](inbound_dispatcher.py)       | Routing table: decoded inner message → typed callback                                                                             | ❌         | via proto      |
 | [`models.py`](models.py)                               | DTOs + enums shared across all of the above                                                                                       | ❌         | enum refs only |
 | [`state.py`](state.py)                                 | Ephemeral pending-action dataclasses (`PausedSeek`, `PendingPlayingSeek`, `PendingQobuzPosition`, `TrackRefKey`, `origin_scope`)   | ❌         | ❌              |
-| [`controller.py`](controller.py)                       | Persistent controller-role connection (dual-WS): renderer-registry tracking + the verb API (`load_queue`, `play_item`, `seek`, `set_playing`, `set_volume`, `set_mute`, `activate_self`); the verb API is used by `queue_loader.py` (only). No MA imports.  | ❌         | via session   |
+| [`controller.py`](controller.py)                       | Renderer-registry tracking + the verb API over the shared single socket (`load_queue`, `play_item`, `seek`, `set_playing`, `set_volume`, `set_mute`, `activate_self`); the verb API is used by `queue_loader.py` (only). No MA imports.  | ❌         | via session   |
 | [`ma_bridge.py`](ma_bridge.py)                         | The one place sync.py touches Music Assistant — provider accessors + `mass.player_queues.*` / `mass.players.*`                    | ✅         | ❌              |
 | [`outbound_reporter.py`](outbound_reporter.py)         | Renderer→cloud emission: `report_state`, heartbeat, buffering reporter, wire-anchor logic                                         | via engine | ❌              |
 | [`seek_pipeline.py`](seek_pipeline.py)                 | Paused-seek storage, playing-seek debouncing, Qobuz-position confirmation                                                         | via engine | ❌              |
@@ -116,26 +116,34 @@ every MA access in the sync engine + its collaborators goes through
 | Stage 9 (queue_loader.py + dead-code)  |         861 |
 | Stage 10 (command_handler.py)          |         461 |
 
-## Controller connection (dual-WS)
+## The single dual-role connection
 
-Everything above this section describes the **renderer** connection —
-the Qobuz app driving MA, unchanged since the provider's inception. This
-section adds the second, persistent connection that lets MA drive the
-Qobuz app: `controller.py`, gated by the `enable_controller` config
-option (on by default for this experimental provider).
+Everything in this provider speaks to the Qobuz cloud over **one**
+websocket per instance — a `QobuzConnectSession` joined in **controller
+role** (`CtrlSrvrJoinSession{deviceInfo}`), exactly like the reference
+Qobuz Web Client. That single socket both *reports renderer state*
+(`RNDR_SRVR_STATE_UPDATED`, volume/quality reports) and *sends controller
+verbs* (`CTRL_SRVR_*`), and receives everything the cloud routes to the
+device identity. The `enable_controller` config option (on by default)
+falls the join back to the legacy renderer role
+(`RndrSrvrJoinSession` + session-uuid subscribe), which restores the
+pre-controller receive-only behavior.
 
-### Why a second connection
+### Why one connection (history)
 
-A renderer connection cannot push MA-origin actions (start a playlist
-from the MA UI mid-session, skip, seek, volume) back to the Qobuz apps —
-every earlier attempt (qweb-style `QUEUE_LOAD_TRACKS` on the renderer
-socket, autoplay load, reconcile suppression) either created an
-MA→cloud→MA feedback loop or was rejected outright. The cloud does not
-support a renderer driving itself. A second connection joined in
-**controller role** — the same role the Qobuz Web Client uses — can
-issue the same verbs a real controlling client would, and the cloud
-loops the result back to our renderer as an ordinary `SRVR_RNDR_SET_STATE`,
-which the existing follower path already knows how to execute.
+The first controller design ran a *second*, persistent controller-role
+socket next to the renderer socket, merged into one identity via a shared
+deviceUuid. Live testing (2026-07-08) killed it: the cloud has **one
+endpoint per device identity** and routes renderer-directed *unicast*
+frames (`SRVR_RNDR_SET_STATE`, `SET_ACTIVE`, `SET_VOLUME`, quality/mode
+commands, state requests) to the **most recently joined** same-uuid
+connection — not to both. Two sockets under one identity therefore
+produced routing steals (phone commands swallowed by the other socket),
+cross-socket ordering races (one socket clearing the cloud queue while
+the other reported the old track), and teardown hazards (either socket's
+disconnect deregistered the device). One socket makes all of those
+unrepresentable — reports and verbs are serialized on a single
+connection, matching the reference client.
 
 ### Role is declared by the JOIN message, not the JWT
 
@@ -144,100 +152,67 @@ regardless of role; its claims are just `{quid, qaid}`. What makes a
 connection a renderer or a controller is which JOIN message it sends
 after `AUTHENTICATE` → `SUBSCRIBE`:
 
-- `RndrSrvrJoinSession{deviceUuid, sessionUuid, ...}` → renderer.
-- `CtrlSrvrJoinSession{deviceInfo}` → controller. `deviceInfo` is
-  mandatory; joining without it is rejected with "Error while processing
-  JoinSessionMessage".
+- `RndrSrvrJoinSession{deviceUuid, sessionUuid, ...}` → renderer
+  (subscribe carries the session uuid channel).
+- `CtrlSrvrJoinSession{deviceInfo}` → controller (subscribe carries no
+  channels). `deviceInfo` is mandatory; joining without it is rejected
+  with "Error while processing JoinSessionMessage". A controller-joined
+  connection still registers a picker entry from its `deviceInfo` and
+  receives renderer-directed frames — dual-role, like the web client.
 
 Verified live against production (`wss://qws-eu-prod.qobuz.com/ws`,
-2026-07-07) with the Playwright capture harness — see
+2026-07-07/08) with the Playwright capture harness — see
 `tests/providers/qobuz_connect/protocol_capture/.runs/controller_full_lifecycle__client_{a,b}.json`
 and `docs/superpowers/specs/2026-07-07-qobuz-connect-controller-design.md`
-("Verified protocol facts") for the full write-up. `session.py`'s
-`encode_subscribe` / `encode_join_session` / `encode_ctrl_join_session`
-docstrings carry the same fact at the call site.
-
-### Shared-identity merge
-
-The controller connection joins with the **same deviceUuid** as the
-renderer. The cloud merges it into the renderer's existing identity
-(same `rendererId`) instead of creating a second picker entry — a
-controller joining with a fresh/different deviceUuid would show up as a
-separate device.
-
-**Routing steal** (observed live 2026-07-08): the cloud routes
-renderer-directed *unicast* frames (`SRVR_RNDR_SET_STATE`, `SET_ACTIVE`,
-`SET_VOLUME`, quality/mode commands, state requests) to the **most
-recently joined** connection with that deviceUuid — they are NOT
-duplicated to both sockets. Because the controller joins after the
-renderer, it becomes the delivery target for those commands. The
-controller session therefore shares the provider's renderer-directed
-handlers (see `controller.py::start`); only the non-idempotent queue
-*delta* broadcasts — which do fan out to every session socket — stay
-noop on the controller so the renderer connection applies them exactly
-once. Load acks and queue errors are idempotent under duplicate delivery
-and are shared too.
-
-**Hazard**: when the shared-uuid controller connection disconnects, the
-cloud deregisters the renderer (`SRVR_CTRL_REMOVE_RENDERER`) even though
-the renderer's own WS is still open; the renderer's subsequent
-`RNDR_SRVR_STATE_UPDATED` reports then come back as **message-level
-type-1 errors inside PAYLOAD batches** (not outer ERROR frames) — the
-rejoin-on-error path handles both shapes.
-Two mitigations: the controller connection is treated as persistent
-(started alongside the renderer, reconnects with backoff, stopped only
-when the provider stops — never opened transiently for a single verb),
-and renderer rejoin-on-error (below) recovers if it still happens.
+("Verified protocol facts") for the full write-up.
 
 ### Controller verb map
 
-`controller.py` exposes the verb API; every verb goes out on the
-controller socket via `session.py`. Only `queue_loader.py` calls into it
-today (`load_queue`, `play_item`, `activate_self`) — `set_playing`,
-`seek`, `set_volume` and `set_mute` are implemented but have no
-production callsite yet:
+`controller.py` holds the renderer-registry state and exposes the verb
+API; every verb goes out on the shared socket. Only `queue_loader.py`
+calls into it today (`load_queue`, `play_item`, `activate_self`) —
+`set_playing`, `seek`, `set_volume` and `set_mute` are implemented but
+have no production callsite yet:
 
 | Verb                          | `controller.py` method | Wire message                                                        |
 |--------------------------------|-------------------------|-----------------------------------------------------------------------|
-| Pause / resume                 | `set_playing`           | `CTRL_SRVR_SET_PLAYER_STATE{playingState}` (no callsite yet — verb available on QobuzConnectController) |
-| Seek                           | `seek`                  | `CTRL_SRVR_SET_PLAYER_STATE{currentPosition}` (position only) (no callsite yet — verb available on QobuzConnectController) |
+| Pause / resume                 | `set_playing`           | `CTRL_SRVR_SET_PLAYER_STATE{playingState}` (no callsite yet)          |
+| Seek                           | `seek`                  | `CTRL_SRVR_SET_PLAYER_STATE{currentPosition}` (position only) (no callsite yet) |
 | Skip / play specific item      | `play_item`             | `CTRL_SRVR_SET_PLAYER_STATE{playingState, currentPosition: 0, currentQueueItem}` |
-| Volume                         | `set_volume`            | `CTRL_SRVR_SET_VOLUME{rendererId, volume}` (no callsite yet — verb available on QobuzConnectController) |
-| Mute                           | `set_mute`              | `CTRL_SRVR_MUTE_VOLUME{rendererId, value}` (no callsite yet — verb available on QobuzConnectController) |
+| Volume                         | `set_volume`            | `CTRL_SRVR_SET_VOLUME{rendererId, volume}` (no callsite yet)          |
+| Mute                           | `set_mute`              | `CTRL_SRVR_MUTE_VOLUME{rendererId, value}` (no callsite yet)          |
 | Become the active renderer     | `activate_self`         | `CTRL_SRVR_SET_ACTIVE_RENDERER{rendererId}`                           |
-| Queue replacement (MA-origin)  | `load_queue`            | `CTRL_SRVR_QUEUE_LOAD_TRACKS` — packed little-endian uint32 track ids in the (misnamed) `sessionUuid` field; the active renderer keeps rendering and switches to the new queue |
+| Queue replacement (MA-origin)  | `load_queue`            | `CTRL_SRVR_QUEUE_LOAD_TRACKS` — packed little-endian uint32 track ids in the (misnamed) `sessionUuid` field, plus a mandatory fresh 16-byte `contextUuid` and explicitly-present `shufflePivotQueueItemId=0` / `shuffleMode=false`; the active renderer keeps rendering and switches to the new queue |
 
 `load_queue` is the only queue-load verb `queue_loader.py` calls directly
-(`_send_controller_load`); it falls back to the legacy renderer-socket
+(`_send_controller_load`); it falls back to the legacy
 `_send_legacy_qweb_load` only when the controller is disabled via the
 `enable_controller` config toggle. When the controller is enabled but not
 currently connected, MA-origin loads are skipped (not mirrored to the
-Qobuz app) rather than falling back — see "Controller-outage behavior" in
-`queue_loader.py`.
+Qobuz app) rather than falling back, with one warning per outage.
 
 ### Own-rendererId discovery
 
-The controller doesn't know its `rendererId` until the cloud tells it.
-On join, the cloud bootstraps the controller with `SRVR_CTRL_ADD_RENDERER`
-for every online renderer (including the merged one); `controller.py`
-matches the entry whose `device_uuid` equals its own to learn
-`own_renderer_id`. Every verb method checks it first and is a no-op
-(`activate_self` / `load_queue` log at debug) until it's known.
-`SRVR_CTRL_ACTIVE_RENDERER_CHANGED` keeps `active_renderer_id` current;
-`activate_self()` only calls `CTRL_SRVR_SET_ACTIVE_RENDERER` when we
-aren't already active.
+The connection doesn't know its `rendererId` until the cloud tells it.
+On join, the cloud bootstraps it with `SRVR_CTRL_ADD_RENDERER` for every
+online renderer; `controller.py` matches the entry whose `device_uuid`
+equals ours to learn `own_renderer_id`. Every verb method checks it and
+is a no-op until it's known. `SRVR_CTRL_ACTIVE_RENDERER_CHANGED` keeps
+`active_renderer_id` current; `activate_self()` only sends when we
+aren't already active. On connection loss (`on_disconnected` callback,
+fired from the session's connection loop) both ids are cleared and are
+re-discovered from the next bootstrap.
 
-### Renderer rejoin-on-error
+### Rejoin-on-error
 
-Independent of the controller connection, but required by the hazard
-above: an inbound type-1 ERROR frame on the renderer socket after a
-successful join triggers `session._maybe_rejoin_after_error` — a
-rate-limited re-send of `SUBSCRIBE` + `RNDR_SRVR_JOIN_SESSION` on the
-same connection, rather than a full reconnect. This fixes both the
-shared-identity deregistration hazard and the older "session disappears
-while MA keeps reporting" failure mode. It only runs for
-`SessionRole.RENDERER` and has no dependency on the controller
-connection existing, so it's safe to run with `enable_controller` off.
+The cloud can silently deregister a device while its socket stays open;
+subsequent state reports are answered with **message-level type-1 errors
+inside PAYLOAD batches** (not outer ERROR frames). Both error shapes
+funnel into `session._maybe_rejoin_after_error` — a rate-limited re-send
+of the role-appropriate `SUBSCRIBE` + JOIN on the same connection rather
+than a full reconnect. Queued outbound frames older than ~2s are dropped
+on reconnect instead of flushed: the cloud rejects stale envelope
+timestamps ("Message too old") and the rejection can drop the connection.
 
 ## Inbound messages (Qobuz → this provider)
 
@@ -305,7 +280,7 @@ On the **controller** connection three of these are load-bearing rather
 than benign — `SRVR_CTRL_ADD_RENDERER`, `SRVR_CTRL_REMOVE_RENDERER` and
 `SRVR_CTRL_ACTIVE_RENDERER_CHANGED` are how `controller.py` discovers our
 own `rendererId` and tracks the session's active renderer (see
-"Controller connection (dual-WS)" below). Same message types, different
+"The single dual-role connection" below). Same message types, different
 meaning depending on which socket they arrive on.
 
 **Known parse anomaly:** one 82-byte PAYLOAD frame in
@@ -323,7 +298,7 @@ All outbound traffic is constructed in [`protocol.py`](protocol.py) and
 sent via [`session.py`](session.py). The triggering code lives in
 [`sync.py`](sync.py) / [`queue_loader.py`](queue_loader.py) (renderer
 connection) and [`controller.py`](controller.py) (controller connection —
-see "Controller connection (dual-WS)" below).
+see "The single dual-role connection" below).
 
 | Type ID | Message                                  | Encoder (`protocol.py`)                  | Triggered from                                                                            |
 |--------:|------------------------------------------|------------------------------------------|-------------------------------------------------------------------------------------------|
