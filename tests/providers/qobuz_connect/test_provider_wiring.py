@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -20,6 +21,7 @@ from music_assistant.providers.qobuz_connect import (
     QobuzConnectProvider,
     _ReporterHost,
 )
+from music_assistant.providers.qobuz_connect import outbound_reporter as outbound_reporter_module
 from music_assistant.providers.qobuz_connect.coordinator import QobuzConnectCoordinator
 from music_assistant.providers.qobuz_connect.effect_runner import EffectRunner
 from music_assistant.providers.qobuz_connect.models import (
@@ -29,6 +31,7 @@ from music_assistant.providers.qobuz_connect.models import (
     QueueVersion,
     SetStateEvent,
 )
+from music_assistant.providers.qobuz_connect.outbound_reporter import OutboundReporter
 from music_assistant.providers.qobuz_connect.sync_types import (
     CanonicalState,
     PushVolume,
@@ -36,6 +39,7 @@ from music_assistant.providers.qobuz_connect.sync_types import (
 )
 
 if TYPE_CHECKING:
+    import pytest
     from music_assistant_models.event import MassEvent
 
 
@@ -287,6 +291,52 @@ def test_reporter_host_duration_falls_back_to_zero_without_queue() -> None:
     host = _ReporterHost(cast("Any", fake_bridge), lambda: state)
 
     assert host.qobuz_state.duration_ms == 0
+
+
+def test_reporter_host_is_active_reflects_canonical_state() -> None:
+    """_ReporterHost._is_active mirrors the projected CanonicalState.active flag."""
+    fake_bridge = SimpleNamespace(
+        target_player_id=lambda: "player_1",
+        get_queue=lambda _pid: None,
+    )
+
+    active_host = _ReporterHost(cast("Any", fake_bridge), lambda: CanonicalState(active=True))
+    assert active_host._is_active is True
+
+    inactive_host = _ReporterHost(cast("Any", fake_bridge), lambda: CanonicalState(active=False))
+    assert inactive_host._is_active is False
+
+
+async def test_heartbeat_loop_survives_tick_against_real_reporter_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The 5-second heartbeat loop survives a tick when reading ``_is_active`` off the real host.
+
+    Regression guard: the loop reads ``self._engine._is_active`` outside its
+    exception suppression, so if ``_ReporterHost`` didn't expose ``_is_active``
+    the very first tick would raise ``AttributeError`` and silently kill the
+    heartbeat task (report_state() itself never touches it, so this path is
+    invisible to a plain report_state() call).
+    """
+    monkeypatch.setattr(outbound_reporter_module, "STATE_REPORT_INTERVAL_S", 0.01)
+    # session is None so report_state() early-returns cleanly after the tick.
+    fake_bridge = SimpleNamespace(
+        session=None,
+        target_player_id=lambda: "player_1",
+        get_queue=lambda _pid: None,
+    )
+    host = _ReporterHost(cast("Any", fake_bridge), lambda: CanonicalState(active=True))
+    reporter = OutboundReporter(cast("Any", host))
+
+    await reporter.start()
+    try:
+        await asyncio.sleep(0.05)
+        # Before the fix the task would be ``.done()`` with an AttributeError.
+        assert reporter._heartbeat_task is not None
+        assert not reporter._heartbeat_task.done()
+    finally:
+        await reporter.stop()
 
 
 async def test_ma_events_ignore_non_target_player() -> None:
