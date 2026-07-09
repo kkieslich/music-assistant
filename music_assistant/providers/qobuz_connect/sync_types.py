@@ -38,6 +38,8 @@ class CanonicalState:
     own_rid: int | None = None
     active_rid: int | None = None
     pending: tuple[Proposal, ...] = field(default_factory=tuple)
+    last_asked_version: QueueVersion = field(default_factory=QueueVersion)
+    """The cloud queue_version we last sent an AskSnapshot for (dedup)."""
 
 
 # ---- proposals ----
