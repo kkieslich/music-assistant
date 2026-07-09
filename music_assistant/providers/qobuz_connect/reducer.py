@@ -16,15 +16,20 @@ from .sync_types import (
     CanonicalState,
     CloudActiveRendererChanged,
     CloudAddRenderer,
+    CloudAutoplaySet,
     CloudAutoplayTracksLoaded,
     CloudCleared,
     CloudLoadAck,
+    CloudLoopSet,
+    CloudMute,
+    CloudQuality,
     CloudQueueError,
     CloudRemoveRenderer,
     CloudRendererStateUpdated,
     CloudSessionState,
     CloudSetActive,
     CloudSetState,
+    CloudShuffleSet,
     CloudSnapshot,
     CloudStateRequest,
     CloudTracksAdded,
@@ -32,10 +37,13 @@ from .sync_types import (
     CloudTracksRemoved,
     CloudTracksReordered,
     CloudVersionChanged,
+    CloudVolume,
+    CloudVolumeDelta,
     Connected,
     Disconnected,
     Effect,
     Event,
+    MaModesChanged,
     MaPause,
     MaPlayTrack,
     MaQueueChanged,
@@ -43,14 +51,22 @@ from .sync_types import (
     MaResume,
     MaResyncQueue,
     MaSeek,
+    MaSetLoop,
+    MaSetShuffleFlag,
+    MaSetVolume,
     MaTransportChanged,
+    MaVolumeChanged,
     Proposal,
     ProposalKind,
     ProposalTimeout,
     PushAdd,
+    PushAutoplay,
     PushClear,
     PushLoad,
+    PushLoop,
+    PushMute,
     PushPlayerState,
+    PushVolume,
     ReduceResult,
     ReportState,
 )
@@ -76,6 +92,25 @@ _TRANSPORT_INBOUND = (
 # Position drift beyond this is treated as an explicit seek rather than a
 # heartbeat/position-only update.
 _SEEK_THRESHOLD_MS = 1500
+
+# Events handled by the modes lane (loop/autoplay/shuffle flags).
+_MODES_INBOUND = (
+    CloudLoopSet,
+    CloudShuffleSet,
+    CloudAutoplaySet,
+    MaModesChanged,
+)
+
+# Side-channel events (volume/mute/quality): ungated, fire-and-forget, no
+# canonical state to track since CanonicalState carries no volume/mute/quality
+# fields.
+_SIDE_INBOUND = (
+    CloudVolume,
+    CloudVolumeDelta,
+    CloudMute,
+    CloudQuality,
+    MaVolumeChanged,
+)
 
 _LIST_INBOUND = (
     CloudSnapshot,
@@ -132,7 +167,15 @@ def reduce(state: CanonicalState, event: Event) -> ReduceResult:
         return _reduce_list_inbound(state, event)
     if isinstance(event, _TRANSPORT_INBOUND):
         return _reduce_transport(state, event)
-    return ReduceResult(state, ())
+    if isinstance(event, _MODES_INBOUND):
+        return _reduce_modes(state, event)
+    if isinstance(event, _SIDE_INBOUND):
+        return _reduce_side(state, event)
+    # Defensive fallback: the lanes above exhaustively cover the Event union,
+    # so mypy proves this unreachable. Kept so an unhandled event no-ops
+    # rather than crashing; if the union later grows a case this misses, the
+    # ignore becomes unused and mypy flags the gap.
+    return ReduceResult(state, ())  # type: ignore[unreachable]
 
 
 def _reduce_ma_queue_changed(state: CanonicalState, event: MaQueueChanged) -> ReduceResult:
@@ -255,6 +298,53 @@ def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
         new = dataclasses.replace(state, cloud_version=event.version, current_id=current_id)
         return ReduceResult(new, (ReportState(),))
     return ReduceResult(state, ())
+
+
+def _reduce_modes(state: CanonicalState, event: Event) -> ReduceResult:
+    """Route a modes-lane event (loop/autoplay/shuffle) to its handler."""
+    if isinstance(event, CloudLoopSet):
+        new = dataclasses.replace(state, loop=event.loop)
+        return ReduceResult(new, (MaSetLoop(event.loop),))
+    if isinstance(event, CloudAutoplaySet):
+        # No MaSetAutoplay effect exists: autoplay is a cloud-side flag only.
+        return ReduceResult(dataclasses.replace(state, autoplay=event.autoplay), ())
+    if isinstance(event, CloudShuffleSet):
+        # The reorder itself rides on the list lane's snapshot/reorder events;
+        # this only flips MA's shuffle flag.
+        return ReduceResult(state, (MaSetShuffleFlag(event.shuffle),))
+    if isinstance(event, MaModesChanged):
+        return _ma_modes_changed(state, event)
+    return ReduceResult(state, ())
+
+
+def _reduce_side(state: CanonicalState, event: Event) -> ReduceResult:
+    """
+    Route a side-channel event (volume/mute/quality) to its handler.
+
+    Side channels are ungated and fire-and-forget: CanonicalState carries no
+    volume/mute/quality fields, so these never touch canonical truth.
+    """
+    if isinstance(event, CloudVolume):
+        return ReduceResult(state, (MaSetVolume(event.volume),))
+    if isinstance(event, CloudVolumeDelta | CloudMute | CloudQuality):
+        # No MA effect exists for a relative delta, mute, or quality change.
+        return ReduceResult(state, ())
+    if isinstance(event, MaVolumeChanged):
+        return ReduceResult(state, (PushVolume(event.volume), PushMute(event.muted)))
+    return ReduceResult(state, ())
+
+
+def _ma_modes_changed(state: CanonicalState, event: MaModesChanged) -> ReduceResult:
+    """Diff MA's reported loop/autoplay against canonical; push only what changed."""
+    new = state
+    effects: list[Effect] = []
+    if event.loop != state.loop:
+        new = dataclasses.replace(new, loop=event.loop)
+        effects.append(PushLoop(event.loop))
+    if event.autoplay != state.autoplay:
+        new = dataclasses.replace(new, autoplay=event.autoplay)
+        effects.append(PushAutoplay(event.autoplay))
+    return ReduceResult(new, tuple(effects))
 
 
 def _apply_transport(
