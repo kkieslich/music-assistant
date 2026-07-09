@@ -2,26 +2,21 @@
 Outbound renderer-state reporting for the Qobuz Connect provider.
 
 This is the "what does MA tell the Qobuz cloud right now" half of the
-sync engine, lifted out of :mod:`.sync` so the engine itself can focus
-on inbound reconciliation. After Phase C stage 6, every place that used
-to call ``self.report_state`` / set the buffering reporter / drive the
-heartbeat now goes through this class.
+sync layer. The reducer's ``ReportState`` effect and the two background
+loops here drive it; it reads its state off a host that exposes a live
+``QobuzMirror`` projection of the coordinator's ``CanonicalState`` (see
+``_ReporterHost`` in ``__init__.py``), so it needs no engine of its own.
 
 The reporter owns three concerns:
 
-1. **Renderer state composition.** Reads ``QobuzMirror`` + the current
-   MA queue, decides what wire-level position / timestamp / buffer
-   state to send, and emits a single ``RNDR_SRVR_STATE_UPDATED`` frame
-   via the session.
+1. **Renderer state composition.** Reads the ``QobuzMirror`` projection,
+   decides what wire-level position / timestamp / buffer state to send,
+   and emits a single ``RNDR_SRVR_STATE_UPDATED`` frame via the session.
 2. **Heartbeat task.** A 5-second loop that re-emits the canonical
-   renderer state so the cloud doesn't time us out.
+   renderer state while active so the cloud doesn't time us out.
 3. **Buffering reporter task.** A 1-second loop that fires while
    ``QobuzMirror.buffer_state == BUFFERING`` so the cloud sees the
    frozen anchor refresh quickly during track-load latency.
-
-The engine retains thin ``report_state`` / ``_set_buffering`` /
-``_set_buffer_ok`` methods that delegate here, preserving the public
-API tests use.
 """
 
 from __future__ import annotations
@@ -30,14 +25,9 @@ import asyncio
 import contextlib
 import logging
 import time
-from typing import TYPE_CHECKING
-
-from music_assistant_models.enums import PlaybackState as MAPlaybackState
+from typing import Any
 
 from .models import BufferState, PlayingState
-
-if TYPE_CHECKING:
-    from .sync import QobuzConnectSyncEngine
 
 LOGGER = logging.getLogger(__name__)
 
@@ -50,7 +40,7 @@ class OutboundReporter:
 
     __slots__ = ("_buffering_task", "_engine", "_heartbeat_task")
 
-    def __init__(self, engine: QobuzConnectSyncEngine) -> None:
+    def __init__(self, engine: Any) -> None:
         """Bind the reporter to its host engine for state + bridge access."""
         self._engine = engine
         self._heartbeat_task: asyncio.Task[None] | None = None
@@ -95,16 +85,12 @@ class OutboundReporter:
 
     # ---- canonical state report ----------------------------------------
 
-    async def report_state(self, *, sync_from_ma: bool = True) -> None:
+    async def report_state(self) -> None:
         """Compose and emit a single ``RNDR_SRVR_STATE_UPDATED`` frame."""
         engine = self._engine
         session = engine.bridge.session
         if session is None:
             return
-        player_id = engine.bridge.target_player_id()
-        queue = engine.bridge.get_queue(player_id) if player_id else None
-        if sync_from_ma and queue is not None and not engine.command_handler.is_reconciling():
-            await self._sync_mirror_from_ma_if_aligned(queue)
         current_item = engine.qobuz_state.current_item
         if current_item is None:
             return
@@ -112,7 +98,7 @@ class OutboundReporter:
         wire_buffer_state = self._wire_buffer_state()
         engine.bridge.logger.debug(
             "Qobuz report state=%s buffer=%s wire_buffer=%s pos=%sms (anchor ts=%s) "
-            "item=%s:%s qv=%s.%s sync_from_ma=%s",
+            "item=%s:%s qv=%s.%s",
             engine.qobuz_state.playing_state,
             engine.qobuz_state.buffer_state,
             wire_buffer_state,
@@ -122,7 +108,6 @@ class OutboundReporter:
             current_item.track_id,
             engine.qobuz_state.queue_version.major,
             engine.qobuz_state.queue_version.minor,
-            sync_from_ma,
         )
         await session.send_renderer_state(
             playing_state=engine.qobuz_state.playing_state,
@@ -135,27 +120,6 @@ class OutboundReporter:
         )
 
     # ---- helpers (private to the reporter) -----------------------------
-
-    async def _sync_mirror_from_ma_if_aligned(self, queue: object) -> None:
-        """When MA and Qobuz agree on the current track, fold MA's position in."""
-        engine = self._engine
-        ma_track_id = (
-            engine.bridge.qobuz_track_id_for(getattr(queue, "current_item", None))
-            if getattr(queue, "current_item", None)
-            else None
-        )
-        if (
-            engine.qobuz_state.current_item
-            and ma_track_id == engine.qobuz_state.current_item.track_id
-        ):
-            # Delegate to the engine for the actual position interpolation —
-            # it owns the pending-position confirmation state machine.
-            await engine._sync_mirror_from_ma_queue(queue)
-        elif ma_track_id is None and getattr(queue, "state", None) in (
-            MAPlaybackState.PLAYING,
-            MAPlaybackState.PAUSED,
-        ):
-            engine.qobuz_state.playing_state = PlayingState.STOPPED
 
     def _wire_anchor(self) -> tuple[int, int]:
         """

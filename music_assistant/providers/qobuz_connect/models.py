@@ -13,8 +13,8 @@ Owns:
   ``QueueLoadAck``, ``QueueError``, ``QueueStateSnapshot``,
   ``QueueTracksAddedEvent``, ``QueueTracksInsertedEvent``,
   ``QueueTracksRemovedEvent``, ``QueueTracksReorderedEvent``,
-  ``QueueClearedEvent``, ``QobuzMirror`` (the canonical remote-state
-  snapshot held by the sync engine).
+  ``QueueClearedEvent``, ``QobuzMirror`` (the legacy remote-state snapshot
+  the reporter host projects from ``CanonicalState``).
 
 Exposes:
 - All of the above as importable names.
@@ -24,9 +24,8 @@ Depends on:
   module is the lingua franca that the codec, transport, discovery and
   sync layers communicate with — it must stay framework-free.
 
-See :doc:`ARCHITECTURE` for which fields are part of the canonical mirror
-vs. ephemeral per-action state (the latter is mostly still in
-:mod:`.sync`; consolidating it here is Phase C of the plan).
+See :doc:`ARCHITECTURE` for how the reducer's ``CanonicalState`` relates to
+the legacy ``QobuzMirror`` projection used by the outbound reporter.
 """
 
 from __future__ import annotations

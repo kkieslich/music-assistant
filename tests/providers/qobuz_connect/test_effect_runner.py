@@ -346,11 +346,11 @@ async def test_ask_snapshot_calls_session_with_version() -> None:
 
 
 async def test_report_state_delegates_to_reporter() -> None:
-    """ReportState maps to reporter.report_state(sync_from_ma=False)."""
+    """ReportState maps to reporter.report_state()."""
     session, bridge, reporter = _FakeSession(), _FakeBridge(), _FakeReporter()
     runner = _runner(session, bridge, reporter=reporter)
     await runner.run(ReportState())
-    assert reporter.calls == [{"sync_from_ma": False}]
+    assert reporter.calls == [{}]
 
 
 async def test_ma_resume_calls_bridge() -> None:

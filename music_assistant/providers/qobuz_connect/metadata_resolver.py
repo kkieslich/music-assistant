@@ -1,29 +1,25 @@
 """
-MA track-metadata lookups for the Qobuz Connect sync engine.
+MA track-metadata lookups for the Qobuz Connect sync core.
 
 Every place that needs the duration or full ``Track`` for a Qobuz queue
-item went through one of four methods that all looked the same: ask
-the native MA qobuz provider for ``get_track(id)``, cache the
-``track_id`` if it fails, surface a typed ``Track | None`` (or write
-the duration into the mirror). This module pulls them into one place
-and gives the "this track is unresolvable, don't keep retrying"
-fail-cache its own home.
+item asks the native MA qobuz provider for ``get_track(id)``, caches the
+``track_id`` if it fails, and surfaces a typed ``Track | None``. This module
+pulls that into one place and gives the "this track is unresolvable, don't
+keep retrying" fail-cache its own home.
 
-The resolver also owns the duration_ms write-through on the mirror so
-the renderer-state reporter has a fresh value to ship. Other state on
-the engine (``qobuz_state.duration_ms``, the bridge) is read via the
-engine reference.
+The effect runner uses it (via a small duck-typed host exposing ``bridge``)
+to resolve the Qobuz ids in ``MaPlayTrack`` / ``MaResyncQueue`` effects into
+MA ``Track`` objects before driving the player queue.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from music_assistant_models.media_items import Track
 
     from .models import QueueTrackRef
-    from .sync import QobuzConnectSyncEngine
 
 
 class MetadataResolver:
@@ -31,7 +27,7 @@ class MetadataResolver:
 
     __slots__ = ("_engine", "_unresolvable_track_ids")
 
-    def __init__(self, engine: QobuzConnectSyncEngine) -> None:
+    def __init__(self, engine: Any) -> None:
         """Bind the resolver to the host engine for bridge + state access."""
         self._engine = engine
         self._unresolvable_track_ids: set[str] = set()
