@@ -62,10 +62,12 @@ from .sync_types import (
     PushAdd,
     PushAutoplay,
     PushClear,
+    PushInsert,
     PushLoad,
     PushLoop,
     PushMute,
     PushPlayerState,
+    PushRemove,
     PushReorder,
     PushVolume,
     ReduceResult,
@@ -185,40 +187,10 @@ def _reduce_ma_queue_changed(state: CanonicalState, event: MaQueueChanged) -> Re
     if proposal is None:
         return ReduceResult(state, ())
     new = dataclasses.replace(state, pending=(*state.pending, proposal))
-    if proposal.kind is ProposalKind.ADD:
-        # The cloud's add command APPENDS its payload to the existing cloud
-        # queue, so only the appended tail may be pushed — the full resolved
-        # list would duplicate the tracks the cloud already has. The proposal
-        # itself still carries the full target list (target_track_ids) since
-        # _confirm_proposal folds that into canonical truth on echo.
-        canonical_ids = tuple(
-            qid
-            for t in state.tracks
-            if (qid := _safe_qid(t)) is not None and qid in event.resolvable
-        )
-        tail = event.track_ids[len(canonical_ids) :]
-        push: Effect = PushAdd(
-            action_uuid=proposal.action_uuid, base_version=proposal.base_version, track_ids=tail
-        )
-        return ReduceResult(new, (push,))
-    if proposal.kind is ProposalKind.REORDER:
-        # The wire command speaks cloud queue_item_ids (slots), not Qobuz
-        # track ids — translate the reordered Qobuz ids via the canonical
-        # correspondence. A REORDER is same-set by construction, so every
-        # target id is present in canonical and the translation is total.
-        qid_to_item = {
-            qid: t.queue_item_id for t in state.tracks if (qid := _safe_qid(t)) is not None
-        }
-        push = PushReorder(
-            action_uuid=proposal.action_uuid,
-            base_version=proposal.base_version,
-            queue_item_ids=tuple(
-                qid_to_item[q] for q in proposal.target_track_ids if q in qid_to_item
-            ),
-            insert_after=0,
-        )
-        return ReduceResult(new, (push,))
-    return ReduceResult(new, (_push_for(proposal),))
+    # Translate against the PRE-append state: the proposal's own tracks
+    # aren't in canonical yet, which is exactly why an ADD's tail comes out
+    # as only the newly appended ids.
+    return ReduceResult(new, (_emit_push(state, proposal),))
 
 
 def _reduce_proposal_timeout(state: CanonicalState, event: ProposalTimeout) -> ReduceResult:
@@ -583,7 +555,9 @@ def _reject_proposal(
         )
         pending = tuple(rebased if p is proposal else p for p in absorbed.pending)
         new = dataclasses.replace(absorbed, pending=pending)
-        return ReduceResult(new, (_push_for(rebased),))
+        # Translate against the post-absorb canonical (current truth), so a
+        # retry's push reflects whatever drifted in underneath us.
+        return ReduceResult(new, (_emit_push(absorbed, rebased),))
     pending = tuple(p for p in absorbed.pending if p is not proposal)
     new = dataclasses.replace(absorbed, pending=pending)
     return _with_resync(new)  # converge MA to cloud truth
@@ -601,7 +575,7 @@ def _rebase_target(state: CanonicalState, proposal: Proposal) -> tuple[int, ...]
     """
     if proposal.kind is not ProposalKind.ADD:
         return proposal.target_track_ids
-    canonical_ids = tuple(t.queue_item_id for t in state.tracks)
+    canonical_ids = tuple(qid for t in state.tracks if (qid := _safe_qid(t)) is not None)
     tail = tuple(i for i in proposal.target_track_ids if i not in canonical_ids)
     return canonical_ids + tail
 
@@ -643,23 +617,21 @@ def _diff_ma_list(state: CanonicalState, event: MaQueueChanged) -> Proposal | No
     )
 
 
-def _push_for(proposal: Proposal) -> Effect:
-    """Map a pending proposal to the cloud push command that realizes it."""
+def _emit_push(state: CanonicalState, proposal: Proposal) -> Effect:
+    """
+    Translate a proposal into the cloud push command that realizes it.
+
+    All Qobuz-id -> cloud-slot translation happens here against ``state``,
+    so the same logic produces a correct push both for a proposal's initial
+    emission and for a retry after a version-stale rejection — the only
+    difference between the two call sites is which state (pre-edit
+    canonical vs. post-absorb canonical) they translate against.
+
+    :param state: Canonical state to translate ids against.
+    :param proposal: The proposal being realized as a cloud push.
+    """
     if proposal.kind is ProposalKind.CLEAR:
         return PushClear(action_uuid=proposal.action_uuid, base_version=proposal.base_version)
-    if proposal.kind is ProposalKind.ADD:
-        # NOTE: this full-list fallback is never actually reached for ADD —
-        # _reduce_ma_queue_changed intercepts ADD proposals and builds the
-        # appended-only-tail PushAdd itself, since the cloud's add command
-        # appends its payload to the existing cloud queue rather than
-        # replacing it. Kept here only so _push_for stays total over
-        # ProposalKind (e.g. for _reject_proposal's rebase-and-repush path,
-        # which reuses this branch with a rebased target).
-        return PushAdd(
-            action_uuid=proposal.action_uuid,
-            base_version=proposal.base_version,
-            track_ids=proposal.target_track_ids,
-        )
     if proposal.kind is ProposalKind.LOAD:
         current_index = (
             proposal.target_track_ids.index(proposal.current_track_id)
@@ -673,14 +645,55 @@ def _push_for(proposal: Proposal) -> Effect:
             current_index=current_index,
             context_uuid=b"\x00" * 16,
         )
+    if proposal.kind is ProposalKind.ADD:
+        # The cloud's add command APPENDS its payload to the existing cloud
+        # queue, so only the ids not already present in canonical may be
+        # pushed — the full target list would duplicate tracks the cloud
+        # already has. The proposal itself still carries the full target
+        # list since _confirm_proposal folds that into canonical truth on
+        # echo.
+        present = {qid for t in state.tracks if (qid := _safe_qid(t)) is not None}
+        tail = tuple(q for q in proposal.target_track_ids if q not in present)
+        return PushAdd(
+            action_uuid=proposal.action_uuid, base_version=proposal.base_version, track_ids=tail
+        )
+    if proposal.kind is ProposalKind.INSERT:
+        # No diff path produces INSERT proposals yet; implemented
+        # defensively so _emit_push stays total over ProposalKind.
+        return PushInsert(
+            action_uuid=proposal.action_uuid,
+            base_version=proposal.base_version,
+            track_ids=proposal.target_track_ids,
+            insert_after=0,
+        )
+    if proposal.kind is ProposalKind.REMOVE:
+        # No diff path produces REMOVE proposals yet (_diff_ma_list yields
+        # LOAD for a same-set-minus-some-ids change); implemented
+        # defensively so _emit_push stays total over ProposalKind. The wire
+        # command speaks cloud queue_item_ids, not Qobuz track ids.
+        return PushRemove(
+            action_uuid=proposal.action_uuid,
+            base_version=proposal.base_version,
+            queue_item_ids=tuple(
+                item
+                for q in proposal.target_track_ids
+                if (item := _item_id_for_qid(state, q)) is not None
+            ),
+        )
     if proposal.kind is ProposalKind.REORDER:
-        # Encode any permutation as "move every item, in the target order,
-        # to the front" — mirrors _reorder()'s semantics exactly since the
-        # remaining list is empty once every id is moved.
+        # The wire command speaks cloud queue_item_ids (slots), not Qobuz
+        # track ids — translate the reordered Qobuz ids via the canonical
+        # correspondence against ``state``. A REORDER is same-set by
+        # construction, so every target id is present in canonical and the
+        # translation is total.
         return PushReorder(
             action_uuid=proposal.action_uuid,
             base_version=proposal.base_version,
-            queue_item_ids=proposal.target_track_ids,
+            queue_item_ids=tuple(
+                item
+                for q in proposal.target_track_ids
+                if (item := _item_id_for_qid(state, q)) is not None
+            ),
             insert_after=0,
         )
     raise NotImplementedError(f"push mapping for {proposal.kind} lands in a later task")

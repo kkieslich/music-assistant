@@ -12,6 +12,7 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     MaResyncQueue,
     ProposalTimeout,
     PushAdd,
+    PushReorder,
 )
 
 
@@ -160,3 +161,63 @@ def test_confirm_add_uses_real_item_ids_from_echo() -> None:
     confirmed = r2.state.tracks[-1]
     assert confirmed.queue_item_id == 2
     assert confirmed.track_id == "900002"
+
+
+def test_reject_retry_add_repushes_tail_not_full() -> None:
+    """A version-stale rejection of an ADD re-pushes only the tail, not the full target list."""
+    state = _state()
+    r1 = reduce(
+        state,
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xaa" * 16,
+            track_ids=(900000, 900001, 900002),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001, 900002}),
+        ),
+    )
+    r2 = reduce(
+        r1.state,
+        CloudQueueError(
+            now_ms=2,
+            version=QueueVersion(7, 1),
+            action_uuid=b"\xaa" * 16,
+            code="1",
+            message="Queue version mismatch",
+        ),
+    )
+    pushes = [e for e in r2.effects if isinstance(e, PushAdd)]
+    assert len(pushes) == 1
+    assert pushes[0].track_ids == (900002,)
+    assert r2.state.pending[0].retries_left == 0
+
+
+def test_reject_retry_reorder_translates_to_slot_ids() -> None:
+    """A version-stale rejection of a REORDER re-pushes with translated cloud slot ids."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1, 2), current_id=900000, active=True
+    )
+    r1 = reduce(
+        state,
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xbb" * 16,
+            track_ids=(900002, 900000, 900001),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001, 900002}),
+        ),
+    )
+    r2 = reduce(
+        r1.state,
+        CloudQueueError(
+            now_ms=2,
+            version=QueueVersion(7, 1),
+            action_uuid=b"\xbb" * 16,
+            code="1",
+            message="Queue version mismatch",
+        ),
+    )
+    pushes = [e for e in r2.effects if isinstance(e, PushReorder)]
+    assert len(pushes) == 1
+    assert pushes[0].queue_item_ids == (2, 0, 1)
+    assert pushes[0].insert_after == 0
