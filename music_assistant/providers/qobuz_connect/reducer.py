@@ -66,6 +66,7 @@ from .sync_types import (
     PushLoop,
     PushMute,
     PushPlayerState,
+    PushReorder,
     PushVolume,
     ReduceResult,
     ReportState,
@@ -499,8 +500,11 @@ def _confirm_proposal(
     """Fold a confirmed proposal into truth; MA already reflects this state."""
     # Trust the proposal's resolved target rather than re-deriving the delta
     # from the echo event — this stays correct across every proposal kind.
+    # Where the echo itself carries real track ids (adds/inserts/load-acks
+    # assign them cloud-side), prefer those over the placeholder fallback.
+    echoed_track_ids = {t.queue_item_id: t.track_id for t in getattr(event, "tracks", ())}
     tracks = tuple(
-        QueueTrackRef(queue_item_id=i, track_id=_track_id_for(state, i))
+        QueueTrackRef(queue_item_id=i, track_id=echoed_track_ids.get(i, _track_id_for(state, i)))
         for i in proposal.target_track_ids
     )
     pending = tuple(p for p in state.pending if p is not proposal)
@@ -521,7 +525,10 @@ def _reject_proposal(
     absorbed = dataclasses.replace(state, cloud_version=event.version)
     if proposal.retries_left > 0:
         rebased = dataclasses.replace(
-            proposal, base_version=event.version, retries_left=proposal.retries_left - 1
+            proposal,
+            base_version=event.version,
+            retries_left=proposal.retries_left - 1,
+            target_track_ids=_rebase_target(absorbed, proposal),
         )
         pending = tuple(rebased if p is proposal else p for p in absorbed.pending)
         new = dataclasses.replace(absorbed, pending=pending)
@@ -531,22 +538,49 @@ def _reject_proposal(
     return _with_resync(new)  # converge MA to cloud truth
 
 
+def _rebase_target(state: CanonicalState, proposal: Proposal) -> tuple[int, ...]:
+    """
+    Recompute a rejected proposal's target against current canonical tracks.
+
+    Only ADD's target is unambiguous to re-derive after canonical drift
+    (current canonical + whichever proposed ids aren't already canonical,
+    in their proposed order). LOAD/CLEAR/REORDER targets are kept as-is:
+    their intended delta can't be reconstructed from target_track_ids alone
+    once canonical has moved.
+    """
+    if proposal.kind is not ProposalKind.ADD:
+        return proposal.target_track_ids
+    canonical_ids = tuple(t.queue_item_id for t in state.tracks)
+    tail = tuple(i for i in proposal.target_track_ids if i not in canonical_ids)
+    return canonical_ids + tail
+
+
 def _diff_ma_list(state: CanonicalState, event: MaQueueChanged) -> Proposal | None:
     """
     Detect an MA-origin structural change and turn it into a proposal.
 
-    Minimal for this task: detects a pure append (target == truth + tail) and
-    a full clear; anything else is treated as a whole-list load. Task 6
-    replaces this with the full structural diff (reorder detection, partial
-    resolvability, pointer-only-change suppression).
+    Canonical ``tracks`` is filtered to ``event.resolvable`` before
+    comparison: MA legitimately cannot materialize region-locked/404 ids, so
+    a resolvable-filtered subsequence is not a user-driven removal. A pure
+    current-pointer move (list unchanged) is not a list change at all — it is
+    left for the transport lane, which is what prevents the 238-track
+    re-push bug (a natural track-advance being misread as a fresh queue
+    load). Any pending proposal that already targets this exact list is
+    suppressed so we never re-push our own unconfirmed optimistic edit.
     """
-    current_ids = tuple(t.queue_item_id for t in state.tracks)
-    if current_ids == event.track_ids:
+    canonical_ids = tuple(
+        t.queue_item_id for t in state.tracks if t.queue_item_id in event.resolvable
+    )
+    if canonical_ids == event.track_ids:
+        return None
+    if any(p.target_track_ids == event.track_ids for p in state.pending):
         return None
     if not event.track_ids:
         kind = ProposalKind.CLEAR
-    elif event.track_ids[: len(current_ids)] == current_ids:
+    elif canonical_ids and event.track_ids[: len(canonical_ids)] == canonical_ids:
         kind = ProposalKind.ADD
+    elif set(event.track_ids) == set(canonical_ids):
+        kind = ProposalKind.REORDER
     else:
         kind = ProposalKind.LOAD
     return Proposal(
@@ -583,7 +617,17 @@ def _push_for(proposal: Proposal) -> Effect:
             current_index=current_index,
             context_uuid=b"\x00" * 16,
         )
-    raise NotImplementedError(f"push mapping for {proposal.kind} lands in Task 6")
+    if proposal.kind is ProposalKind.REORDER:
+        # Encode any permutation as "move every item, in the target order,
+        # to the front" — mirrors _reorder()'s semantics exactly since the
+        # remaining list is empty once every id is moved.
+        return PushReorder(
+            action_uuid=proposal.action_uuid,
+            base_version=proposal.base_version,
+            queue_item_ids=proposal.target_track_ids,
+            insert_after=0,
+        )
+    raise NotImplementedError(f"push mapping for {proposal.kind} lands in a later task")
 
 
 def _track_id_for(state: CanonicalState, queue_item_id: int) -> str:
