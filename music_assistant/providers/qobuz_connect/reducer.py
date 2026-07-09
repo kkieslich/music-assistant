@@ -67,7 +67,6 @@ from .sync_types import (
     PushLoad,
     PushLoop,
     PushMute,
-    PushPlayerState,
     PushRemove,
     PushReorder,
     PushVolume,
@@ -472,7 +471,7 @@ def _deactivate(state: CanonicalState) -> ReduceResult:
 
 
 def _ma_transport(state: CanonicalState, event: MaTransportChanged) -> ReduceResult:
-    """Fold MA's own transport report into canonical state and push it to cloud."""
+    """Fold MA's own transport into canonical and REPORT it as a renderer (not a command)."""
     current_id = event.current_track_id if event.current_track_id is not None else state.current_id
     new = dataclasses.replace(
         state,
@@ -481,16 +480,15 @@ def _ma_transport(state: CanonicalState, event: MaTransportChanged) -> ReduceRes
         position_ms=event.position_ms,
         position_anchor_ms=event.now_ms,
     )
-    # The wire command wants the cloud's slot id, not the Qobuz track id we
-    # key on internally — translate via the canonical correspondence.
-    item_id = _item_id_for_qid(state, current_id) if current_id is not None else None
-    effect = PushPlayerState(
-        playing=event.playing,
-        position_ms=event.position_ms,
-        queue_version=state.cloud_version,
-        queue_item_id=item_id,
-    )
-    return ReduceResult(new, (effect,))
+    # MA is the RENDERER: it reports its live state via rndrSrvrStateUpdated
+    # (the ReportState effect), NOT ctrlSrvrSetPlayerState. The latter is a
+    # CONTROLLER command that tells the cloud "make this the current track" —
+    # sending it for MA's own playback made MA fight the app for control and
+    # created a command-echo loop that ping-ponged between two tracks (live
+    # 2026-07-09). Controllers/the app follow the renderer's reported current,
+    # so a user skip inside MA still propagates via the report. Our own report
+    # echoes back as srvrCtrlRendererStateUpdated(ownId) and is ignored.
+    return ReduceResult(new, (ReportState(),))
 
 
 def _remove_renderer(state: CanonicalState, event: CloudRemoveRenderer) -> ReduceResult:
