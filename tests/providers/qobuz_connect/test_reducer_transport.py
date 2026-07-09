@@ -280,6 +280,84 @@ def test_app_load_ack_adopts_the_new_queue() -> None:
     assert any(isinstance(e, MaResyncQueue) for e in result.effects)
 
 
+def test_load_ack_while_playing_plays_new_current() -> None:
+    """
+    A new queue load on an active, playing renderer switches playback.
+
+    A real web renderer auto-plays the newly loaded queue's current track on
+    SRVR_CTRL_QUEUE_TRACKS_LOADED (ref_new_album capture). Resyncing the list
+    alone left MA streaming the previous album (live 2026-07-09
+    "MA showed a broken state after I played another song").
+    """
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0, 1),
+        current_id=900000,
+        playing=PlayingState.PLAYING,
+        active=True,
+    )
+    result = reduce(
+        state,
+        CloudLoadAck(
+            now_ms=1,
+            version=QueueVersion(6, 1),
+            action_uuid=b"\xcc" * 16,
+            tracks=_refs(7, 8, 9),
+            queue_position=0,
+        ),
+    )
+    plays = [e for e in result.effects if isinstance(e, MaPlayTrack)]
+    assert len(plays) == 1
+    assert plays[0].track_id == 900007  # tracks[0] Qobuz id of the new queue
+    assert result.state.current_id == 900007
+    assert any(isinstance(e, MaResyncQueue) for e in result.effects)
+
+
+def test_load_ack_same_current_does_not_restart() -> None:
+    """A reorder (shuffle) keeps the current track — audio must not restart."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0, 1, 2),
+        current_id=900000,
+        playing=PlayingState.PLAYING,
+        active=True,
+    )
+    # New order, but the current track (queue_position -> id 900000) is unchanged.
+    result = reduce(
+        state,
+        CloudLoadAck(
+            now_ms=1,
+            version=QueueVersion(6, 1),
+            action_uuid=b"\xcc" * 16,
+            tracks=_refs(0, 2, 1),
+            queue_position=0,
+        ),
+    )
+    assert not any(isinstance(e, MaPlayTrack) for e in result.effects)
+
+
+def test_load_ack_while_inactive_does_not_play() -> None:
+    """A queue load while we are not the active renderer never starts audio."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0, 1),
+        current_id=900000,
+        playing=PlayingState.PLAYING,
+        active=False,
+    )
+    result = reduce(
+        state,
+        CloudLoadAck(
+            now_ms=1,
+            version=QueueVersion(6, 1),
+            action_uuid=b"\xcc" * 16,
+            tracks=_refs(7, 8),
+            queue_position=0,
+        ),
+    )
+    assert not any(isinstance(e, MaPlayTrack) for e in result.effects)
+
+
 def test_empty_load_ack_keeps_tracks() -> None:
     """A load ack with no tracks just bumps the version (doesn't wipe the queue)."""
     state = CanonicalState(
@@ -288,7 +366,10 @@ def test_empty_load_ack_keeps_tracks() -> None:
     result = reduce(
         state,
         CloudLoadAck(
-            now_ms=1, version=QueueVersion(6, 1), action_uuid=b"\xcc" * 16, tracks=(),
+            now_ms=1,
+            version=QueueVersion(6, 1),
+            action_uuid=b"\xcc" * 16,
+            tracks=(),
             queue_position=0,
         ),
     )

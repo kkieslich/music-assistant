@@ -516,10 +516,30 @@ def _reduce_load_ack(state: CanonicalState, event: CloudLoadAck) -> ReduceResult
     if not tracks:
         return ReduceResult(dataclasses.replace(state, cloud_version=event.version), ())
     idx = max(0, min(event.queue_position, len(tracks) - 1))
+    new_current = _safe_qid(tracks[idx])
     new = dataclasses.replace(
-        state, cloud_version=event.version, tracks=tracks, current_id=_safe_qid(tracks[idx])
+        state, cloud_version=event.version, tracks=tracks, current_id=new_current
     )
-    return _with_resync(new)
+    result = _with_resync(new)
+    # A new queue load while we are the active, playing renderer must switch
+    # playback to the loaded queue's current track. A real web renderer
+    # auto-plays on SRVR_CTRL_QUEUE_TRACKS_LOADED — verified in the
+    # ref_new_album capture: the active renderer emits rndrSrvrStateUpdated
+    # PLAYING at the new queueVersion the instant the load arrives, with no
+    # separate SET_STATE. Resyncing the list alone left MA streaming the
+    # previous album while the app had moved on (live 2026-07-09
+    # "MA showed a broken state after I played another song"). Gated on a
+    # real current-track change so a shuffle reorder (same current, new
+    # order) never restarts audio.
+    if (
+        new.active
+        and state.playing is PlayingState.PLAYING
+        and new_current is not None
+        and new_current != state.current_id
+    ):
+        play = MaPlayTrack(track_id=new_current, position_ms=0)
+        return ReduceResult(new, (*result.effects, play))
+    return result
 
 
 def _maybe_ask_snapshot(
