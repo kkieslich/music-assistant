@@ -418,15 +418,15 @@ async def test_on_queue_state_uses_remembered_track_index() -> None:
 
 async def test_on_queue_error_falls_back_to_cloud_version() -> None:
     """
-    A QueueError with no queue_version doesn't crash and leaves the proposal alone.
+    A QueueError with no queue_version still rebases the matching proposal.
 
     The fallback value the coordinator supplies equals ``state.cloud_version``
-    exactly (``CloudQueueError.version`` is non-optional), so the reducer's
-    top-of-``reduce()`` version gate treats it as not-newer-than-current and
-    drops it before it ever reaches ``_reject_proposal`` — recovery is left to
-    the ProposalTimeout safety net rather than an immediate reject/rebase.
+    exactly (``CloudQueueError.version`` is non-optional). A rejection is a
+    control event exempted from the reducer's top-of-``reduce()`` version-stale
+    gate, so it still reaches ``_reject_proposal`` and rebases immediately
+    rather than waiting on the ProposalTimeout safety net.
     """
-    coord, _runner, bridge = _coordinator()
+    coord, runner, bridge = _coordinator()
     proposal = await _seed_and_propose(coord, bridge)
 
     callbacks = coord.build_session_callbacks()
@@ -434,8 +434,10 @@ async def test_on_queue_error_falls_back_to_cloud_version() -> None:
         QueueError(action_uuid=proposal.action_uuid, queue_version=None, code="1", message="failed")
     )
 
-    assert coord.state.pending == (proposal,)
+    assert len(coord.state.pending) == 1  # rebased, still pending
+    assert coord.state.pending[0].retries_left == proposal.retries_left - 1
     assert coord.state.cloud_version == QueueVersion(5, 1)
+    assert any(isinstance(e, PushAdd) for e in runner.effects)  # re-pushed
 
 
 async def test_on_renderer_state_updated_maps_current_queue_index() -> None:

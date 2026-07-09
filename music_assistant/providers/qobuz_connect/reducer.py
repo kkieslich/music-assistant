@@ -149,7 +149,15 @@ ConfirmEvent = (
 def reduce(state: CanonicalState, event: Event) -> ReduceResult:
     """Compute the next canonical state and the effects an event produces."""
     version = getattr(event, "version", None)
-    if version is not None and _version_le(version, state.cloud_version):
+    # A rejection is a control event, not queue state: it must always reach
+    # its matching proposal regardless of version, since the coordinator
+    # falls back to version=state.cloud_version when the wire error carries
+    # none, which the version-stale gate would otherwise always swallow.
+    if (
+        version is not None
+        and not isinstance(event, CloudQueueError)
+        and _version_le(version, state.cloud_version)
+    ):
         return ReduceResult(state, ())
     if isinstance(event, MaQueueChanged):
         return _reduce_ma_queue_changed(state, event)
