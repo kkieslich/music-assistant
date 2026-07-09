@@ -9,14 +9,19 @@ from music_assistant.providers.qobuz_connect.models import (
 )
 from music_assistant.providers.qobuz_connect.reducer import reduce
 from music_assistant.providers.qobuz_connect.sync_types import (
+    AskSnapshot,
     CanonicalState,
     CloudAddRenderer,
+    CloudLoadAck,
     CloudRendererStateUpdated,
+    CloudSessionState,
     CloudSetActive,
     CloudSetState,
+    Disconnected,
     MaPause,
     MaPlayTrack,
     MaResyncQueue,
+    ReportState,
 )
 
 
@@ -205,3 +210,82 @@ def test_setstate_new_current_plays_qobuz_id() -> None:
     assert len(plays) == 1
     assert plays[0].track_id == 900002
     assert result.state.current_id == 900002
+
+
+def test_transport_sets_position_anchor() -> None:
+    """A CloudSetState carrying a position stamps position_anchor_ms from now_ms."""
+    state = _playing_state()
+    result = reduce(
+        state,
+        CloudSetState(
+            now_ms=12345,
+            version=None,
+            playing=PlayingState.PLAYING,
+            position_ms=2000,
+            current_ref=_refs(0)[0],
+            next_ref=None,
+        ),
+    )
+    assert result.state.position_anchor_ms == 12345
+
+
+def test_session_state_asks_for_snapshot() -> None:
+    """CloudSessionState on a fresh state emits AskSnapshot and records last_asked_version."""
+    state = CanonicalState()
+    result = reduce(state, CloudSessionState(now_ms=1, version=QueueVersion(30, 1), track_index=1))
+    asks = [e for e in result.effects if isinstance(e, AskSnapshot)]
+    assert asks == [AskSnapshot(version=QueueVersion(30, 1))]
+    assert result.state.last_asked_version == QueueVersion(30, 1)
+
+
+def test_disconnect_resets_ask() -> None:
+    """Disconnected resets last_asked_version so the next CloudSessionState re-asks."""
+    state = CanonicalState(last_asked_version=QueueVersion(30, 1))
+    result = reduce(state, Disconnected(now_ms=1))
+    assert result.state.last_asked_version == QueueVersion(0, 0)
+
+    result2 = reduce(
+        result.state, CloudSessionState(now_ms=2, version=QueueVersion(30, 1), track_index=1)
+    )
+    asks = [e for e in result2.effects if isinstance(e, AskSnapshot)]
+    assert asks == [AskSnapshot(version=QueueVersion(30, 1))]
+
+
+def test_load_ack_ignores_current_not_in_canonical() -> None:
+    """A load ack whose current track isn't in canonical leaves current_id untouched."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1), current_id=900000, active=True
+    )
+    result = reduce(
+        state,
+        CloudLoadAck(
+            now_ms=1,
+            version=QueueVersion(6, 1),
+            action_uuid=b"\xcc" * 16,
+            tracks=(QueueTrackRef(queue_item_id=0, track_id="999999"),),
+            queue_position=0,
+        ),
+    )
+    assert result.state.current_id == 900000
+    assert result.state.cloud_version == QueueVersion(6, 1)
+    assert any(isinstance(e, ReportState) for e in result.effects)
+
+
+def test_load_ack_adopts_current_in_canonical() -> None:
+    """A load ack whose current track IS in canonical adopts it as current_id."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1), current_id=900000, active=True
+    )
+    result = reduce(
+        state,
+        CloudLoadAck(
+            now_ms=1,
+            version=QueueVersion(6, 1),
+            action_uuid=b"\xcc" * 16,
+            tracks=_refs(0, 1),
+            queue_position=1,
+        ),
+    )
+    assert result.state.current_id == 900001
+    assert result.state.cloud_version == QueueVersion(6, 1)
+    assert any(isinstance(e, ReportState) for e in result.effects)

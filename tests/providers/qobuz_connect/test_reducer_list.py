@@ -6,6 +6,7 @@ from __future__ import annotations
 from music_assistant.providers.qobuz_connect.models import QueueTrackRef, QueueVersion
 from music_assistant.providers.qobuz_connect.reducer import reduce
 from music_assistant.providers.qobuz_connect.sync_types import (
+    AskSnapshot,
     CanonicalState,
     CloudCleared,
     CloudSnapshot,
@@ -144,3 +145,40 @@ def test_cleared_empties_tracks_and_current() -> None:
     )
     assert result.state.tracks == ()
     assert result.state.current_id is None
+
+
+def test_version_changed_asks_once() -> None:
+    """Two CloudVersionChanged events at the same version only ask for a snapshot once."""
+    state = CanonicalState(cloud_version=QueueVersion(5, 1), active=True)
+    r1 = reduce(state, CloudVersionChanged(now_ms=1, version=QueueVersion(6, 1)))
+    asks1 = [e for e in r1.effects if isinstance(e, AskSnapshot)]
+    assert asks1 == [AskSnapshot(version=QueueVersion(6, 1))]
+    assert r1.state.last_asked_version == QueueVersion(6, 1)
+
+    # Re-delivering the same version is stale relative to the now-bumped
+    # cloud_version, so it's gated out entirely -> no second ask.
+    r2 = reduce(r1.state, CloudVersionChanged(now_ms=2, version=QueueVersion(6, 1)))
+    assert r2.state is r1.state
+    assert not any(isinstance(e, AskSnapshot) for e in r2.effects)
+
+
+def test_snapshot_arrival_sets_last_asked() -> None:
+    """A CloudSnapshot's arrival records last_asked_version so a same-version re-ask is skipped."""
+    state = CanonicalState(cloud_version=QueueVersion(5, 1), active=True)
+    r1 = reduce(
+        state,
+        CloudSnapshot(
+            now_ms=1,
+            version=QueueVersion(6, 1),
+            tracks=_refs(0, 1),
+            autoplay_tracks=(),
+            shuffle=False,
+            autoplay=False,
+            track_index=1,
+        ),
+    )
+    assert r1.state.last_asked_version == QueueVersion(6, 1)
+
+    r2 = reduce(r1.state, CloudVersionChanged(now_ms=2, version=QueueVersion(6, 1)))
+    assert r2.state is r1.state  # stale version (== cloud_version) is ignored entirely
+    assert not any(isinstance(e, AskSnapshot) for e in r2.effects)

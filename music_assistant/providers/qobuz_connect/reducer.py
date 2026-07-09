@@ -13,6 +13,7 @@ import dataclasses
 
 from .models import PlayingState, QueueTrackRef, QueueVersion
 from .sync_types import (
+    AskSnapshot,
     CanonicalState,
     CloudActiveRendererChanged,
     CloudAddRenderer,
@@ -215,16 +216,22 @@ def _reduce_list_inbound(state: CanonicalState, event: Event) -> ReduceResult:
     if isinstance(event, CloudSnapshot):
         tracks = tuple(event.tracks)
         current_id = _current_from_pointer(tracks, event.track_index)
+        # We now hold this version's queue: record it as asked-for so an
+        # immediately-following notification at the same version doesn't
+        # trigger a redundant re-ask.
         new = dataclasses.replace(
             state,
             cloud_version=event.version,
             tracks=tracks,
             autoplay_tracks=tuple(event.autoplay_tracks),
             current_id=current_id,
+            last_asked_version=event.version,
         )
         return _with_resync(new)
     if isinstance(event, CloudVersionChanged):
-        return ReduceResult(dataclasses.replace(state, cloud_version=event.version), ())
+        new = dataclasses.replace(state, cloud_version=event.version)
+        asked, ask_effects = _maybe_ask_snapshot(new, event.version)
+        return ReduceResult(asked, ask_effects)
     if isinstance(event, CloudCleared):
         new = dataclasses.replace(state, cloud_version=event.version, tracks=(), current_id=None)
         return _with_resync(new)
@@ -263,12 +270,7 @@ def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
     if isinstance(event, CloudSetActive):
         return _takeover(state) if event.active else _deactivate(state)
     if isinstance(event, CloudSetState):
-        return _apply_transport(
-            state,
-            playing=event.playing,
-            position_ms=event.position_ms,
-            current_id=_qid(event.current_ref) if event.current_ref else None,
-        )
+        return _reduce_set_state(state, event)
     if isinstance(event, CloudRendererStateUpdated):
         # Another renderer's live state feeds canonical truth only while we
         # aren't active; once we're active it's our own echo or irrelevant.
@@ -283,6 +285,7 @@ def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
             current_id=current_id,
             playing=event.playing or state.playing,
             position_ms=event.position_ms if event.position_ms is not None else state.position_ms,
+            position_anchor_ms=event.now_ms,
         )
         return ReduceResult(new, ())
     if isinstance(event, CloudStateRequest):
@@ -292,7 +295,10 @@ def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
     if isinstance(event, CloudSessionState):
         current_id = _current_from_pointer(state.tracks, event.track_index)
         new = dataclasses.replace(state, cloud_version=event.version, current_id=current_id)
-        return ReduceResult(new, ())
+        # The primary handoff path: the cloud only pushes the queue snapshot
+        # in response to an explicit ask, so connecting mid-session must ask.
+        asked, ask_effects = _maybe_ask_snapshot(new, event.version)
+        return ReduceResult(asked, ask_effects)
     if isinstance(event, CloudActiveRendererChanged):
         return ReduceResult(dataclasses.replace(state, active_rid=event.renderer_id), ())
     if isinstance(event, CloudAddRenderer):
@@ -307,9 +313,21 @@ def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
     if isinstance(event, Connected):
         return ReduceResult(state, ())
     if isinstance(event, Disconnected):
-        return ReduceResult(dataclasses.replace(state, active=False, pending=()), ())
+        # Reset the ask-dedup so a reconnect re-seeds a fresh snapshot rather
+        # than trusting a possibly-stale last_asked_version.
+        new = dataclasses.replace(
+            state, active=False, pending=(), last_asked_version=QueueVersion()
+        )
+        return ReduceResult(new, ())
     if isinstance(event, CloudLoadAck):
-        current_id = _current_from_load_ack(event)
+        # SRVR_CTRL_AUTOPLAY_TRACKS_LOADED is delivered here as a CloudLoadAck
+        # whose tracks are autoplay continuation tracks NOT in canonical.
+        # Only adopt the resolved current id if it's actually present in
+        # canonical; otherwise keep current_id as-is to avoid pointing at a
+        # dangling Qobuz id. Autoplay continuation-track appending into
+        # canonical is a known follow-up, not handled here.
+        candidate = _current_from_load_ack(event)
+        current_id = candidate if _in_canonical(state, candidate) else state.current_id
         new = dataclasses.replace(state, cloud_version=event.version, current_id=current_id)
         return ReduceResult(new, (ReportState(),))
     return ReduceResult(state, ())
@@ -362,9 +380,27 @@ def _ma_modes_changed(state: CanonicalState, event: MaModesChanged) -> ReduceRes
     return ReduceResult(new, tuple(effects))
 
 
+def _reduce_set_state(state: CanonicalState, event: CloudSetState) -> ReduceResult:
+    """Apply a CloudSetState transport command, then ask for a snapshot if it carries a version."""
+    result = _apply_transport(
+        state,
+        now_ms=event.now_ms,
+        playing=event.playing,
+        position_ms=event.position_ms,
+        current_id=_qid(event.current_ref) if event.current_ref else None,
+    )
+    if event.version is None:
+        return result
+    # An app play with a version we don't yet hold must trigger a snapshot
+    # ask, deduped against redundant asks at the same version.
+    asked, ask_effects = _maybe_ask_snapshot(result.state, event.version)
+    return ReduceResult(asked, result.effects + ask_effects)
+
+
 def _apply_transport(
     state: CanonicalState,
     *,
+    now_ms: int,
     playing: PlayingState | None,
     position_ms: int | None,
     current_id: int | None,
@@ -377,6 +413,8 @@ def _apply_transport(
     an explicit seek, else a bare position/heartbeat update with no effect.
 
     :param state: Canonical state before the transport command.
+    :param now_ms: The event's timestamp, stamped as the anchor whenever
+        position_ms is (re)captured so the reporter can interpolate.
     :param playing: Reported playing state, or None if not carried.
     :param position_ms: Reported position, or None if not carried.
     :param current_id: Reported current Qobuz track id, or None if not carried.
@@ -387,6 +425,7 @@ def _apply_transport(
             current_id=current_id,
             playing=playing or state.playing,
             position_ms=position_ms or 0,
+            position_anchor_ms=now_ms,
         )
         return ReduceResult(new, (MaPlayTrack(track_id=current_id, position_ms=position_ms or 0),))
     if playing is not None and playing != state.playing:
@@ -394,15 +433,16 @@ def _apply_transport(
         effect = MaPause() if playing is PlayingState.PAUSED else MaResume()
         return ReduceResult(new, (effect,))
     if position_ms is not None and abs(position_ms - state.position_ms) > _SEEK_THRESHOLD_MS:
-        new = dataclasses.replace(state, position_ms=position_ms)
+        new = dataclasses.replace(state, position_ms=position_ms, position_anchor_ms=now_ms)
         return ReduceResult(new, (MaSeek(position_ms),))
-    # Position/heartbeat only: no MA effect, ever.
-    return ReduceResult(
-        dataclasses.replace(
-            state, position_ms=position_ms if position_ms is not None else state.position_ms
-        ),
-        (),
-    )
+    # Position/heartbeat only: no MA effect, ever. Only re-anchor when a
+    # position was actually reported — a bare heartbeat with no position
+    # carries no fresh interpolation point.
+    if position_ms is not None:
+        return ReduceResult(
+            dataclasses.replace(state, position_ms=position_ms, position_anchor_ms=now_ms), ()
+        )
+    return ReduceResult(state, ())
 
 
 def _takeover(state: CanonicalState) -> ReduceResult:
@@ -429,7 +469,11 @@ def _ma_transport(state: CanonicalState, event: MaTransportChanged) -> ReduceRes
     """Fold MA's own transport report into canonical state and push it to cloud."""
     current_id = event.current_track_id if event.current_track_id is not None else state.current_id
     new = dataclasses.replace(
-        state, playing=event.playing, current_id=current_id, position_ms=event.position_ms
+        state,
+        playing=event.playing,
+        current_id=current_id,
+        position_ms=event.position_ms,
+        position_anchor_ms=event.now_ms,
     )
     # The wire command wants the cloud's slot id, not the Qobuz track id we
     # key on internally — translate via the canonical correspondence.
@@ -459,6 +503,39 @@ def _current_from_load_ack(event: CloudLoadAck) -> int | None:
         return None
     idx = max(0, min(event.queue_position, len(event.tracks) - 1))
     return _qid(event.tracks[idx])
+
+
+def _in_canonical(state: CanonicalState, qid: int | None) -> bool:
+    """Whether ``qid`` is a Qobuz track id present in canonical tracks."""
+    if qid is None:
+        return False
+    return any(_safe_qid(t) == qid for t in state.tracks)
+
+
+def _maybe_ask_snapshot(
+    state: CanonicalState, version: QueueVersion
+) -> tuple[CanonicalState, tuple[Effect, ...]]:
+    """
+    Ask the cloud for a full queue snapshot of ``version`` if we haven't already.
+
+    The cloud only sends SRVR_CTRL_QUEUE_STATE in response to an explicit
+    ask; it never pushes it unsolicited. Deduped against
+    ``last_asked_version`` so redundant notifications at the same version —
+    including the echo of our own confirmed proposals — don't trigger a
+    repeat ask.
+
+    :param state: Canonical state to check and, if asking, update.
+    :param version: The cloud queue_version to request a snapshot for.
+    """
+    if version == QueueVersion():
+        return state, ()
+    if (version.major, version.minor) == (
+        state.last_asked_version.major,
+        state.last_asked_version.minor,
+    ):
+        return state, ()
+    new = dataclasses.replace(state, last_asked_version=version)
+    return new, (AskSnapshot(version=version),)
 
 
 def _with_resync(new: CanonicalState) -> ReduceResult:
