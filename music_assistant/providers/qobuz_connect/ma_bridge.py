@@ -1,13 +1,13 @@
 """
-Single seam between the sync engine and the Music Assistant world.
+Single seam between the sync core and the Music Assistant world.
 
-After Phase C, every MA-world touch in :mod:`.sync` goes through this
-class — both the provider-facing accessors (``provider.logger``,
-``provider.qobuz_session``, ``provider.get_target_player_id()`` …) and
-the MA-core operations (``mass.player_queues.play_index``,
-``mass.players.cmd_volume_set`` …). The sync engine no longer holds a
-direct ``self.mass`` reference and reaches into the provider only via
-``self.bridge``.
+Every MA-world touch in the sync shell (``coordinator`` / ``effect_runner``
+and the reporter/metadata helpers) goes through this class — both the
+provider-facing accessors (``provider.logger``, ``provider.qobuz_session``,
+``provider.get_target_player_id()`` …) and the MA-core operations
+(``mass.player_queues.play_index``, ``mass.players.cmd_volume_set`` …).
+The sync shell holds no direct ``self.mass`` reference and reaches into the
+provider only via the bridge.
 
 That seam pays off in two places:
 
@@ -16,8 +16,7 @@ That seam pays off in two places:
 - changes to MA's API only need to be reflected in one file.
 
 Stays MA-free at the type level — runtime accesses are typed ``Any`` so
-adding this module doesn't pull MA-specific imports into the sync
-graph.
+adding this module doesn't pull MA-specific imports into the sync graph.
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ if TYPE_CHECKING:
 
 
 class MABridge:
-    """Provider-facing facade for :class:`.sync.QobuzConnectSyncEngine`."""
+    """Provider-facing facade over MA's player/queue APIs for the sync core."""
 
     __slots__ = ("_provider",)
 
@@ -202,7 +201,7 @@ class MABridge:
 
         Accepts MA's ``RepeatMode`` string value (``"off"`` / ``"one"`` /
         ``"all"``) and constructs the enum at the bridge boundary so the
-        sync engine stays free of MA type imports.
+        sync core stays free of MA type imports.
         """
         from music_assistant_models.enums import RepeatMode  # noqa: PLC0415
 

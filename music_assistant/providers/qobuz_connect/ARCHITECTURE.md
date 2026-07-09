@@ -1,10 +1,15 @@
 # Qobuz Connect Provider — Architecture
 
 This document describes the **current** shape of the `qobuz_connect`
-provider. It's the prerequisite for the redesign work in Phase B / Phase C
-of the plan: you should be able to read this and modify any one module
-without spelunking the others. Pair it with [`README.md`](README.md) for the
+provider. You should be able to read this and modify any one module without
+spelunking the others. Pair it with [`README.md`](README.md) for the
 user-facing rationale (why this provider exists, what it replaces).
+
+The sync layer is a **pure reducer + impure shell**: `reduce(state, event)
+-> (state, effects)` (`reducer.py` / `sync_types.py`) owns every MA↔Qobuz
+decision without touching I/O, and a thin shell (`coordinator.py` /
+`effect_runner.py`) feeds it events and executes the effects it returns. It
+replaced the earlier stateful `QobuzConnectSyncEngine` facade + collaborators.
 
 ## What this provider does
 
@@ -58,63 +63,56 @@ actually fetches the audio.
     │  QobuzConnectSession
     ├─ session.py sends OuterMessageType.AUTHENTICATE (JWT) ┐
     ├─ session.py sends OuterMessageType.SUBSCRIBE (QConnect proto)
-    ├─ session.py sends RNDR_SRVR_JOIN_SESSION (renderer joins)
-    └─ if `enable_controller` is on, controller.py opens a second,
-       persistent session in CONTROLLER role (see "Controller connection
-       (see "The single dual-role connection" below) — same JWT type, different JOIN
-       message
+    ├─ session.py sends the role's JOIN message: CtrlSrvrJoinSession when
+    │  `enable_controller` is on (dual-role — see "The single dual-role
+    │  connection" below), else the legacy RndrSrvrJoinSession
+    └─ one websocket per instance carries both renderer reports and
+       controller verbs — same JWT type, role chosen by the JOIN message
 
 4.  Steady state: bidirectional message loop
     ├─ session.py decodes outer envelopes via QobuzConnectCodec.decode_frame
     ├─ batched inner messages parsed → typed events fired via callbacks
-    ├─ sync.py's handlers reconcile each event against QobuzMirror + MA
-    └─ sync.py emits state reports back via session.send_renderer_state
-       on a 5s heartbeat plus ad-hoc after every command
+    ├─ coordinator.py translates each callback into a pure Event, runs it
+    │  through reducer.reduce() under a lock, and awaits the resulting
+    │  effects on effect_runner (in order) before the next event
+    └─ effect_runner emits state reports back via outbound_reporter /
+       session on a 5s heartbeat plus ad-hoc after every command
 ```
 
 ## Module map
 
-The Phase C redesign split what used to be a single 1.1k-LOC `sync.py`
-into a facade + six focused collaborators. Each collaborator owns one
-concern and is reachable from the engine via a single attribute
-(`engine.bridge`, `engine.reporter`, `engine.seek_pipeline`,
-`engine.metadata`, `engine.queue_loader`, `engine.command_handler`).
+The sync layer is a **functional core / imperative shell**. A pure reducer
+(`reducer.py` over the value types in `sync_types.py`) makes every decision;
+an impure shell (`coordinator.py` + `effect_runner.py`) does all the I/O.
+Nothing outside the shell holds mutable sync state.
 
 | File                                                   | Owns                                                                                                                              | MA?       | Proto?         |
 |--------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|-----------|----------------|
 | [`discovery.py`](discovery.py)                         | mDNS service + local HTTP handshake endpoints                                                                                     | ❌         | ❌              |
 | [`protocol.py`](protocol.py)                           | Outer-frame codec + protobuf encode/decode                                                                                        | ❌         | ✅              |
-| [`session.py`](session.py)                             | WebSocket lifecycle, token refresh, hand-off to dispatcher                                                                        | ❌         | via proto      |
+| [`session.py`](session.py)                             | WebSocket lifecycle, token refresh, JOIN role, `send_*` verbs, hand-off to dispatcher                                             | ❌         | via proto      |
 | [`inbound_dispatcher.py`](inbound_dispatcher.py)       | Routing table: decoded inner message → typed callback                                                                             | ❌         | via proto      |
-| [`models.py`](models.py)                               | DTOs + enums shared across all of the above                                                                                       | ❌         | enum refs only |
-| [`state.py`](state.py)                                 | Ephemeral pending-action dataclasses (`PausedSeek`, `PendingPlayingSeek`, `PendingQobuzPosition`, `TrackRefKey`, `origin_scope`)   | ❌         | ❌              |
-| [`controller.py`](controller.py)                       | Renderer-registry tracking + the verb API over the shared single socket (`load_queue`, `play_item`, `seek`, `set_playing`, `set_volume`, `set_mute`, `activate_self`); the verb API is used by `queue_loader.py` (only). No MA imports.  | ❌         | via session   |
-| [`ma_bridge.py`](ma_bridge.py)                         | The one place sync.py touches Music Assistant — provider accessors + `mass.player_queues.*` / `mass.players.*`                    | ✅         | ❌              |
-| [`outbound_reporter.py`](outbound_reporter.py)         | Renderer→cloud emission: `report_state`, heartbeat, buffering reporter, wire-anchor logic                                         | via engine | ❌              |
-| [`seek_pipeline.py`](seek_pipeline.py)                 | Paused-seek storage, playing-seek debouncing, Qobuz-position confirmation                                                         | via engine | ❌              |
-| [`metadata_resolver.py`](metadata_resolver.py)         | MA track-metadata lookups + fail-cache                                                                                            | via engine | ❌              |
-| [`queue_loader.py`](queue_loader.py)                   | MA→Qobuz queue-load round-trip (action_uuid futures, context UUID, ack/timeout)                                                   | via engine | indirect       |
-| [`command_handler.py`](command_handler.py)             | `SRVR_RNDR_SET_STATE` reconciliation: mirror update, reconcile task, per-playing-state branches, MA-queue replacement, prequeue   | via engine | indirect       |
-| [`sync.py`](sync.py)                                   | **Facade** holding QobuzMirror + cross-cutting helpers + Phase B mirror handlers; wires up the six collaborators above            | ✅ (via bridge) | indirect    |
-| [`__init__.py`](__init__.py)                           | `QobuzConnectProvider`: config, lifecycle, MA event subscription, wiring                                                          | ✅         | ❌              |
+| [`models.py`](models.py)                               | DTOs + enums shared across all of the above (parsed cloud events, `QueueTrackRef`, `QueueVersion`, quality maps, `QobuzMirror`)   | ❌         | enum refs only |
+| [`sync_types.py`](sync_types.py)                       | **Pure** value types: `CanonicalState`, the `Event` union (cloud + MA + timer), the `Effect` union (`Push*`/`Ma*`/`ReportState`), `Proposal`  | ❌         | ❌              |
+| [`reducer.py`](reducer.py)                             | **Pure** `reduce(state, event) -> (state, effects)`: version gate, proposal confirm/reject/timeout, the four lanes               | ❌         | ❌              |
+| [`coordinator.py`](coordinator.py)                     | **Shell**: owns the single `CanonicalState`; serializes inbound (cloud callbacks + MA `on_ma_*`) into `Event`s through `reduce` under a lock; runs the proposal-timeout timer | ✅ (via bridge) | via session |
+| [`effect_runner.py`](effect_runner.py)                 | **Shell**: turns each `Effect` into a real `session.send_*` call or `ma_bridge` mutation; nothing else does I/O                  | ✅ (via bridge) | via session |
+| [`ma_bridge.py`](ma_bridge.py)                         | The one place the sync core touches Music Assistant — provider accessors + `mass.player_queues.*` / `mass.players.*`             | ✅         | ❌              |
+| [`metadata_resolver.py`](metadata_resolver.py)         | MA track-metadata lookups + fail-cache (used by `effect_runner` to resolve Qobuz ids → MA `Track`s)                              | via bridge | ❌              |
+| [`outbound_reporter.py`](outbound_reporter.py)         | Renderer→cloud emission: `report_state`, heartbeat, buffering reporter, wire-anchor logic (driven by the `ReportState` effect + heartbeat) | via host | ❌     |
+| [`__init__.py`](__init__.py)                           | `QobuzConnectProvider`: config, lifecycle, MA event subscription, wiring the shell together                                       | ✅         | ❌              |
 
-The first six modules in the table (discovery → models → state →
-inbound_dispatcher) are pure: they could be lifted into a standalone
-Qobuz Connect SDK without MA. MA coupling lives behind `ma_bridge.py`
-(and in `__init__.py` which constructs the provider). After Phase C
-every MA access in the sync engine + its collaborators goes through
-`self.bridge`.
+`discovery`, `protocol`, `inbound_dispatcher`, `models`, `sync_types` and
+`reducer` are pure (no MA imports): they could be lifted into a standalone
+Qobuz Connect SDK. MA coupling lives behind `ma_bridge.py` and in the two
+shell modules (`coordinator` / `effect_runner`) plus `__init__.py`, which
+constructs the provider and wires everything together.
 
-### sync.py size, before vs. after Phase C
-
-| Stage                                  | sync.py LOC |
-|----------------------------------------|------------:|
-| Pre-Phase-C                            |       1,255 |
-| Stage 6 (outbound_reporter.py)         |       1,145 |
-| Stage 7 (seek_pipeline.py)             |       1,002 |
-| Stage 8 (metadata_resolver.py)         |         970 |
-| Stage 9 (queue_loader.py + dead-code)  |         861 |
-| Stage 10 (command_handler.py)          |         461 |
+`metadata_resolver` and `outbound_reporter` predate the reducer rework and
+were built against the retired engine; the provider now hands each a small
+duck-typed host (`_MetadataHost` / `_ReporterHost` in `__init__.py`) that
+exposes just `bridge` (and, for the reporter, a live `QobuzMirror`
+projection of the coordinator's `CanonicalState`) instead of the old engine.
 
 ## The single dual-role connection
 
@@ -168,40 +166,44 @@ and `docs/superpowers/specs/2026-07-07-qobuz-connect-controller-design.md`
 
 ### Controller verb map
 
-`controller.py` holds the renderer-registry state and exposes the verb
-API; every verb goes out on the shared socket. Only `queue_loader.py`
-calls into it today (`load_queue`, `play_item`, `activate_self`) —
-`set_playing`, `seek`, `set_volume` and `set_mute` are implemented but
-have no production callsite yet:
+The controller verbs are `Push*` **effects** the reducer emits; the shell
+turns them into `session.send_*` calls via `effect_runner`. Every verb goes
+out on the shared socket. MA-origin queue edits (`PushLoad` / `PushAdd` /
+`PushInsert` / `PushRemove` / `PushReorder` / `PushClear`) and
+`PushSetActive` are wired end-to-end today; `PushPlayerState` /
+`PushVolume` / `PushMute` have `send_*` support but the reducer has no
+callsite emitting them yet:
 
-| Verb                          | `controller.py` method | Wire message                                                        |
-|--------------------------------|-------------------------|-----------------------------------------------------------------------|
-| Pause / resume                 | `set_playing`           | `CTRL_SRVR_SET_PLAYER_STATE{playingState}` (no callsite yet)          |
-| Seek                           | `seek`                  | `CTRL_SRVR_SET_PLAYER_STATE{currentPosition}` (position only) (no callsite yet) |
-| Skip / play specific item      | `play_item`             | `CTRL_SRVR_SET_PLAYER_STATE{playingState, currentPosition: 0, currentQueueItem}` |
-| Volume                         | `set_volume`            | `CTRL_SRVR_SET_VOLUME{rendererId, volume}` (no callsite yet)          |
-| Mute                           | `set_mute`              | `CTRL_SRVR_MUTE_VOLUME{rendererId, value}` (no callsite yet)          |
-| Become the active renderer     | `activate_self`         | `CTRL_SRVR_SET_ACTIVE_RENDERER{rendererId}`                           |
-| Queue replacement (MA-origin)  | `load_queue`            | `CTRL_SRVR_QUEUE_LOAD_TRACKS` — packed little-endian uint32 track ids in the (misnamed) `sessionUuid` field, plus a mandatory fresh 16-byte `contextUuid` and explicitly-present `shufflePivotQueueItemId=0` / `shuffleMode=false`; the active renderer keeps rendering and switches to the new queue |
+| Verb                          | Effect            | Wire message                                                        |
+|--------------------------------|-------------------|-----------------------------------------------------------------------|
+| Pause / resume                 | `PushPlayerState` | `CTRL_SRVR_SET_PLAYER_STATE{playingState}` (no callsite yet)          |
+| Seek                           | `PushPlayerState` | `CTRL_SRVR_SET_PLAYER_STATE{currentPosition}` (no callsite yet)       |
+| Skip / play specific item      | `PushPlayerState` | `CTRL_SRVR_SET_PLAYER_STATE{playingState, currentPosition: 0, currentQueueItem}` |
+| Volume                         | `PushVolume`      | `CTRL_SRVR_SET_VOLUME{rendererId, volume}` (no callsite yet)          |
+| Mute                           | `PushMute`        | `CTRL_SRVR_MUTE_VOLUME{rendererId, value}` (no callsite yet)          |
+| Become the active renderer     | `PushSetActive`   | `CTRL_SRVR_SET_ACTIVE_RENDERER{rendererId}`                           |
+| Queue replacement (MA-origin)  | `PushLoad`        | `CTRL_SRVR_QUEUE_LOAD_TRACKS` — packed little-endian uint32 track ids in the (misnamed) `sessionUuid` field, plus a mandatory fresh 16-byte `contextUuid` and explicitly-present `shufflePivotQueueItemId=0` / `shuffleMode=false`; the active renderer keeps rendering and switches to the new queue |
 
-`load_queue` is the only queue-load verb `queue_loader.py` calls directly
-(`_send_controller_load`); it falls back to the legacy
-`_send_legacy_qweb_load` only when the controller is disabled via the
-`enable_controller` config toggle. When the controller is enabled but not
-currently connected, MA-origin loads are skipped (not mirrored to the
-Qobuz app) rather than falling back, with one warning per outage.
+An MA-origin edit becomes a `Proposal` in `CanonicalState.pending`, and the
+matching `Push*` effect carries the proposal's `action_uuid` + `base_version`
+so the cloud echo can be correlated (see "The sync core" below). Cloud
+pushes are only meaningful while the controller socket is connected; when it
+isn't, the effect's `session.send_*` no-ops (the `_LiveSessionProxy` in
+`__init__.py` forwards to whichever session is current and safely drops
+sends before one exists).
 
 ### Own-rendererId discovery
 
-The connection doesn't know its `rendererId` until the cloud tells it.
-On join, the cloud bootstraps it with `SRVR_CTRL_ADD_RENDERER` for every
-online renderer; `controller.py` matches the entry whose `device_uuid`
-equals ours to learn `own_renderer_id`. Every verb method checks it and
-is a no-op until it's known. `SRVR_CTRL_ACTIVE_RENDERER_CHANGED` keeps
-`active_renderer_id` current; `activate_self()` only sends when we
-aren't already active. On connection loss (`on_disconnected` callback,
-fired from the session's connection loop) both ids are cleared and are
-re-discovered from the next bootstrap.
+The connection doesn't know its `rendererId` until the cloud tells it. On
+join, the cloud bootstraps it with `SRVR_CTRL_ADD_RENDERER` for every online
+renderer; the reducer's transport lane matches the entry whose `device_uuid`
+equals ours (resolved by the coordinator against its `device_uuid`) and
+stores it as `CanonicalState.own_rid`. `PushSetActive` is a no-op until
+`own_rid` is known. `SRVR_CTRL_ACTIVE_RENDERER_CHANGED` keeps
+`active_rid` current, and the reducer only emits `PushSetActive` when we
+aren't already active. On connection loss (`Disconnected` event, from the
+session's connection loop) both ids are cleared and re-discovered from the
+next bootstrap.
 
 ### Eager connect (controller mode)
 
@@ -230,26 +232,29 @@ receives SET_ACTIVE). Sources for that knowledge:
 - `SRVR_CTRL_SESSION_STATE.trackIndex` (connect-time) — the queue *read
   pointer*: the index of the NEXT track to pull, i.e. current + 1 (live
   2026-07-08: phone on index 2 → trackIndex 3; equivalently a 1-based
-  current index). The mirror stores `max(0, trackIndex - 1)`.
+  current index). The reducer resolves `current_id` from `max(0,
+  trackIndex - 1)` against the known track list.
 - `SRVR_CTRL_QUEUE_STATE` (asked-for snapshot) — the track list.
 - `SRVR_CTRL_RENDERER_STATE_UPDATED` (type 82, ~1/s while another
   renderer plays) — live playing state, position, duration, and
   `currentQueueIndex` when the renderer reports one.
 
-`sync.takeover_playback()` (called from `_on_set_active`) derives
-`current_item = tracks[track_index]`, and if the previous renderer was
-PLAYING, synthesizes the rich `SET_STATE` the renderer role used to
-receive and feeds it through the normal command pipeline. Play commands
-arriving later without track refs (`_handle_qobuz_play`) fall back to the
-same derivation. Two guards:
+The reducer's transport lane handles `CloudSetActive`: it flips
+`state.active` and, when it transitions us *into* the active role while the
+session was PLAYING, emits an `MaResyncQueue` / `MaPlayTrack` effect so MA
+picks up the current track from local knowledge — the same continue-the-
+session behavior as the reference web client. A takeover while paused only
+records state (`test_reducer_transport.py`). Because those effects flow
+through the ordinary transport lane, a later play arriving without track
+refs converges the same way. Guards, now expressed as state rather than
+side-effect flags:
 
-- The queue loader calls `suppress_takeover_once()` before its own
-  `activate_self()` — the activation echo of an MA-origin load must not
-  resurrect the stale mirror queue.
-- `current_item` stays `None` while we are not the target (it gates the
-  heartbeat reporter — inactive renderers must stay silent, and
-  deactivation clears it while preserving `tracks`/`track_index`, which
-  the cloud never resends unprompted).
+- Audio is never restarted unless `current_id` actually *changes* (see
+  "The sync core" below), so the activation echo of an MA-origin load —
+  which leaves `current_id` unchanged — can't resurrect a stale queue.
+- Reports are gated on `state.active`: inactive renderers stay silent, and
+  a deactivation clears `active` while preserving `tracks`/`current_id`,
+  which the cloud never resends unprompted.
 
 ### Rejoin-on-error
 
@@ -271,9 +276,9 @@ session (live 2026-07-08 evening cascade); they're excluded via
 `REPORT_SEMANTIC_ERRORS`. Related invariants that prevent the errors at
 the source:
 
-- Our own `QUEUE_CLEARED` echo clears `current_item` (report gate), and
-  a queue snapshot prunes a `current_item` that's no longer in it.
-- Losing the websocket drops `_is_active` (a fresh connection is never
+- Our own `QUEUE_CLEARED` echo clears `current_id` (report gate), and
+  a queue snapshot prunes a `current_id` that's no longer in it.
+- Losing the websocket drops `state.active` (a fresh connection is never
   the active renderer) and the heartbeat only reports while active.
 - MA's `play_media` replaces a queue via a transient clear-then-load, so
   an empty MA queue only propagates to the cloud as `CLEAR_QUEUE` after
@@ -282,30 +287,37 @@ the source:
 
 ## Inbound messages (Qobuz → this provider)
 
-All inbound traffic is one of these QConnect inner message types,
-dispatched in [`session.py`](session.py) and handled in [`sync.py`](sync.py):
+All inbound traffic is one of these QConnect inner message types, decoded
+and dispatched in [`session.py`](session.py), translated into a pure
+`Event` by [`coordinator.py`](coordinator.py), and reduced in
+[`reducer.py`](reducer.py). The reducer routes each event to one of four
+lanes: **list** (queue snapshot/add/insert/remove/reorder/clear + load
+acks/version), **transport/session** (set-state, set-active, session-state,
+renderer registry), **modes** (loop/shuffle/autoplay), and **side-channels**
+(volume/mute/quality). See "The sync core" below.
 
-| Type ID | Message                              | Decoder (`protocol.py`)       | Handler (`sync.py`)                  | Purpose                                                |
-|--------:|--------------------------------------|-------------------------------|--------------------------------------|--------------------------------------------------------|
-|      41 | `SRVR_RNDR_SET_STATE`                | `parse_set_state`             | `handle_qobuz_set_state`             | Master command: play/pause/seek/load-track             |
-|      42 | `SRVR_RNDR_SET_VOLUME`               | (inline in session.py)        | `set_volume` / `set_volume_delta`    | Volume command                                         |
-|      43 | `SRVR_RNDR_SET_ACTIVE`               | (inline in session.py)        | `reset_for_deactivation` if `false`  | Cloud activates/deactivates this renderer              |
-|      44 | `SRVR_RNDR_SET_MAX_AUDIO_QUALITY`    | (inline in session.py)        | `_on_quality_change` in `__init__.py`| User picked a new max quality in the Qobuz app         |
-|      77 | `CTRL_SRVR_ASK_FOR_RENDERER_STATE`   | (no payload)                  | `report_state`                       | Cloud asks: "what's your current state?"               |
-|      88 | `SRVR_CTRL_QUEUE_ERROR_MESSAGE`      | `parse_queue_error`           | `handle_queue_error`                 | Cloud rejected a queue-load we sent                    |
-|      91 | `SRVR_CTRL_QUEUE_TRACKS_LOADED`      | `parse_queue_load_ack`        | `handle_queue_load_ack`              | Cloud ack'd a `CTRL_SRVR_QUEUE_LOAD_TRACKS`            |
-|     103 | `SRVR_CTRL_AUTOPLAY_TRACKS_LOADED`   | `parse_autoplay_load_ack`     | `handle_queue_load_ack`              | Cloud ack'd a `CTRL_SRVR_AUTOPLAY_LOAD_TRACKS`         |
-|     105 | `SRVR_CTRL_QUEUE_VERSION_CHANGED`    | `parse_queue_version_changed` | `handle_queue_version`               | Authoritative queue version bump                       |
+| Type ID | Message                              | Decoder (`protocol.py`)       | Event (`sync_types.py`)              | Lane      |
+|--------:|--------------------------------------|-------------------------------|--------------------------------------|-----------|
+|      41 | `SRVR_RNDR_SET_STATE`                | `parse_set_state`             | `CloudSetState`                      | transport |
+|      42 | `SRVR_RNDR_SET_VOLUME`               | (inline in session.py)        | `CloudVolume` / `CloudVolumeDelta`   | side      |
+|      43 | `SRVR_RNDR_SET_ACTIVE`               | (inline in session.py)        | `CloudSetActive`                     | transport |
+|      44 | `SRVR_RNDR_SET_MAX_AUDIO_QUALITY`    | (inline in session.py)        | `_on_quality_change` in `__init__.py`| (provider)|
+|      77 | `CTRL_SRVR_ASK_FOR_RENDERER_STATE`   | (no payload)                  | `CloudStateRequest` → `ReportState`  | transport |
+|      88 | `SRVR_CTRL_QUEUE_ERROR_MESSAGE`      | `parse_queue_error`           | `CloudQueueError` (proposal reject)  | list      |
+|      91 | `SRVR_CTRL_QUEUE_TRACKS_LOADED`      | `parse_queue_load_ack`        | `CloudLoadAck` (proposal confirm)    | list      |
+|     103 | `SRVR_CTRL_AUTOPLAY_TRACKS_LOADED`   | `parse_autoplay_load_ack`     | `CloudAutoplayTracksLoaded`          | list      |
+|     105 | `SRVR_CTRL_QUEUE_VERSION_CHANGED`    | `parse_queue_version_changed` | `CloudVersionChanged`                | list      |
 
-### Known gaps (Phase B targets)
+### Inbound message catalog
 
 Validated against the full bidirectional captures under
 [`tests/providers/qobuz_connect/protocol_capture/.runs/`](../../../tests/providers/qobuz_connect/protocol_capture/.runs/).
-Tier 1 is the set the captures *prove* matter; Tier 2 are proto-defined
-messages the Qobuz app *will* emit on flows we haven't captured yet
-(insert/remove/reorder via specific UI paths, clear from another client).
+The queue-mutation and mode messages below are now consumed by the reducer's
+list and modes lanes; the tables catalog each message and the symptom it
+prevents. Tier 2 messages are proto-defined and emitted on specific UI paths
+(insert/remove/reorder, clear from another client).
 
-**Tier 1 — directly observed in captures, must be handled:**
+**Tier 1 — directly observed in captures:**
 
 | Type ID | Name                                 | Direction | Symptom when ignored                                                          |
 |--------:|--------------------------------------|-----------|-------------------------------------------------------------------------------|
@@ -344,132 +356,179 @@ and move on:
 
 On the **controller** connection three of these are load-bearing rather
 than benign — `SRVR_CTRL_ADD_RENDERER`, `SRVR_CTRL_REMOVE_RENDERER` and
-`SRVR_CTRL_ACTIVE_RENDERER_CHANGED` are how `controller.py` discovers our
-own `rendererId` and tracks the session's active renderer (see
-"The single dual-role connection" below). Same message types, different
-meaning depending on which socket they arrive on.
+`SRVR_CTRL_ACTIVE_RENDERER_CHANGED` become `CloudAddRenderer` /
+`CloudRemoveRenderer` / `CloudActiveRendererChanged` events, and the
+reducer's transport lane uses them to learn `own_rid` and track the
+session's `active_rid` (see "Own-rendererId discovery" above). Same message
+types, different meaning depending on which socket they arrive on.
 
 **Known parse anomaly:** one 82-byte PAYLOAD frame in
 `queue_mutations__client_b.json` (frame index 30) fails to parse as a
 `QConnectBatch`. Possibly a partial transmission or non-batch control
-message. Defer investigation to Phase C; for now the dispatcher should
-log and continue rather than crash.
+message. Possibly a partial transmission or non-batch control message; for
+now the dispatcher logs and continues rather than crashing.
 
-Phase B uses bytes from the captures as ground-truth fixtures for
-decoder round-trip tests.
+Bytes from the captures serve as ground-truth fixtures for decoder
+round-trip tests.
 
 ## Outbound messages (this provider → Qobuz)
 
 All outbound traffic is constructed in [`protocol.py`](protocol.py) and
-sent via [`session.py`](session.py). The triggering code lives in
-[`sync.py`](sync.py) / [`queue_loader.py`](queue_loader.py) (renderer
-connection) and [`controller.py`](controller.py) (controller connection —
-see "The single dual-role connection" below).
+sent via [`session.py`](session.py)'s `send_*` verbs. Steady-state sends are
+`Effect`s the reducer returns, executed by
+[`effect_runner.py`](effect_runner.py); connection-level frames
+(AUTHENTICATE / SUBSCRIBE / JOIN, quality reports) are still driven directly
+by `session.py` / the provider.
 
 | Type ID | Message                                  | Encoder (`protocol.py`)                  | Triggered from                                                                            |
 |--------:|------------------------------------------|------------------------------------------|-------------------------------------------------------------------------------------------|
 |       1 | `AUTHENTICATE` (outer envelope)          | `encode_authenticate`                    | `session.start()` after tokens arrive (both roles)                                        |
 |       2 | `SUBSCRIBE` (outer envelope)             | `encode_subscribe`                       | `session.start()` after AUTHENTICATE (renderer: session-uuid channel; controller: empty)  |
-|      23 | `RNDR_SRVR_STATE_UPDATED`                | `encode_renderer_state`                  | `sync.report_state()` on 5s heartbeat + after every command, plus 1s during buffering     |
-|      25 | `RNDR_SRVR_VOLUME_CHANGED`               | `encode_volume_changed`                  | `_broadcast_current_volume` (on connect/activate) and `sync.set_volume`                   |
+|      23 | `RNDR_SRVR_STATE_UPDATED`                | `encode_renderer_state`                  | `ReportState` effect / `outbound_reporter` heartbeat (5s + after every command, 1s during buffering) |
+|      25 | `RNDR_SRVR_VOLUME_CHANGED`               | `encode_volume_changed`                  | `PushVolume` effect; `_broadcast_current_volume` on connect/activate                       |
 |      26 | `RNDR_SRVR_FILE_AUDIO_QUALITY_CHANGED`   | `encode_file_audio_quality_changed`      | `session.send_quality_reports` after connect / quality change                              |
 |      27 | `RNDR_SRVR_DEVICE_AUDIO_QUALITY_CHANGED` | `encode_device_audio_quality_changed`    | same                                                                                       |
 |      28 | `RNDR_SRVR_MAX_AUDIO_QUALITY_CHANGED`    | `encode_max_audio_quality_changed`       | same                                                                                       |
-|      61 | `CTRL_SRVR_JOIN_SESSION`                 | `encode_ctrl_join_session`               | `controller.start()`, joining with the renderer's deviceUuid (shared-identity merge)      |
-|      62 | `CTRL_SRVR_SET_PLAYER_STATE` (full)      | `encode_player_state`                    | (method exists, no callsite — dead for now)                                                |
-|      62 | `CTRL_SRVR_SET_PLAYER_STATE` (partial)   | `encode_ctrl_set_player_state`           | `session.send_ctrl_player_state`, via `controller.play_item` (queue_loader.py, after MA-origin load ack); `set_playing`/`seek` (no callsite yet — verb available on QobuzConnectController) |
-|      63 | `CTRL_SRVR_SET_ACTIVE_RENDERER`          | `encode_set_active_renderer`             | `controller.activate_self` before an MA-origin load if we aren't the active renderer      |
-|      64 | `CTRL_SRVR_SET_VOLUME`                   | `encode_ctrl_set_volume`                 | `controller.set_volume` (no callsite yet — verb available on QobuzConnectController)       |
-|      66 | `CTRL_SRVR_QUEUE_LOAD_TRACKS`            | `encode_queue_load_tracks`               | `queue_loader._send_controller_load` (controller connected) via `controller.load_queue`, else falls back to `queue_loader._send_legacy_qweb_load` (renderer socket, `enable_controller` off via config) |
-|      73 | `CTRL_SRVR_MUTE_VOLUME`                  | `encode_ctrl_mute_volume`                | `controller.set_mute` (no callsite yet — verb available on QobuzConnectController)         |
-|      79 | `CTRL_SRVR_AUTOPLAY_LOAD_TRACKS`         | `encode_autoplay_load_tracks`            | (method exists, no callsite — dead for now)                                                |
+|      61 | `CTRL_SRVR_JOIN_SESSION`                 | `encode_ctrl_join_session`               | `session.start()` in controller role, joining with the device deviceUuid                   |
+|      62 | `CTRL_SRVR_SET_PLAYER_STATE` (partial)   | `encode_ctrl_set_player_state`           | `PushPlayerState` effect via `session.send_ctrl_player_state` (no reducer callsite yet)    |
+|      63 | `CTRL_SRVR_SET_ACTIVE_RENDERER`          | `encode_set_active_renderer`             | `PushSetActive` effect before an MA-origin load if we aren't the active renderer            |
+|      64 | `CTRL_SRVR_SET_VOLUME`                   | `encode_ctrl_set_volume`                 | `PushVolume` effect (no reducer callsite yet)                                              |
+|      66 | `CTRL_SRVR_QUEUE_LOAD_TRACKS`            | `encode_queue_load_tracks`               | `PushLoad` effect via `session.send_queue_load_tracks`; MA-origin loads are skipped (one warning per outage) while the controller socket is down |
+|      73 | `CTRL_SRVR_MUTE_VOLUME`                  | `encode_ctrl_mute_volume`                | `PushMute` effect (no reducer callsite yet)                                                |
+|       — | `CTRL_SRVR_QUEUE_ADD/INSERT/REMOVE/REORDER/CLEAR_TRACKS` | (per-verb encoders)       | `PushAdd` / `PushInsert` / `PushRemove` / `PushReorder` / `PushClear` effects              |
 |       — | `RNDR_SRVR_JOIN_SESSION`                 | `encode_join_session`                    | `session.start()` after SUBSCRIBE (renderer role only)                                    |
 
-## The sync engine
+## The sync core
 
-[`sync.py`](sync.py) is the part that fuses two systems that don't speak
-each other's language. The plan calls it out for restructuring — for now,
-this section just names the concepts so the existing 1,100-line file can
-be read.
+The part that fuses two systems that don't speak each other's language is a
+**pure reducer + impure shell**. All MA↔Qobuz decisions live in one pure
+function; everything with a side effect lives in a thin shell around it.
+
+```
+inbound (cloud callbacks + MA on_ma_*)
+        │
+        ▼
+  coordinator.py  ── translate → Event ──▶ reduce(state, event) ──▶ (state', effects)
+   (owns the one       serialize under          reducer.py            │
+    CanonicalState)    an asyncio.Lock          (pure)                ▼
+        ▲                                                       effect_runner.py
+        └──────────────── stores state' ──────────────────────  runs each Effect
+                                                                 (session.send_* / bridge)
+```
+
+### The pure reducer
+
+`reduce(state, event) -> ReduceResult(state, effects)` in
+[`reducer.py`](reducer.py) is pure: no I/O, no MA imports, no websocket. It
+takes the current `CanonicalState` plus one `Event` and returns the next
+state and a tuple of `Effect`s to run. It routes each event to one of four
+lanes:
+
+- **list** — queue snapshot / add / insert / remove / reorder / clear, plus
+  load acks and version bumps. Owns `tracks` and `cloud_version`.
+- **transport / session** — `CloudSetState`, `CloudSetActive`,
+  `CloudSessionState`, renderer registry (`own_rid` / `active_rid`), and the
+  MA-origin transport edits. Owns `current_id`, `playing`, `position_ms`,
+  `active`.
+- **modes** — loop / shuffle / autoplay flags.
+- **side-channels** — volume / mute / quality; ungated fire-and-forget, since
+  `CanonicalState` carries no volume/mute/quality fields.
 
 ### Canonical state
 
 ```python
-class QobuzMirror:
-    queue_version: QueueVersion      # major/minor from Qobuz
-    current_item:  QueueTrackRef | None
-    next_item:     QueueTrackRef | None
-    playing_state: PlayingState      # STOPPED, PLAYING, PAUSED
-    buffer_state:  BufferState       # UNKNOWN, BUFFERING, OK, ERROR, UNDERRUN
-    position_ms:   int
-    position_timestamp_ms: int        # interpolation anchor
-    duration_ms:   int
+@dataclass(slots=True)
+class CanonicalState:
+    cloud_version: QueueVersion       # the logical clock (major, minor)
+    tracks: tuple[QueueTrackRef, ...]
+    autoplay_tracks: tuple[QueueTrackRef, ...]
+    current_id: int | None            # Qobuz track id of the current track
+    playing: PlayingState             # STOPPED / PLAYING / PAUSED
+    position_ms: int
+    position_anchor_ms: int           # interpolation anchor
+    loop: LoopMode
+    autoplay: bool
+    active: bool                      # are we the active renderer?
+    own_rid: int | None               # our rendererId, learned from the cloud
+    active_rid: int | None            # the session's active renderer
+    pending: tuple[Proposal, ...]     # optimistic MA-origin edits awaiting echo
 ```
 
-`QobuzMirror` is the canonical "what does Qobuz think we're doing." Both
-inbound events and outbound state reports flow through it.
+`CanonicalState` is the single source of truth: the one thing MA and Qobuz
+agree on. The reducer never mutates it in place — it returns copies via
+`dataclasses.replace()`. The coordinator holds the only live instance. The
+provider projects a legacy `QobuzMirror` view from it for
+`outbound_reporter`'s heartbeat.
 
-### Ephemeral state (the band-aids the plan targets)
+### Cloud queue_version as the logical clock
 
-Scattered across `QobuzConnectSyncEngine.__init__`, currently a mix of
-overlapping single fields:
+The cloud's `queue_version` `(major, minor)` is the authoritative clock.
+Every inbound event carrying a `version` that is `<=` the current
+`cloud_version` is stale and no-ops (the version gate at the top of
+`reduce`) — the one exception is `CloudQueueError`, a control event that must
+always reach its proposal. This makes reordered or duplicate cloud frames
+harmless.
 
-- **Paused seek** (`pending_paused_seek_ms`, `_pending_paused_seek_ref`):
-  if Qobuz seeks while paused, remember the position so the next play can
-  resume there.
-- **Playing seek, debounced** (`_pending_seek_position_ms`, `_ref`,
-  `_generation`, `_pending_seek_task`): coalesce rapid scrubs from the
-  Qobuz app before issuing a single MA seek.
-- **Position confirmation** (`qobuz_position.target_ms`, `issued_ms`,
-  `timestamp_ms`): hold Qobuz state frozen until MA's reported position
-  confirms a seek landed. `issued_ms` is what we last asked MA to seek to
-  via `bridge.seek` / `bridge.play_index` (or `None` when only the
-  debounce path has reserved a target); `target_ms` is the latest target
-  Qobuz wants. Rapid Qobuz seeks while MA is still buffering only update
-  `target_ms`; when MA confirms `issued_ms`, the seek pipeline either
-  clears the pending (if target unchanged) or issues a fresh MA seek for
-  the deferred `target_ms` — never stacking expensive
-  AirPlay-restart-level MA operations.
-- **Queue-load acknowledgement** (`_pending_queue_loads: dict[bytes,
-  asyncio.Future]`): map `action_uuid` to a future that resolves when
-  Qobuz acks the load (or times out at 3s).
-- **Prequeue** (`_prequeued_qobuz_items`, `_last_prequeued_next_ref`):
-  optimistically place Qobuz's announced next_item into MA's queue ahead
-  of time.
+### Optimistic proposals (emit / confirm / reject-rebase / timeout)
 
-Phase C of the plan consolidates these into typed dataclasses in a new
-`state.py`.
+An MA-origin queue edit doesn't wait for a round-trip. The list lane diffs
+the new MA queue against `tracks`, mints a `Proposal` (an `action_uuid`,
+the `base_version` it was computed against, the mutation kind, and the
+target Qobuz track ids), appends it to `state.pending`, and emits the
+matching `Push*` effect to send it to the cloud. Then one of:
 
-### Generation tracking
+- **confirm** — the cloud echoes the edit (`CloudLoadAck` /
+  `CloudTracksAdded` / …) carrying the same `action_uuid`; the proposal is
+  dropped and the echo's new `cloud_version` becomes canonical.
+- **reject → rebase** — the cloud rejects it (`CloudQueueError` with the
+  `action_uuid`); the proposal is dropped and the reducer converges MA back
+  to canonical truth (`MaResyncQueue`).
+- **timeout** — no echo arrives in time; the coordinator's proposal-timeout
+  timer fires a `ProposalTimeout`, the reducer drops the stale proposal and
+  resyncs. This is the lost-echo safety net.
 
-`_command_generation` ticks up every time a *play-state-changing*
-command (a play/pause/stop, or a track change) arrives. Position-only
-seek events deliberately do *not* bump the counter, and they run in a
-separate task slot (`_position_only_task`) rather than through
-`_schedule_reconcile`. The original conflation caused a position-only
-event arriving mid-track-replace to cancel the in-flight reconcile
-between its `stop_queue` and `play_index`, leaving the renderer stopped
-(observed on a Pi, May 2026). Every handler still checks
-`_is_current_command(gen)` before issuing MA operations so a stale
-command doesn't undo a newer one.
+The `base_version` on each proposal is why concurrent edits stay correct:
+the translation runs against the *pre-append* state, so an append comes out
+as only the newly added tail rather than the whole list.
 
-### Origin
+### Audio is never interrupted unless the track changes
 
-`self.origin: Origin | None` is set to `QOBUZ` while a Qobuz command is
-being processed, so the MA `QUEUE_UPDATED` listener doesn't echo the
-change back. Currently a plain instance field — Phase C replaces it with
-an async context manager so leaks become impossible.
+The hard invariant: **only a `current_id` transition ever restarts audio.**
+List-lane edits (add/insert/remove/reorder), version bumps, active-flag
+flips, mode changes and position-only heartbeats all update state without
+emitting a play/resync effect. `MaResyncQueue` / `MaPlayTrack` are emitted
+only when `current_id` actually changes (or on a takeover into the active
+role while playing). That's what lets the Qobuz app rearrange the queue, or
+echo our own load, without the audio hiccuping.
 
-### Tasks
+### Track identity
 
-| Task                          | Cadence                | Purpose                                                  |
-|-------------------------------|------------------------|----------------------------------------------------------|
-| `_heartbeat_task`             | every 5 s              | Periodic `RNDR_SRVR_STATE_UPDATED`                       |
-| `_reconcile_task`             | latest-only            | Run async MA operations from the most recent Qobuz cmd   |
-| `_position_only_task`         | latest-only            | Apply position-only seeks without cancelling reconcile   |
-| `_metadata_task`              | latest-only            | Fetch track metadata for non-command updates             |
-| `_buffering_report_task`      | every 1 s while loading| Faster state reports while audio is loading              |
-| `_pending_seek_task`          | 350 ms after last scrub| Debounced playing-seek                                   |
+A track's identity is its **Qobuz track id** (`current_id`, the diff match
+key, the `Push*` payloads). The cloud slot id (`queue_item_id`) is only
+meaningful on the wire: it arrives on cloud queue deltas and is required by
+the remove / reorder verbs (which address existing slots), so the effect
+runner passes those straight through, while add / insert / load verbs send
+`queue_item_id=0` and let the cloud assign + echo the real slot.
+
+### The impure shell
+
+- [`coordinator.py`](coordinator.py) owns the single `CanonicalState`. Its
+  `build_session_callbacks()` turns the session's parsed DTOs into `Event`s,
+  and its `on_ma_*` entry points do the same for MA's event bus. Every event
+  is fed through `reduce` under an `asyncio.Lock` and *fully* applied — state
+  stored, every effect awaited in order — before the next event starts. That
+  linear ordering is what makes the version-gated decisions correct: nothing
+  ever observes a half-applied state. It also runs the proposal-timeout timer
+  (schedule a `ProposalTimeout` per pending proposal, cancel it once the
+  proposal leaves `pending`). Serializing under the lock is also what
+  replaces the old engine's explicit `origin` echo-suppression flag — an
+  MA-origin edit and its cloud echo can't interleave.
+- [`effect_runner.py`](effect_runner.py) is the only place `Effect`s become
+  real `session.send_*` calls or `ma_bridge` mutations. Each branch is a
+  small `await`, so a new effect or session verb touches exactly one branch.
+  `Ma*` effects resolve Qobuz ids to MA `Track`s via
+  [`metadata_resolver.py`](metadata_resolver.py) and drive the player queue
+  through [`ma_bridge.py`](ma_bridge.py).
 
 ## Glossary
 
@@ -477,18 +536,21 @@ an async context manager so leaks become impossible.
   renderer (e.g. the Qobuz mobile app driving MA).
 - **Renderer** — the role of a Qobuz client that *plays* audio in
   response to controller commands (e.g. MA's `qobuz_connect`).
-- **Origin** — internal tag for "who initiated the in-flight change"
-  (`QOBUZ` / `MA` / `ACK`), used to short-circuit echo loops between the
-  MA event bus and the Qobuz cloud.
 - **Queue version** — `(major, minor)` integer pair the cloud uses to
-  arbitrate concurrent edits to the play queue. Every load / insert /
-  remove / reorder bumps `minor`; some operations bump `major`.
-- **action_uuid** — a 16-byte UUID the controller mints when issuing a
-  `CTRL_SRVR_QUEUE_LOAD_TRACKS`; the cloud echoes it in the
-  corresponding `SRVR_CTRL_QUEUE_TRACKS_LOADED` ack so we can correlate
-  request with response.
-- **Pre-queue** — adding the cloud's announced `next_item` to MA's queue
-  ahead of time so the player can switch tracks gaplessly.
+  arbitrate concurrent edits to the play queue, and the reducer's logical
+  clock. Every load / insert / remove / reorder bumps `minor`; some
+  operations bump `major`. Inbound events at or below the current version
+  are stale and no-op.
+- **action_uuid** — a 16-byte UUID minted for a `Proposal` when a `Push*`
+  effect issues an MA-origin edit; the cloud echoes it in the corresponding
+  ack (`SRVR_CTRL_QUEUE_TRACKS_LOADED`, etc.) so the reducer can correlate
+  the echo with the proposal and confirm it.
+- **Proposal** — an optimistic MA-origin queue edit held in
+  `CanonicalState.pending` until the cloud confirms (echo), rejects
+  (`CloudQueueError`), or the coordinator times it out.
+- **Effect** — a value the pure reducer returns describing I/O to perform
+  (`Push*` cloud verbs, `Ma*` player-queue operations, `ReportState`); the
+  `effect_runner` is what actually performs it.
 
 ## Out of scope / out of band
 
@@ -506,4 +568,4 @@ an async context manager so leaks become impossible.
 ## Captured reference data
 
 - [`tests/providers/qobuz_connect/protocol_capture/`](../../../tests/providers/qobuz_connect/protocol_capture/) — **the** source of reference data. A Playwright harness that drives two real Qobuz Web Clients via CDP, recording both directions of the WebSocket into `.runs/`. Add or extend a scenario whenever a protocol question can't be answered from existing captures. Scenarios can opt in to throttled-network conditions for "slow renderer" / "lossy link" tests.
-  Each scenario file is suitable as a Phase B test fixture once auth tokens are stripped.
+  Each scenario file is suitable as a decoder test fixture once auth tokens are stripped.

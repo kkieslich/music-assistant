@@ -70,9 +70,8 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
-# Qobuz LoopMode -> MA RepeatMode string value. Mirrors sync.py's
-# ``_LOOP_TO_MA_REPEAT`` — kept as a local copy so this shell module has no
-# import-order dependency on the (much larger) sync engine module.
+# Qobuz LoopMode -> MA RepeatMode string value. Kept local to this shell
+# module so it owns its own Qobuz→MA enum translation.
 _LOOP_TO_MA_REPEAT: dict[LoopMode, str] = {
     LoopMode.OFF: "off",
     LoopMode.REPEAT_ONE: "one",
@@ -202,7 +201,7 @@ class EffectRunner:
                 queue_uuid=uuid.uuid4().bytes,
             )
         elif isinstance(effect, ReportState) and self._reporter is not None:
-            await self._reporter.report_state(sync_from_ma=False)
+            await self._reporter.report_state()
 
     # ---- MA effect dispatch -------------------------------------------------
 
@@ -284,10 +283,9 @@ class EffectRunner:
         only for tracks MA doesn't have yet, then commits the whole list via one
         ``update_items``. Non-Qobuz MA queue items (e.g. a local/Spotify track a user
         manually queued during an active Connect session) are preserved, appended after
-        the reconciled Qobuz block — mirroring the old reconciler's
-        (``command_handler._materialize_full_queue``) non-Qobuz tail preservation. This is
-        still the safe subset of that reconciler; deferred: chunked metadata resolution and
-        mirror/MA duplicate-count bucketing for repeated tracks.
+        the reconciled Qobuz block. This is the safe subset of full reconciliation;
+        deferred: chunked metadata resolution and duplicate-count bucketing for
+        repeated tracks.
         """
         pid = self._target_player_id("MaResyncQueue")
         if pid is None or self._metadata is None:

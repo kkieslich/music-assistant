@@ -11,7 +11,8 @@ Data flow: `Qobuz app -> Qobuz Connect protocol -> MA player queue -> native MA 
 - [discovery.py](music_assistant/providers/qobuz_connect/discovery.py): mDNS + local handshake endpoints.
 - [session.py](music_assistant/providers/qobuz_connect/session.py): Qobuz Connect WebSocket lifecycle and dispatch.
 - [protocol.py](music_assistant/providers/qobuz_connect/protocol.py): `QobuzConnectCodec` frame/protobuf codec.
-- [sync.py](music_assistant/providers/qobuz_connect/sync.py): `QobuzConnectSyncEngine`, the owner of Qobuz/MA state reconciliation.
+- [reducer.py](music_assistant/providers/qobuz_connect/reducer.py) + [sync_types.py](music_assistant/providers/qobuz_connect/sync_types.py): the pure sync core — `reduce(state, event) -> (state, effects)` over an immutable `CanonicalState`, owner of Qobuz/MA state reconciliation.
+- [coordinator.py](music_assistant/providers/qobuz_connect/coordinator.py) + [effect_runner.py](music_assistant/providers/qobuz_connect/effect_runner.py): the impure shell — serialized event intake + proposal-timeout timer (`coordinator`) and effect execution against session/bridge (`effect_runner`).
 - [models.py](music_assistant/providers/qobuz_connect/models.py): shared enums/dataclasses and quality maps.
 - Generated protobuf modules are committed in [proto/](music_assistant/providers/qobuz_connect/proto/); do not delete them.
 - For protocol behavior questions, use the Playwright capture harness at [tests/providers/qobuz_connect/protocol_capture/](tests/providers/qobuz_connect/protocol_capture/). It drives real Qobuz Web Clients via CDP and records WebSocket traffic into `.runs/`; add or extend scenarios when observing reference behavior.

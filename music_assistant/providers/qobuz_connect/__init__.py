@@ -665,13 +665,11 @@ class _ReporterHost:
     """
     Minimal duck-typed 'engine' satisfying ``OutboundReporter``'s constructor.
 
-    ``OutboundReporter.report_state`` is only ever invoked with
-    ``sync_from_ma=False`` from the effect runner's ``ReportState`` handling,
-    which short-circuits before ever touching ``engine.command_handler`` — so
-    this host never needs one. ``qobuz_state`` is a live projection of the
-    coordinator's ``CanonicalState`` (rather than a field some caller has to
-    remember to keep in sync) so the heartbeat / ``ReportState`` effect keeps
-    reporting current position/track/playing data. ``CanonicalState`` doesn't
+    ``qobuz_state`` is a live projection of the coordinator's
+    ``CanonicalState`` (rather than a field some caller has to remember to
+    keep in sync) so the heartbeat / ``ReportState`` effect keeps reporting
+    current position/track/playing data off a single source of truth.
+    ``CanonicalState`` doesn't
     carry ``duration_ms``/``buffer_state``/``next_item`` (those lived on the
     retired ``QobuzMirror`` only); ``buffer_state``/``next_item`` fall back to
     safe defaults, while ``duration_ms`` is read live from MA's current queue

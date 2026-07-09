@@ -26,7 +26,7 @@ Depends on:
 - :func:`.reducer.reduce` (pure) and :mod:`.sync_types` (pure event/effect/state
   types) for all sync decisions.
 - :class:`.session.SessionCallbacks` for the shape the transport expects.
-- :func:`.queue_loader.try_parse_qobuz_id` and the old parsed DTOs in :mod:`.models`
+- the local ``try_parse_qobuz_id`` helper and the old parsed DTOs in :mod:`.models`
   for translating cloud/MA input.
 - ``asyncio``/``time``/``uuid`` — this module is the impure shell.
 """
@@ -37,7 +37,7 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .models import (
     LoopMode,
@@ -56,7 +56,6 @@ from .models import (
     SessionStateEvent,
     SetStateEvent,
 )
-from .queue_loader import try_parse_qobuz_id
 from .reducer import reduce
 from .session import SessionCallbacks
 from .sync_types import (
@@ -107,9 +106,19 @@ LOGGER = logging.getLogger(__name__)
 # ProposalTimeout) lives in .reducer.
 PROPOSAL_TIMEOUT_S = 5.0
 
-# MA's str-enum RepeatMode (off/one/all) to Qobuz's int-enum LoopMode. Mirrors
-# sync.py's ``_MA_REPEAT_TO_LOOP`` — kept as a local copy so this shell module
-# has no import-order dependency on the (much larger) legacy sync engine.
+
+def try_parse_qobuz_id(value: Any) -> int | None:
+    """Return an integer Qobuz id when the protocol can represent the value."""
+    if value is None:
+        return None
+    try:
+        return int(str(value))
+    except TypeError, ValueError:
+        return None
+
+
+# MA's str-enum RepeatMode (off/one/all) to Qobuz's int-enum LoopMode. Kept as a
+# local copy so this shell module carries its own MA↔Qobuz enum translation.
 _MA_REPEAT_TO_LOOP: dict[str, LoopMode] = {
     "off": LoopMode.OFF,
     "one": LoopMode.REPEAT_ONE,
