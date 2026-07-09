@@ -185,6 +185,20 @@ def _reduce_ma_queue_changed(state: CanonicalState, event: MaQueueChanged) -> Re
     if proposal is None:
         return ReduceResult(state, ())
     new = dataclasses.replace(state, pending=(*state.pending, proposal))
+    if proposal.kind is ProposalKind.ADD:
+        # The cloud's add command APPENDS its payload to the existing cloud
+        # queue, so only the appended tail may be pushed — the full resolved
+        # list would duplicate the tracks the cloud already has. The proposal
+        # itself still carries the full target list (target_track_ids) since
+        # _confirm_proposal folds that into canonical truth on echo.
+        canonical_ids = tuple(
+            t.queue_item_id for t in state.tracks if t.queue_item_id in event.resolvable
+        )
+        tail = event.track_ids[len(canonical_ids) :]
+        push: Effect = PushAdd(
+            action_uuid=proposal.action_uuid, base_version=proposal.base_version, track_ids=tail
+        )
+        return ReduceResult(new, (push,))
     return ReduceResult(new, (_push_for(proposal),))
 
 
@@ -597,8 +611,13 @@ def _push_for(proposal: Proposal) -> Effect:
     if proposal.kind is ProposalKind.CLEAR:
         return PushClear(action_uuid=proposal.action_uuid, base_version=proposal.base_version)
     if proposal.kind is ProposalKind.ADD:
-        # NOTE: pushes the full resolved target as the "add" payload; Task 6's
-        # richer diff supplies the true appended-only delta.
+        # NOTE: this full-list fallback is never actually reached for ADD —
+        # _reduce_ma_queue_changed intercepts ADD proposals and builds the
+        # appended-only-tail PushAdd itself, since the cloud's add command
+        # appends its payload to the existing cloud queue rather than
+        # replacing it. Kept here only so _push_for stays total over
+        # ProposalKind (e.g. for _reject_proposal's rebase-and-repush path,
+        # which reuses this branch with a rebased target).
         return PushAdd(
             action_uuid=proposal.action_uuid,
             base_version=proposal.base_version,
