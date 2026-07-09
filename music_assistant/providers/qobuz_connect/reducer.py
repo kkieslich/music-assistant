@@ -335,16 +335,7 @@ def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
         )
         return ReduceResult(new, ())
     if isinstance(event, CloudLoadAck):
-        # SRVR_CTRL_AUTOPLAY_TRACKS_LOADED is delivered here as a CloudLoadAck
-        # whose tracks are autoplay continuation tracks NOT in canonical.
-        # Only adopt the resolved current id if it's actually present in
-        # canonical; otherwise keep current_id as-is to avoid pointing at a
-        # dangling Qobuz id. Autoplay continuation-track appending into
-        # canonical is a known follow-up, not handled here.
-        candidate = _current_from_load_ack(event)
-        current_id = candidate if _in_canonical(state, candidate) else state.current_id
-        new = dataclasses.replace(state, cloud_version=event.version, current_id=current_id)
-        return ReduceResult(new, (ReportState(),))
+        return _reduce_load_ack(state, event)
     return ReduceResult(state, ())
 
 
@@ -512,19 +503,25 @@ def _remove_renderer(state: CanonicalState, event: CloudRemoveRenderer) -> Reduc
     return ReduceResult(new, ())
 
 
-def _current_from_load_ack(event: CloudLoadAck) -> int | None:
-    """Resolve the new current Qobuz track id from a load ack's clamped position."""
-    if not event.tracks:
-        return None
-    idx = max(0, min(event.queue_position, len(event.tracks) - 1))
-    return _qid(event.tracks[idx])
+def _reduce_load_ack(state: CanonicalState, event: CloudLoadAck) -> ReduceResult:
+    """
+    Adopt an app-initiated queue load (SRVR_CTRL_QUEUE_TRACKS_LOADED).
 
-
-def _in_canonical(state: CanonicalState, qid: int | None) -> bool:
-    """Whether ``qid`` is a Qobuz track id present in canonical tracks."""
-    if qid is None:
-        return False
-    return any(_safe_qid(t) == qid for t in state.tracks)
+    The cloud broadcasts this — carrying the FULL new track list — whenever
+    anyone (the app, another client) loads content. A Qobuz web client adopts
+    that queue; so must we, or MA keeps playing off the stale connect-time
+    snapshot while the app has moved on (the live 2026-07-09 wrong-track /
+    ignored-skip bug). Autoplay continuation tracks arrive separately as
+    CloudAutoplayTracksLoaded and are appended, not replaced.
+    """
+    tracks = tuple(event.tracks)
+    if not tracks:
+        return ReduceResult(dataclasses.replace(state, cloud_version=event.version), ())
+    idx = max(0, min(event.queue_position, len(tracks) - 1))
+    new = dataclasses.replace(
+        state, cloud_version=event.version, tracks=tracks, current_id=_safe_qid(tracks[idx])
+    )
+    return _with_resync(new)
 
 
 def _maybe_ask_snapshot(

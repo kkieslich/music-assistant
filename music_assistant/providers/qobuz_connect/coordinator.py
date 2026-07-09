@@ -63,6 +63,7 @@ from .sync_types import (
     CloudActiveRendererChanged,
     CloudAddRenderer,
     CloudAutoplaySet,
+    CloudAutoplayTracksLoaded,
     CloudCleared,
     CloudLoadAck,
     CloudLoopSet,
@@ -187,6 +188,7 @@ class QobuzConnectCoordinator:
         return SessionCallbacks(
             on_set_state=self._on_set_state,
             on_queue_load_ack=self._on_queue_load_ack,
+            on_autoplay_tracks_loaded=self._on_autoplay_tracks_loaded,
             on_queue_error=self._on_queue_error,
             on_queue_version=self._on_queue_version,
             on_queue_state=self._on_queue_state,
@@ -358,6 +360,16 @@ class QobuzConnectCoordinator:
                 action_uuid=ack.action_uuid,
                 tracks=tuple(ack.tracks),
                 queue_position=ack.queue_position,
+            )
+        )
+
+    async def _on_autoplay_tracks_loaded(self, ack: QueueLoadAck) -> None:
+        await self._submit(
+            CloudAutoplayTracksLoaded(
+                now_ms=self._now(),
+                version=ack.queue_version,
+                action_uuid=ack.action_uuid,
+                tracks=tuple(ack.tracks),
             )
         )
 

@@ -140,6 +140,9 @@ class SessionCallbacks:
     on_remove_renderer: Callable[[int], Awaitable[None]] | None = None
     on_active_renderer_changed: Callable[[int], Awaitable[None]] | None = None
     on_renderer_state_updated: Callable[[RendererStateUpdate], Awaitable[None]] | None = None
+    # Autoplay continuation tracks (SRVR_CTRL_AUTOPLAY_TRACKS_LOADED) — appended
+    # to the queue, distinct from a full queue (re)load which replaces it.
+    on_autoplay_tracks_loaded: Callable[[QueueLoadAck], Awaitable[None]] | None = None
     # Fired whenever the connection loop tears down the websocket (both on
     # error and on a clean stop iteration); lets owners drop any state that
     # is only valid while connected (e.g. renderer-registry ids).

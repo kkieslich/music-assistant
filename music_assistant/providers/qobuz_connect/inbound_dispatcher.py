@@ -175,13 +175,16 @@ class InboundDispatcher:
             await self._cb.on_queue_load_ack(ack)
 
     async def _on_autoplay_load_ack(self, msg: Any) -> None:
+        if self._cb.on_autoplay_tracks_loaded is None:
+            self._logger.debug("Qobuz broadcast ignored: type=%s", msg.messageType)
+            return
         if ack := self._codec.parse_autoplay_load_ack(msg):
             self._logger.debug(
                 "Qobuz autoplay-load ACK qv=%s tracks=%s",
                 ack.queue_version,
                 [_format_track_ref(track) for track in ack.tracks],
             )
-            await self._cb.on_queue_load_ack(ack)
+            await self._cb.on_autoplay_tracks_loaded(ack)
 
     async def _on_queue_error(self, msg: Any) -> None:
         if error := self._codec.parse_queue_error(msg):

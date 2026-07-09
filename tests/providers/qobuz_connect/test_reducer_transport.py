@@ -21,7 +21,6 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     MaPause,
     MaPlayTrack,
     MaResyncQueue,
-    ReportState,
 )
 
 
@@ -251,10 +250,19 @@ def test_disconnect_resets_ask() -> None:
     assert asks == [AskSnapshot(version=QueueVersion(30, 1))]
 
 
-def test_load_ack_ignores_current_not_in_canonical() -> None:
-    """A load ack whose current track isn't in canonical leaves current_id untouched."""
+def test_app_load_ack_adopts_the_new_queue() -> None:
+    """
+    An app-initiated queue load replaces canonical tracks (MA follows like a web client).
+
+    SRVR_CTRL_QUEUE_TRACKS_LOADED broadcasts the full new track list whenever anyone
+    loads content; MA must adopt it rather than stay on its stale snapshot (the
+    live 2026-07-09 wrong-track bug).
+    """
     state = CanonicalState(
-        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1), current_id=900000, active=True
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0, 1),
+        current_id=900000,
+        active=True,
     )
     result = reduce(
         state,
@@ -262,33 +270,30 @@ def test_load_ack_ignores_current_not_in_canonical() -> None:
             now_ms=1,
             version=QueueVersion(6, 1),
             action_uuid=b"\xcc" * 16,
-            tracks=(QueueTrackRef(queue_item_id=0, track_id="999999"),),
-            queue_position=0,
-        ),
-    )
-    assert result.state.current_id == 900000
-    assert result.state.cloud_version == QueueVersion(6, 1)
-    assert any(isinstance(e, ReportState) for e in result.effects)
-
-
-def test_load_ack_adopts_current_in_canonical() -> None:
-    """A load ack whose current track IS in canonical adopts it as current_id."""
-    state = CanonicalState(
-        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1), current_id=900000, active=True
-    )
-    result = reduce(
-        state,
-        CloudLoadAck(
-            now_ms=1,
-            version=QueueVersion(6, 1),
-            action_uuid=b"\xcc" * 16,
-            tracks=_refs(0, 1),
+            tracks=_refs(7, 8, 9),
             queue_position=1,
         ),
     )
-    assert result.state.current_id == 900001
+    assert tuple(t.queue_item_id for t in result.state.tracks) == (7, 8, 9)
+    assert result.state.current_id == 900008  # queue_position 1 -> tracks[1] Qobuz id
     assert result.state.cloud_version == QueueVersion(6, 1)
-    assert any(isinstance(e, ReportState) for e in result.effects)
+    assert any(isinstance(e, MaResyncQueue) for e in result.effects)
+
+
+def test_empty_load_ack_keeps_tracks() -> None:
+    """A load ack with no tracks just bumps the version (doesn't wipe the queue)."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1), current_id=900000, active=True
+    )
+    result = reduce(
+        state,
+        CloudLoadAck(
+            now_ms=1, version=QueueVersion(6, 1), action_uuid=b"\xcc" * 16, tracks=(),
+            queue_position=0,
+        ),
+    )
+    assert tuple(t.queue_item_id for t in result.state.tracks) == (0, 1)
+    assert result.state.cloud_version == QueueVersion(6, 1)
 
 
 def test_setstate_applies_even_when_version_is_stale() -> None:
