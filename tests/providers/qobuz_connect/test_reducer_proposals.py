@@ -16,12 +16,13 @@ from music_assistant.providers.qobuz_connect.sync_types import (
 
 
 def _refs(*ids: int) -> tuple[QueueTrackRef, ...]:
-    return tuple(QueueTrackRef(queue_item_id=i, track_id=str(100 + i)) for i in ids)
+    # queue_item_id = small cloud slot; track_id = distinct large Qobuz id.
+    return tuple(QueueTrackRef(queue_item_id=i, track_id=str(900000 + i)) for i in ids)
 
 
 def _state() -> CanonicalState:
     return CanonicalState(
-        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1), current_id=0, active=True
+        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1), current_id=900000, active=True
     )
 
 
@@ -33,9 +34,9 @@ def test_ma_append_emits_proposal_without_mutating_truth() -> None:
         MaQueueChanged(
             now_ms=1,
             action_uuid=b"\xaa" * 16,
-            track_ids=(0, 1, 2),
-            current_track_id=0,
-            resolvable=frozenset({0, 1, 2}),
+            track_ids=(900000, 900001, 900002),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001, 900002}),
         ),
     )
     assert tuple(t.queue_item_id for t in result.state.tracks) == (0, 1)  # truth unchanged
@@ -52,9 +53,9 @@ def test_own_echo_confirms_and_does_not_resync_ma() -> None:
         MaQueueChanged(
             now_ms=1,
             action_uuid=b"\xaa" * 16,
-            track_ids=(0, 1, 2),
-            current_track_id=0,
-            resolvable=frozenset({0, 1, 2}),
+            track_ids=(900000, 900001, 900002),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001, 900002}),
         ),
     )
     r2 = reduce(
@@ -80,9 +81,9 @@ def test_reject_rebases_once_then_converges() -> None:
         MaQueueChanged(
             now_ms=1,
             action_uuid=b"\xaa" * 16,
-            track_ids=(0, 1, 2),
-            current_track_id=0,
-            resolvable=frozenset({0, 1, 2}),
+            track_ids=(900000, 900001, 900002),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001, 900002}),
         ),
     )
     # cloud advanced underneath us -> reject at a newer version
@@ -123,11 +124,39 @@ def test_proposal_timeout_drops_and_converges() -> None:
         MaQueueChanged(
             now_ms=1,
             action_uuid=b"\xaa" * 16,
-            track_ids=(0, 1, 2),
-            current_track_id=0,
-            resolvable=frozenset({0, 1, 2}),
+            track_ids=(900000, 900001, 900002),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001, 900002}),
         ),
     )
     r2 = reduce(r1.state, ProposalTimeout(now_ms=9999, action_uuid=b"\xaa" * 16))
     assert r2.state.pending == ()
     assert any(isinstance(e, MaResyncQueue) for e in r2.effects)
+
+
+def test_confirm_add_uses_real_item_ids_from_echo() -> None:
+    """Confirming an ADD folds the echo's real queue_item_id onto the appended Qobuz id."""
+    state = _state()
+    r1 = reduce(
+        state,
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xaa" * 16,
+            track_ids=(900000, 900001, 900002),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001, 900002}),
+        ),
+    )
+    r2 = reduce(
+        r1.state,
+        CloudTracksAdded(
+            now_ms=2,
+            version=QueueVersion(6, 1),
+            action_uuid=b"\xaa" * 16,
+            tracks=(QueueTrackRef(queue_item_id=2, track_id="900002"),),
+            after_index=2,
+        ),
+    )
+    confirmed = r2.state.tracks[-1]
+    assert confirmed.queue_item_id == 2
+    assert confirmed.track_id == "900002"

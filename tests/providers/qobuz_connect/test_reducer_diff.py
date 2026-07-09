@@ -14,12 +14,13 @@ from music_assistant.providers.qobuz_connect.sync_types import (
 
 
 def _refs(*ids: int) -> tuple[QueueTrackRef, ...]:
-    return tuple(QueueTrackRef(queue_item_id=i, track_id=str(100 + i)) for i in ids)
+    # queue_item_id = small cloud slot; track_id = distinct large Qobuz id.
+    return tuple(QueueTrackRef(queue_item_id=i, track_id=str(900000 + i)) for i in ids)
 
 
 def _state() -> CanonicalState:
     return CanonicalState(
-        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1, 2), current_id=0, active=True
+        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1, 2), current_id=900000, active=True
     )
 
 
@@ -30,9 +31,9 @@ def test_pointer_only_move_makes_no_list_proposal() -> None:
         MaQueueChanged(
             now_ms=1,
             action_uuid=b"\xaa" * 16,
-            track_ids=(0, 1, 2),
-            current_track_id=1,
-            resolvable=frozenset({0, 1, 2}),
+            track_ids=(900000, 900001, 900002),
+            current_track_id=900001,
+            resolvable=frozenset({900000, 900001, 900002}),
         ),
     )
     assert result.state.pending == ()  # the 238-track re-push bug: impossible
@@ -45,9 +46,9 @@ def test_reorder_detected_as_reorder_not_load() -> None:
         MaQueueChanged(
             now_ms=1,
             action_uuid=b"\xaa" * 16,
-            track_ids=(2, 0, 1),
-            current_track_id=0,
-            resolvable=frozenset({0, 1, 2}),
+            track_ids=(900002, 900000, 900001),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001, 900002}),
         ),
     )
     assert len(result.state.pending) == 1
@@ -57,17 +58,17 @@ def test_reorder_detected_as_reorder_not_load() -> None:
 def test_unresolvable_subsequence_is_not_a_removal() -> None:
     """MA missing region-locked ids (not in resolvable) is not read as user-removes."""
     state = CanonicalState(
-        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1, 2), current_id=0, active=True
+        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1, 2), current_id=900000, active=True
     )
-    # MA only has 0 and 2 resolvable; 1 is unresolvable -> no proposal
+    # MA only has 900000 and 900002 resolvable; 900001 is unresolvable -> no proposal
     result = reduce(
         state,
         MaQueueChanged(
             now_ms=1,
             action_uuid=b"\xaa" * 16,
-            track_ids=(0, 2),
-            current_track_id=0,
-            resolvable=frozenset({0, 2}),
+            track_ids=(900000, 900002),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900002}),
         ),
     )
     assert result.state.pending == ()
@@ -80,9 +81,9 @@ def test_genuine_new_load_detected() -> None:
         MaQueueChanged(
             now_ms=1,
             action_uuid=b"\xaa" * 16,
-            track_ids=(9, 8, 7),
-            current_track_id=9,
-            resolvable=frozenset({9, 8, 7}),
+            track_ids=(900009, 900008, 900007),
+            current_track_id=900009,
+            resolvable=frozenset({900009, 900008, 900007}),
         ),
     )
     assert result.state.pending[0].kind is ProposalKind.LOAD
@@ -97,26 +98,26 @@ def test_append_pushes_only_the_appended_tail() -> None:
     already has (the latent bug this test pins).
     """
     state = CanonicalState(
-        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1), current_id=0, active=True
+        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1), current_id=900000, active=True
     )
     result = reduce(
         state,
         MaQueueChanged(
             now_ms=1,
             action_uuid=b"\xaa" * 16,
-            track_ids=(0, 1, 2),
-            current_track_id=0,
-            resolvable=frozenset({0, 1, 2}),
+            track_ids=(900000, 900001, 900002),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001, 900002}),
         ),
     )
     assert len(result.state.pending) == 1
     proposal = result.state.pending[0]
     assert proposal.kind is ProposalKind.ADD
-    assert proposal.target_track_ids == (0, 1, 2)
+    assert proposal.target_track_ids == (900000, 900001, 900002)
     assert len(result.effects) == 1
     push = result.effects[0]
     assert isinstance(push, PushAdd)
-    assert push.track_ids == (2,)
+    assert push.track_ids == (900002,)
 
 
 def test_empty_ma_list_with_nonempty_canonical_is_clear() -> None:
@@ -130,7 +131,7 @@ def test_empty_ma_list_with_nonempty_canonical_is_clear() -> None:
             current_track_id=None,
             # resolvable must cover canonical's ids so the empty MA list isn't
             # itself filtered away to "no change" (see _diff_ma_list docstring).
-            resolvable=frozenset({0, 1, 2}),
+            resolvable=frozenset({900000, 900001, 900002}),
         ),
     )
     assert len(result.state.pending) == 1
@@ -140,14 +141,14 @@ def test_empty_ma_list_with_nonempty_canonical_is_clear() -> None:
 def test_pending_add_suppresses_repeated_identical_ma_event() -> None:
     """Re-feeding the same MA event that produced a pending ADD must not re-propose."""
     state = CanonicalState(
-        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1), current_id=0, active=True
+        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1), current_id=900000, active=True
     )
     event = MaQueueChanged(
         now_ms=1,
         action_uuid=b"\xaa" * 16,
-        track_ids=(0, 1, 2),
-        current_track_id=0,
-        resolvable=frozenset({0, 1, 2}),
+        track_ids=(900000, 900001, 900002),
+        current_track_id=900000,
+        resolvable=frozenset({900000, 900001, 900002}),
     )
     first = reduce(state, event)
     assert len(first.state.pending) == 1
@@ -158,19 +159,64 @@ def test_pending_add_suppresses_repeated_identical_ma_event() -> None:
 
 
 def test_reorder_pushes_full_target_order_with_insert_after_zero() -> None:
-    """REORDER's PushReorder encodes the permutation as move-to-front."""
+    """REORDER's PushReorder encodes the permutation as move-to-front, in slot ids."""
     result = reduce(
         _state(),
         MaQueueChanged(
             now_ms=1,
             action_uuid=b"\xaa" * 16,
-            track_ids=(2, 0, 1),
-            current_track_id=0,
-            resolvable=frozenset({0, 1, 2}),
+            track_ids=(900002, 900000, 900001),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001, 900002}),
         ),
     )
     assert len(result.effects) == 1
     push = result.effects[0]
     assert isinstance(push, PushReorder)
+    # target order is Qobuz ids (900002, 900000, 900001) -> translated to
+    # their cloud slot ids (2, 0, 1) via the canonical correspondence.
     assert push.queue_item_ids == (2, 0, 1)
+    assert push.insert_after == 0
+
+
+def test_diff_matches_by_qobuz_id_not_slot() -> None:
+    """
+    Diffing compares Qobuz track ids, not cloud slot ids.
+
+    An MA list reporting the same Qobuz ids in the same order (regardless of
+    what cloud slot ids they happen to occupy) must be a no-op; a reorder of
+    those same Qobuz ids must be detected as REORDER and translated back to
+    slot ids for the wire command.
+    """
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1), current_id=900000, active=True
+    )
+    same = reduce(
+        state,
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xaa" * 16,
+            track_ids=(900000, 900001),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001}),
+        ),
+    )
+    assert same.state.pending == ()  # equal in Qobuz-id space -> no proposal
+
+    reordered = reduce(
+        state,
+        MaQueueChanged(
+            now_ms=2,
+            action_uuid=b"\xbb" * 16,
+            track_ids=(900001, 900000),
+            current_track_id=900001,
+            resolvable=frozenset({900000, 900001}),
+        ),
+    )
+    assert len(reordered.state.pending) == 1
+    assert reordered.state.pending[0].kind is ProposalKind.REORDER
+    assert len(reordered.effects) == 1
+    push = reordered.effects[0]
+    assert isinstance(push, PushReorder)
+    assert push.queue_item_ids == (1, 0)
     assert push.insert_after == 0
