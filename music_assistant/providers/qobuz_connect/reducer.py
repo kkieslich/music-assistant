@@ -192,11 +192,30 @@ def _reduce_ma_queue_changed(state: CanonicalState, event: MaQueueChanged) -> Re
         # itself still carries the full target list (target_track_ids) since
         # _confirm_proposal folds that into canonical truth on echo.
         canonical_ids = tuple(
-            t.queue_item_id for t in state.tracks if t.queue_item_id in event.resolvable
+            qid
+            for t in state.tracks
+            if (qid := _safe_qid(t)) is not None and qid in event.resolvable
         )
         tail = event.track_ids[len(canonical_ids) :]
         push: Effect = PushAdd(
             action_uuid=proposal.action_uuid, base_version=proposal.base_version, track_ids=tail
+        )
+        return ReduceResult(new, (push,))
+    if proposal.kind is ProposalKind.REORDER:
+        # The wire command speaks cloud queue_item_ids (slots), not Qobuz
+        # track ids — translate the reordered Qobuz ids via the canonical
+        # correspondence. A REORDER is same-set by construction, so every
+        # target id is present in canonical and the translation is total.
+        qid_to_item = {
+            qid: t.queue_item_id for t in state.tracks if (qid := _safe_qid(t)) is not None
+        }
+        push = PushReorder(
+            action_uuid=proposal.action_uuid,
+            base_version=proposal.base_version,
+            queue_item_ids=tuple(
+                qid_to_item[q] for q in proposal.target_track_ids if q in qid_to_item
+            ),
+            insert_after=0,
         )
         return ReduceResult(new, (push,))
     return ReduceResult(new, (_push_for(proposal),))
@@ -268,7 +287,7 @@ def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
             state,
             playing=event.playing,
             position_ms=event.position_ms,
-            current_id=event.current_ref.queue_item_id if event.current_ref else None,
+            current_id=_qid(event.current_ref) if event.current_ref else None,
         )
     if isinstance(event, CloudRendererStateUpdated):
         # Another renderer's live state feeds canonical truth only while we
@@ -278,7 +297,7 @@ def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
         current_id = state.current_id
         if event.current_index is not None and state.tracks:
             idx = max(0, min(event.current_index, len(state.tracks) - 1))
-            current_id = state.tracks[idx].queue_item_id
+            current_id = _qid(state.tracks[idx])
         new = dataclasses.replace(
             state,
             current_id=current_id,
@@ -379,7 +398,7 @@ def _apply_transport(
     :param state: Canonical state before the transport command.
     :param playing: Reported playing state, or None if not carried.
     :param position_ms: Reported position, or None if not carried.
-    :param current_id: Reported current queue-item id, or None if not carried.
+    :param current_id: Reported current Qobuz track id, or None if not carried.
     """
     if current_id is not None and current_id != state.current_id:
         new = dataclasses.replace(
@@ -426,11 +445,14 @@ def _ma_transport(state: CanonicalState, event: MaTransportChanged) -> ReduceRes
     new = dataclasses.replace(
         state, playing=event.playing, current_id=current_id, position_ms=event.position_ms
     )
+    # The wire command wants the cloud's slot id, not the Qobuz track id we
+    # key on internally — translate via the canonical correspondence.
+    item_id = _item_id_for_qid(state, current_id) if current_id is not None else None
     effect = PushPlayerState(
         playing=event.playing,
         position_ms=event.position_ms,
         queue_version=state.cloud_version,
-        queue_item_id=current_id,
+        queue_item_id=item_id,
     )
     return ReduceResult(new, (effect,))
 
@@ -446,11 +468,11 @@ def _remove_renderer(state: CanonicalState, event: CloudRemoveRenderer) -> Reduc
 
 
 def _current_from_load_ack(event: CloudLoadAck) -> int | None:
-    """Resolve the new current queue-item id from a load ack's clamped position."""
+    """Resolve the new current Qobuz track id from a load ack's clamped position."""
     if not event.tracks:
         return None
     idx = max(0, min(event.queue_position, len(event.tracks) - 1))
-    return event.tracks[idx].queue_item_id
+    return _qid(event.tracks[idx])
 
 
 def _with_resync(new: CanonicalState) -> ReduceResult:
@@ -459,28 +481,40 @@ def _with_resync(new: CanonicalState) -> ReduceResult:
         return ReduceResult(new, ())
     effects: tuple[Effect, ...] = (
         MaResyncQueue(
-            track_ids=tuple(t.queue_item_id for t in new.tracks), current_track_id=new.current_id
+            track_ids=tuple(qid for t in new.tracks if (qid := _safe_qid(t)) is not None),
+            current_track_id=new.current_id,
         ),
     )
     return ReduceResult(new, effects)
 
 
 def _current_from_pointer(tracks: tuple[QueueTrackRef, ...], track_index: int) -> int | None:
+    """Resolve the current Qobuz track id from a one-indexed pointer into ``tracks``."""
     if not tracks:
         return None
     idx = max(0, min(track_index - 1, len(tracks) - 1))
-    return tracks[idx].queue_item_id
+    return _qid(tracks[idx])
 
 
 def _successor_if_removed(state: CanonicalState, removed: set[int]) -> int | None:
-    if state.current_id not in removed:
-        return state.current_id
-    old_ids = [t.queue_item_id for t in state.tracks]
-    if state.current_id not in old_ids:
+    """
+    Resolve the new current Qobuz track id after a queue_item_id-keyed removal.
+
+    ``state.current_id`` lives in Qobuz-id space while ``removed`` is a set of
+    cloud queue_item_ids, so the current track's ref is located first and its
+    queue_item_id is what's actually tested against ``removed``.
+    """
+    if state.current_id is None:
         return None
-    start = old_ids.index(state.current_id)
-    for qid in old_ids[start + 1 :]:
-        if qid not in removed:
+    current_ref = next((t for t in state.tracks if _safe_qid(t) == state.current_id), None)
+    if current_ref is None or current_ref.queue_item_id not in removed:
+        return state.current_id
+    start = state.tracks.index(current_ref)
+    for t in state.tracks[start + 1 :]:
+        if t.queue_item_id in removed:
+            continue
+        qid = _safe_qid(t)
+        if qid is not None:
             return qid
     return None
 
@@ -512,14 +546,17 @@ def _confirm_proposal(
     state: CanonicalState, event: ConfirmEvent, proposal: Proposal
 ) -> ReduceResult:
     """Fold a confirmed proposal into truth; MA already reflects this state."""
-    # Trust the proposal's resolved target rather than re-deriving the delta
-    # from the echo event — this stays correct across every proposal kind.
-    # Where the echo itself carries real track ids (adds/inserts/load-acks
-    # assign them cloud-side), prefer those over the placeholder fallback.
-    echoed_track_ids = {t.queue_item_id: t.track_id for t in getattr(event, "tracks", ())}
+    # Trust the proposal's resolved target (Qobuz ids) rather than
+    # re-deriving the delta from the echo event — this stays correct across
+    # every proposal kind. Where the echo itself carries real refs (adds/
+    # inserts/load-acks assign real queue_item_ids cloud-side), prefer those
+    # over the existing-canonical fallback, and finally a placeholder ref for
+    # a Qobuz id neither source has yet resolved a queue_item_id for.
+    by_qid = {qid: t for t in getattr(event, "tracks", ()) if (qid := _safe_qid(t)) is not None}
+    fallback = {qid: t for t in state.tracks if (qid := _safe_qid(t)) is not None}
     tracks = tuple(
-        QueueTrackRef(queue_item_id=i, track_id=echoed_track_ids.get(i, _track_id_for(state, i)))
-        for i in proposal.target_track_ids
+        by_qid.get(qid, fallback.get(qid, QueueTrackRef(queue_item_id=0, track_id=str(qid))))
+        for qid in proposal.target_track_ids
     )
     pending = tuple(p for p in state.pending if p is not proposal)
     new = dataclasses.replace(
@@ -583,7 +620,7 @@ def _diff_ma_list(state: CanonicalState, event: MaQueueChanged) -> Proposal | No
     suppressed so we never re-push our own unconfirmed optimistic edit.
     """
     canonical_ids = tuple(
-        t.queue_item_id for t in state.tracks if t.queue_item_id in event.resolvable
+        qid for t in state.tracks if (qid := _safe_qid(t)) is not None and qid in event.resolvable
     )
     if canonical_ids == event.track_ids:
         return None
@@ -649,9 +686,22 @@ def _push_for(proposal: Proposal) -> Effect:
     raise NotImplementedError(f"push mapping for {proposal.kind} lands in a later task")
 
 
-def _track_id_for(state: CanonicalState, queue_item_id: int) -> str:
-    """Look up a queue item's provider track id from truth, else a placeholder."""
+def _qid(ref: QueueTrackRef) -> int:
+    """Qobuz track id (int) for a queue ref — the reducer's track identity."""
+    return int(ref.track_id)
+
+
+def _safe_qid(ref: QueueTrackRef) -> int | None:
+    """Qobuz track id for a queue ref, or None if ``track_id`` isn't numeric."""
+    try:
+        return int(ref.track_id)
+    except ValueError:
+        return None
+
+
+def _item_id_for_qid(state: CanonicalState, qid: int) -> int | None:
+    """Translate a Qobuz track id to its cloud queue_item_id, if known."""
     for t in state.tracks:
-        if t.queue_item_id == queue_item_id:
-            return t.track_id
-    return str(queue_item_id)
+        if _safe_qid(t) == qid:
+            return t.queue_item_id
+    return None

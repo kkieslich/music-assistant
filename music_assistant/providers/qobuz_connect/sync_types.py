@@ -28,7 +28,7 @@ class CanonicalState:
     cloud_version: QueueVersion = field(default_factory=QueueVersion)
     tracks: tuple[QueueTrackRef, ...] = field(default_factory=tuple)
     autoplay_tracks: tuple[QueueTrackRef, ...] = field(default_factory=tuple)
-    current_id: int | None = None
+    current_id: int | None = None  # Qobuz track ID of the current track, if any.
     playing: PlayingState = PlayingState.STOPPED
     position_ms: int = 0
     position_anchor_ms: int = 0
@@ -67,8 +67,8 @@ class Proposal:
     action_uuid: bytes
     base_version: QueueVersion
     kind: ProposalKind
-    target_track_ids: tuple[int, ...]
-    current_track_id: int | None
+    target_track_ids: tuple[int, ...]  # Qobuz track IDs.
+    current_track_id: int | None  # Qobuz track ID.
     retries_left: int = 1
 
 
@@ -352,9 +352,9 @@ class MaQueueChanged:
 
     now_ms: int
     action_uuid: bytes
-    track_ids: tuple[int, ...]
-    current_track_id: int | None
-    resolvable: frozenset[int]
+    track_ids: tuple[int, ...]  # Qobuz track IDs.
+    current_track_id: int | None  # Qobuz track ID.
+    resolvable: frozenset[int]  # Qobuz track IDs MA could materialize.
 
 
 @dataclass(slots=True, frozen=True)
@@ -363,7 +363,7 @@ class MaTransportChanged:
 
     now_ms: int
     playing: PlayingState
-    current_track_id: int | None
+    current_track_id: int | None  # Qobuz track ID.
     position_ms: int
 
 
@@ -548,7 +548,7 @@ class ReportState:
 class MaPlayTrack:
     """Instruct MA to play a track (the ONLY audio-restarting effect)."""
 
-    track_id: int
+    track_id: int  # Qobuz track ID.
     position_ms: int
 
 
@@ -573,8 +573,8 @@ class MaSeek:
 class MaResyncQueue:
     """Instruct MA to update queue metadata/order without restarting audio."""
 
-    track_ids: tuple[int, ...]
-    current_track_id: int | None
+    track_ids: tuple[int, ...]  # Qobuz track IDs.
+    current_track_id: int | None  # Qobuz track ID.
 
 
 @dataclass(slots=True, frozen=True)

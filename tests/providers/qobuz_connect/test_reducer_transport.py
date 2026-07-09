@@ -19,14 +19,15 @@ from music_assistant.providers.qobuz_connect.sync_types import (
 
 
 def _refs(*ids: int) -> tuple[QueueTrackRef, ...]:
-    return tuple(QueueTrackRef(queue_item_id=i, track_id=str(100 + i)) for i in ids)
+    # queue_item_id = small cloud slot; track_id = distinct large Qobuz id.
+    return tuple(QueueTrackRef(queue_item_id=i, track_id=str(900000 + i)) for i in ids)
 
 
 def _playing_state() -> CanonicalState:
     return CanonicalState(
         cloud_version=QueueVersion(5, 1),
         tracks=_refs(0, 1, 2),
-        current_id=0,
+        current_id=900000,
         playing=PlayingState.PLAYING,
         active=True,
     )
@@ -65,8 +66,8 @@ def test_setstate_new_current_plays_that_track() -> None:
     )
     plays = [e for e in result.effects if isinstance(e, MaPlayTrack)]
     assert len(plays) == 1
-    assert plays[0].track_id == 2
-    assert result.state.current_id == 2
+    assert plays[0].track_id == 900002
+    assert result.state.current_id == 900002
 
 
 def test_setstate_pause_toggle_does_not_restart() -> None:
@@ -92,7 +93,7 @@ def test_setactive_takeover_plays_current_when_playing() -> None:
     state = CanonicalState(
         cloud_version=QueueVersion(5, 1),
         tracks=_refs(0, 1, 2),
-        current_id=1,
+        current_id=900001,
         playing=PlayingState.PLAYING,
         active=False,
     )
@@ -100,7 +101,7 @@ def test_setactive_takeover_plays_current_when_playing() -> None:
     assert result.state.active is True
     plays = [e for e in result.effects if isinstance(e, MaPlayTrack)]
     assert len(plays) == 1
-    assert plays[0].track_id == 1
+    assert plays[0].track_id == 900001
 
 
 def test_setactive_takeover_paused_does_not_play() -> None:
@@ -108,7 +109,7 @@ def test_setactive_takeover_paused_does_not_play() -> None:
     state = CanonicalState(
         cloud_version=QueueVersion(5, 1),
         tracks=_refs(0, 1),
-        current_id=0,
+        current_id=900000,
         playing=PlayingState.PAUSED,
         active=False,
     )
@@ -121,7 +122,7 @@ def test_renderer_state_updated_while_inactive_folds_current_index() -> None:
     state = CanonicalState(
         cloud_version=QueueVersion(5, 1),
         tracks=_refs(0, 1, 2),
-        current_id=0,
+        current_id=900000,
         playing=PlayingState.PLAYING,
         active=False,
     )
@@ -131,7 +132,7 @@ def test_renderer_state_updated_while_inactive_folds_current_index() -> None:
             now_ms=1, renderer_id=9, playing=PlayingState.PLAYING, position_ms=1000, current_index=2
         ),
     )
-    assert result.state.current_id == 2  # tracks[2].queue_item_id, no -1
+    assert result.state.current_id == 900002  # Qobuz id of tracks[2], no -1
     assert result.effects == ()  # not the active renderer -> no MA effect
 
 
@@ -140,7 +141,7 @@ def test_heartbeat_position_zero_is_preserved() -> None:
     state = CanonicalState(
         cloud_version=QueueVersion(5, 1),
         tracks=_refs(0, 1),
-        current_id=0,
+        current_id=900000,
         playing=PlayingState.PLAYING,
         position_ms=500,
         active=True,
@@ -157,3 +158,23 @@ def test_heartbeat_position_zero_is_preserved() -> None:
         ),
     )
     assert result.state.position_ms == 0
+
+
+def test_setstate_new_current_plays_qobuz_id() -> None:
+    """CloudSetState's current_ref plays and stores the Qobuz id, not the cloud slot id."""
+    state = _playing_state()
+    result = reduce(
+        state,
+        CloudSetState(
+            now_ms=1,
+            version=None,
+            playing=PlayingState.PLAYING,
+            position_ms=0,
+            current_ref=QueueTrackRef(queue_item_id=2, track_id="900002"),
+            next_ref=None,
+        ),
+    )
+    plays = [e for e in result.effects if isinstance(e, MaPlayTrack)]
+    assert len(plays) == 1
+    assert plays[0].track_id == 900002
+    assert result.state.current_id == 900002
