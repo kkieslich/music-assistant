@@ -269,6 +269,13 @@ class CloudAddRenderer:
     now_ms: int
     renderer_id: int
     device_uuid: bytes
+    is_own: bool = False
+    """
+    Whether ``device_uuid`` matches this renderer's own device uuid.
+
+    Own-ness requires uuid-comparison context the pure reducer doesn't hold,
+    so the coordinator resolves it and carries the verdict on the event.
+    """
 
 
 @dataclass(slots=True, frozen=True)
