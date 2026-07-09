@@ -12,10 +12,11 @@ Owns:
   player), and persisting the user's quality choice from the Qobuz app
   back into both this provider's config *and* the native ``qobuz``
   music provider's ``CONF_QUALITY``.
-- The wiring between the four collaborators: it owns the
-  ``QobuzConnectDiscovery``, ``QobuzConnectSession`` and
-  ``QobuzConnectSyncEngine`` instances and threads callbacks between
-  them.
+- The wiring between the collaborators: it owns the
+  ``QobuzConnectDiscovery`` and ``QobuzConnectSession`` instances, plus the
+  reducer-based sync core (``QobuzConnectCoordinator`` + ``EffectRunner``)
+  that replaced the retired ``QobuzConnectSyncEngine``, and threads
+  callbacks between them.
 - The device-identity derivation that keeps the mDNS serial and the
   Qobuz cloud device UUID stable across restarts (``uuid5`` over
   ``instance_id``).
@@ -27,7 +28,8 @@ Exposes:
   / ``CONF_HTTP_PORT`` / ``CONF_MAX_QUALITY`` / ``CONF_INITIAL_VOLUME``.
 
 Depends on:
-- :mod:`.discovery`, :mod:`.session`, :mod:`.sync`, :mod:`.models`.
+- :mod:`.discovery`, :mod:`.session`, :mod:`.coordinator`, :mod:`.effect_runner`,
+  :mod:`.models`.
 - The native ``qobuz`` music provider (``mass.get_provider("qobuz")``)
   must be configured — looked up lazily via ``get_qobuz_provider()``,
   which raises ``InvalidDataError`` if absent.
@@ -38,7 +40,9 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the end-to-end flow.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
+import time
 import uuid
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
@@ -52,18 +56,23 @@ from music_assistant.helpers.app_vars import app_var
 from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.qobuz import CONF_QUALITY as QOBUZ_CONF_QUALITY
 
-from .controller import QobuzConnectController
+from .coordinator import QobuzConnectCoordinator
 from .discovery import QobuzConnectDiscovery
+from .effect_runner import EffectRunner
+from .ma_bridge import MABridge
+from .metadata_resolver import MetadataResolver
 from .models import (
     PROTOCOL_TO_QUALITY,
     QUALITY_TO_PROTOCOL,
     ConnectTokens,
     DeviceConfig,
     JWTConnectToken,
+    QobuzMirror,
     SessionRole,
 )
+from .outbound_reporter import OutboundReporter
 from .session import QobuzConnectSession, SessionCallbacks
-from .sync import QobuzConnectSyncEngine
+from .sync_types import CloudSetActive
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
@@ -73,6 +82,8 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
     from music_assistant.providers.qobuz import QobuzProvider
+
+    from .sync_types import CanonicalState
 
 
 CONF_TARGET_PLAYER = "target_player"
@@ -202,17 +213,37 @@ class QobuzConnectProvider(PluginProvider):
         self._discovery: QobuzConnectDiscovery | None = None
         self._session: QobuzConnectSession | None = None
         self._enable_controller = bool(config.get_value(CONF_ENABLE_CONTROLLER))
-        # Registry state + verb API over the single shared cloud session.
-        self.controller: QobuzConnectController | None = (
-            QobuzConnectController(
-                uuid.UUID(self._device_uuid).bytes,
-                self.logger,
-                lambda: self._session,
-            )
-            if self._enable_controller
-            else None
+        # Sync core: a pure reducer (reducer.py/sync_types.py) driving an
+        # impure coordinator + effect runner, replacing the retired
+        # QobuzConnectSyncEngine. MABridge stands alone (it already only
+        # wraps ``self``); MetadataResolver/OutboundReporter are built
+        # against a retired-engine-shaped host (below) instead of the real
+        # engine — see ``_MetadataHost``/``_ReporterHost``.
+        self._bridge = MABridge(self)
+        self._metadata = MetadataResolver(cast("Any", _MetadataHost(self._bridge)))
+        self._reporter = OutboundReporter(
+            cast("Any", _ReporterHost(self._bridge, lambda: self._coordinator.state))
         )
-        self._sync = QobuzConnectSyncEngine(self)
+        # EffectRunner's ``session`` parameter wants a concrete session, but
+        # ours is created later (in ``_setup_websocket``) and gets replaced
+        # on reconnect — ``_LiveSessionProxy`` forwards every ``send_*`` call
+        # to whichever session is current, and safely no-ops before one
+        # exists.
+        self._effect_runner = EffectRunner(
+            session=cast(
+                "QobuzConnectSession", _LiveSessionProxy(lambda: self._session, self.logger)
+            ),
+            bridge=self._bridge,
+            metadata=self._metadata,
+            reporter=self._reporter,
+            own_rid_getter=lambda: self._coordinator.state.own_rid,
+        )
+        self._coordinator = QobuzConnectCoordinator(
+            runner=self._effect_runner,
+            bridge=self._bridge,
+            device_uuid=uuid.UUID(self._device_uuid).bytes,
+            controller_enabled=self._enable_controller,
+        )
         self._ws_setup_lock = asyncio.Lock()
         self._unsubscribe_queue_events: Callable[[], None] | None = None
         self._unsubscribe_queue_items_events: Callable[[], None] | None = None
@@ -226,7 +257,7 @@ class QobuzConnectProvider(PluginProvider):
         """Start Qobuz Connect discovery after provider load."""
         logging.getLogger("websockets.client").setLevel(logging.WARNING)
         logging.getLogger("websockets.protocol").setLevel(logging.WARNING)
-        await self._sync.start()
+        await self._reporter.start()
         self._unsubscribe_queue_events = self.mass.subscribe(
             self._on_ma_queue_event,
             EventType.QUEUE_UPDATED,
@@ -281,7 +312,7 @@ class QobuzConnectProvider(PluginProvider):
         if self._unsubscribe_player_events is not None:
             self._unsubscribe_player_events()
             self._unsubscribe_player_events = None
-        await self._sync.stop()
+        await self._reporter.stop()
         if self._session:
             await self._session.stop()
         if self._discovery:
@@ -373,51 +404,23 @@ class QobuzConnectProvider(PluginProvider):
         The cloud routes renderer-directed unicast frames to the most
         recently joined connection with our deviceUuid, so both connections
         must dispatch them into the same handlers.
+
+        Delegates translation of every cloud message into a reducer event to
+        ``self._coordinator``, with two provider-level overrides that do
+        strictly more than the reducer: ``on_set_active`` broadcasts the
+        current MA volume + a quality report on activation before handing
+        off to the coordinator's takeover/deactivate logic, and
+        ``on_quality`` persists the app's quality pick to both this
+        provider's config and the native ``qobuz`` provider's config (the
+        reducer's ``CloudQuality`` handling is a pure no-op — quality isn't
+        an MA-drivable setting, it's config).
         """
-        return SessionCallbacks(
-            on_set_state=self._sync.handle_qobuz_set_state,
-            on_queue_load_ack=self._sync.handle_queue_load_ack,
-            on_queue_error=self._sync.handle_queue_error,
-            on_queue_version=self._sync.handle_queue_version,
-            on_queue_state=self._sync.handle_queue_state,
-            on_queue_tracks_added=self._sync.handle_queue_tracks_added,
-            on_queue_tracks_inserted=self._sync.handle_queue_tracks_inserted,
-            on_queue_tracks_removed=self._sync.handle_queue_tracks_removed,
-            on_queue_tracks_reordered=self._sync.handle_queue_tracks_reordered,
-            on_queue_cleared=self._sync.handle_queue_cleared,
-            on_volume=self._on_volume_command,
-            on_volume_delta=self._on_volume_delta_command,
-            on_quality=self._on_quality_change,
-            on_loop_mode=self._sync.handle_loop_mode,
-            on_shuffle_mode=self._sync.handle_shuffle_mode,
-            on_autoplay_mode=self._sync.handle_autoplay_mode,
-            on_state_request=self._sync.report_state,
+        callbacks = self._coordinator.build_session_callbacks()
+        return dataclasses.replace(
+            callbacks,
             on_set_active=self._on_set_active,
-            on_session_state=self._sync.handle_session_state,
-            on_add_renderer=self.controller._on_add_renderer if self.controller else None,
-            on_remove_renderer=self.controller._on_remove_renderer if self.controller else None,
-            on_active_renderer_changed=(
-                self.controller._on_active_renderer_changed if self.controller else None
-            ),
-            on_renderer_state_updated=(
-                self._sync.handle_renderer_state_updated if self.controller else None
-            ),
-            on_disconnected=self._on_ws_disconnected if self.controller else None,
+            on_quality=self._on_quality_change,
         )
-
-    async def _on_ws_disconnected(self) -> None:
-        """
-        Handle loss of the cloud websocket (controller mode).
-
-        The cloud's registry entry for this connection is gone: a fresh
-        connection is never the session's active renderer until SET_ACTIVE
-        (or our own ``activate_self``) says so again, so the engine must
-        drop its active flag or its heartbeat reports get rejected with
-        "Renderer state updated message received from non active renderer".
-        """
-        if self.controller:
-            await self.controller._on_disconnected()
-        self._sync.handle_connection_lost()
 
     async def _on_quality_change(self, new_quality: int) -> None:
         """Remember quality selected in Qobuz app."""
@@ -459,14 +462,6 @@ class QobuzConnectProvider(PluginProvider):
             {QOBUZ_CONF_QUALITY: str(quality)},
             qobuz_provider.instance_id,
         )
-
-    async def _on_volume_command(self, volume: int) -> None:
-        """Handle absolute or delta volume command from Qobuz."""
-        await self._sync.set_volume(volume)
-
-    async def _on_volume_delta_command(self, delta: int) -> None:
-        """Handle relative volume command from Qobuz."""
-        await self._sync.set_volume_delta(delta)
 
     async def _refresh_ws_token(self) -> JWTConnectToken | None:
         """
@@ -516,21 +511,27 @@ class QobuzConnectProvider(PluginProvider):
         """
         Handle SRVR_RNDR_SET_ACTIVE from the Qobuz cloud.
 
-        Sent when the user picks a different renderer in the Qobuz app —
-        we have to release the MA player so two devices don't keep streaming
-        in parallel.
+        Sent when the user picks a different renderer in the Qobuz app, or
+        when this renderer is (re)selected. Broadcasts the current MA
+        volume + a quality report on activation (matching the Qobuz app's
+        activation UX), then hands off to the coordinator's own
+        translation, whose reducer takeover plays the canonical current
+        track (or releases the MA player on deactivation) — the direct
+        ``QobuzConnectCoordinator._submit`` call mirrors exactly what
+        ``coordinator.build_session_callbacks()``'s own ``on_set_active``
+        would have done, since that field is overridden here to add the
+        volume/quality broadcast first.
         """
         if active:
             self.logger.info("Qobuz Connect activated")
-            self._sync.set_active(active=True)
             await self._broadcast_current_volume()
             if self._session:
                 await self._session.send_quality_reports(self._max_quality)
-            if self._enable_controller:
-                await self._sync.takeover_playback()
-            return
-        self.logger.info("Qobuz Connect deactivated by cloud; releasing MA player")
-        await self._sync.release_target_player()
+        else:
+            self.logger.info("Qobuz Connect deactivated by cloud; releasing MA player")
+        await self._coordinator._submit(
+            CloudSetActive(now_ms=int(time.time() * 1000), active=active)
+        )
 
     async def _broadcast_current_volume(self) -> None:
         """Report current MA player volume to Qobuz."""
@@ -553,55 +554,37 @@ class QobuzConnectProvider(PluginProvider):
             self._last_sent_muted = muted
 
     async def _on_ma_queue_event(self, event: MassEvent) -> None:
-        """Forward MA queue updates into the Qobuz sync engine."""
-        await self._sync.handle_ma_queue_event(event)
-
-    async def _on_ma_queue_items_event(self, event: MassEvent) -> None:
-        """Forward MA queue-item mutations to the MA→Qobuz outbound differ."""
-        await self._sync.handle_ma_queue_items_updated(event)
-
-    async def _on_ma_player_updated(self, event: MassEvent) -> None:
         """
-        Propagate MA-side volume + mute changes to the Qobuz cloud.
+        Forward MA transport/mode changes (``QUEUE_UPDATED``) into the coordinator.
 
-        Fires for every ``PLAYER_UPDATED`` event MA emits. Filters on our
-        target player id and skips when:
-        - The session isn't up yet.
-        - The engine is in QOBUZ origin scope (= we're applying an inbound
-          ``SET_VOLUME``; the resulting MA event would otherwise echo
-          straight back to the cloud).
-        - The value hasn't actually changed since our last send (dedup).
-
-        Volume + mute live on the player state and share the same source
-        event, so both are handled here.
+        Both the transport lane (playing/paused/position) and the modes
+        lane (loop) derive from the same queue-updated snapshot.
         """
-        from .models import Origin  # noqa: PLC0415
-
-        if self._session is None:
-            return
-        if self._sync.origin == Origin.QOBUZ:
-            return
         player_id = self.get_target_player_id()
         if not player_id or event.object_id != player_id:
             return
-        player = event.data
-        if player is None:
+        await self._coordinator.on_ma_transport_event(player_id)
+        await self._coordinator.on_ma_modes_event(player_id)
+
+    async def _on_ma_queue_items_event(self, event: MassEvent) -> None:
+        """Forward MA queue-item mutations (``QUEUE_ITEMS_UPDATED``) into the coordinator."""
+        player_id = self.get_target_player_id()
+        if not player_id or event.object_id != player_id:
             return
-        # group_volume/group_volume_muted give the aggregate for a sync group /
-        # group player and the player's own level for a single player. The bare
-        # ``volume_level``/``volume_muted`` on a group are unset, which is why a
-        # sync-group target never synced its volume to the Qobuz app.
-        volume = getattr(player, "group_volume", None)
-        if volume is not None and volume != self._last_sent_volume:
-            self.logger.debug(
-                "MA->Qobuz volume: sending group_volume=%s (player=%s)", volume, event.object_id
-            )
-            await self._session.send_volume_changed(volume)
-            self._last_sent_volume = volume
-        muted = getattr(player, "group_volume_muted", None)
-        if muted is not None and muted != self._last_sent_muted:
-            await self._session.send_volume_muted(muted)
-            self._last_sent_muted = muted
+        await self._coordinator.on_ma_queue_event(player_id)
+
+    async def _on_ma_player_updated(self, event: MassEvent) -> None:
+        """
+        Propagate MA-side volume + mute changes (``PLAYER_UPDATED``) into the coordinator.
+
+        Fires for every ``PLAYER_UPDATED`` event MA emits; filtered to our
+        target player id. Volume + mute live on the player state and share
+        the same source event, so both go through one coordinator call.
+        """
+        player_id = self.get_target_player_id()
+        if not player_id or event.object_id != player_id:
+            return
+        await self._coordinator.on_ma_volume_event(player_id)
 
     def get_qobuz_track_id_from_queue_item(self, queue_item: Any) -> str | None:
         """Extract a Qobuz provider track id from an MA QueueItem."""
@@ -623,6 +606,106 @@ class QobuzConnectProvider(PluginProvider):
             if provider_domain == "qobuz" or provider_instance == qobuz_provider.instance_id:
                 return str(mapping.item_id)
         return None
+
+
+class _LiveSessionProxy:
+    """
+    Stand-in for ``EffectRunner``'s ``session: QobuzConnectSession`` parameter.
+
+    ``EffectRunner`` is constructed once, in the provider's ``__init__``,
+    before the Qobuz Connect websocket exists (``_setup_websocket`` creates
+    ``self._session`` later, and reconnects replace it), and it calls
+    ``self._session.send_*(...)`` directly with no null-check. This proxy is
+    what actually gets bound as ``EffectRunner``'s ``session``: every
+    attribute access forwards to whatever ``session_getter()`` currently
+    returns, so cloud effects transparently follow reconnects and quietly
+    no-op (rather than raising ``AttributeError``) while no socket is up yet.
+    """
+
+    def __init__(
+        self,
+        session_getter: Callable[[], QobuzConnectSession | None],
+        logger: logging.Logger,
+    ) -> None:
+        """Bind the proxy to a getter for the provider's current live session."""
+        self._session_getter = session_getter
+        self._logger = logger
+
+    def __getattr__(self, name: str) -> Any:
+        """Forward to the live session's attribute, or a logging no-op coroutine."""
+        session = self._session_getter()
+        if session is not None:
+            return getattr(session, name)
+
+        async def _noop(*_args: Any, **_kwargs: Any) -> bool:
+            self._logger.debug("Qobuz Connect effect '%s' dropped: no active cloud session", name)
+            return False
+
+        return _noop
+
+
+class _MetadataHost:
+    """
+    Minimal duck-typed 'engine' satisfying ``MetadataResolver``'s constructor.
+
+    ``MetadataResolver`` was built against the retired ``QobuzConnectSyncEngine``
+    and only ever reads ``engine.bridge`` through the one method the effect
+    runner actually calls (``get_track_or_none``), so this host needs nothing
+    beyond ``bridge``.
+    """
+
+    __slots__ = ("bridge",)
+
+    def __init__(self, bridge: MABridge) -> None:
+        """Wrap the provider's MABridge for MetadataResolver's benefit."""
+        self.bridge = bridge
+
+
+class _ReporterHost:
+    """
+    Minimal duck-typed 'engine' satisfying ``OutboundReporter``'s constructor.
+
+    ``OutboundReporter.report_state`` is only ever invoked with
+    ``sync_from_ma=False`` from the effect runner's ``ReportState`` handling,
+    which short-circuits before ever touching ``engine.command_handler`` — so
+    this host never needs one. ``qobuz_state`` is a live projection of the
+    coordinator's ``CanonicalState`` (rather than a field some caller has to
+    remember to keep in sync) so the heartbeat / ``ReportState`` effect keeps
+    reporting current position/track/playing data. ``CanonicalState`` doesn't
+    carry ``duration_ms``/``buffer_state``/``next_item`` (those lived on the
+    retired ``QobuzMirror`` only), so those three fall back to safe defaults.
+    """
+
+    __slots__ = ("_state_getter", "bridge")
+
+    def __init__(self, bridge: MABridge, state_getter: Callable[[], CanonicalState]) -> None:
+        """Wrap the provider's MABridge and a getter for the coordinator's live state."""
+        self.bridge = bridge
+        self._state_getter = state_getter
+
+    @property
+    def qobuz_state(self) -> QobuzMirror:
+        """Project the coordinator's current ``CanonicalState`` as a ``QobuzMirror``."""
+        state = self._state_getter()
+        current_item = None
+        if state.current_id is not None:
+            current_item = next(
+                (t for t in state.tracks if t.track_id == str(state.current_id)), None
+            )
+        return QobuzMirror(
+            queue_version=state.cloud_version,
+            current_item=current_item,
+            playing_state=state.playing,
+            position_ms=state.position_ms,
+            position_timestamp_ms=state.position_anchor_ms,
+            tracks=list(state.tracks),
+            loop_mode=state.loop,
+            autoplay_mode=state.autoplay,
+        )
+
+    @property
+    def _is_active(self) -> bool:
+        return self._state_getter().active
 
 
 def _normalize_quality_id(value: int) -> int | None:
