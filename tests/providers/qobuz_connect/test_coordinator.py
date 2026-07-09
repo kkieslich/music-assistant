@@ -32,6 +32,7 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     PushMute,
     PushPlayerState,
     PushVolume,
+    ReportState,
 )
 
 if TYPE_CHECKING:
@@ -467,16 +468,16 @@ async def test_on_renderer_state_updated_maps_current_queue_index() -> None:
 
 
 async def test_on_ma_transport_event() -> None:
-    """on_ma_transport_event reads MA's queue state and pushes it to cloud."""
+    """on_ma_transport_event folds MA's state and reports it as a renderer (ReportState)."""
     coord, runner, bridge = _coordinator()
     bridge.queue = _FakeQueue(current_item={"track_id": "100"}, state="paused", elapsed=12.5)
     await coord.on_ma_transport_event("player")
     assert coord.state.playing is PlayingState.PAUSED
     assert coord.state.current_id == 100
-    pushes = [e for e in runner.effects if isinstance(e, PushPlayerState)]
-    assert len(pushes) == 1
-    assert pushes[0].playing is PlayingState.PAUSED
-    assert pushes[0].position_ms == 12500
+    # MA is the renderer: it reports state (rndrSrvrStateUpdated via ReportState),
+    # it does NOT send the ctrlSrvrSetPlayerState controller command (that caused a loop).
+    assert any(isinstance(e, ReportState) for e in runner.effects)
+    assert not any(isinstance(e, PushPlayerState) for e in runner.effects)
 
 
 async def test_on_ma_modes_event() -> None:
