@@ -316,12 +316,16 @@ class QobuzConnectCoordinator:
             if LOGGER.isEnabledFor(logging.DEBUG):
                 state = result.state
                 LOGGER.debug(
-                    "reduce %s -> [%s] | active=%s playing=%s current_id=%s tracks=%d pending=%d",
+                    "reduce %s(v=%s) -> [%s] | active=%s playing=%s current_id=%s "
+                    "cloud_v=%s.%s tracks=%d pending=%d",
                     type(event).__name__,
+                    getattr(event, "version", None),
                     ",".join(type(e).__name__ for e in result.effects) or "-",
                     state.active,
                     getattr(state.playing, "name", state.playing),
                     state.current_id,
+                    state.cloud_version.major,
+                    state.cloud_version.minor,
                     len(state.tracks),
                     len(state.pending),
                 )
