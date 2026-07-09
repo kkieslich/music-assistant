@@ -289,3 +289,38 @@ def test_load_ack_adopts_current_in_canonical() -> None:
     assert result.state.current_id == 900001
     assert result.state.cloud_version == QueueVersion(6, 1)
     assert any(isinstance(e, ReportState) for e in result.effects)
+
+
+def test_setstate_applies_even_when_version_is_stale() -> None:
+    """
+    A transport command switches the current track even if its version lags cloud_version.
+
+    The app advances the queue (higher cloud_version) while we still hold an older
+    snapshot; its SET_STATE 'now playing track X' commands and skips carry the older
+    queue_version. Gating them froze MA on the wrong track and made phone skips
+    no-ops (live 2026-07-09). Transport is a live command, exempt from the gate.
+    """
+    state = CanonicalState(
+        cloud_version=QueueVersion(48, 5),
+        current_id=223528143,
+        playing=PlayingState.PLAYING,
+        active=True,
+        tracks=(QueueTrackRef(queue_item_id=1, track_id="223528143"),),
+    )
+    result = reduce(
+        state,
+        CloudSetState(
+            now_ms=1,
+            version=QueueVersion(48, 3),  # older than cloud_version 48.5
+            playing=PlayingState.PLAYING,
+            position_ms=0,
+            current_ref=QueueTrackRef(queue_item_id=1, track_id="402969598"),
+            next_ref=None,
+        ),
+    )
+    plays = [e for e in result.effects if isinstance(e, MaPlayTrack)]
+    assert len(plays) == 1
+    assert plays[0].track_id == 402969598
+    assert result.state.current_id == 402969598
+    # and it re-asks for the queue it doesn't hold yet
+    assert any(isinstance(e, AskSnapshot) for e in result.effects)

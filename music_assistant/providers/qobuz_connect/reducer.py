@@ -150,18 +150,24 @@ ConfirmEvent = (
 def reduce(state: CanonicalState, event: Event) -> ReduceResult:
     """Compute the next canonical state and the effects an event produces."""
     version = getattr(event, "version", None)
-    # A rejection is a control event, not queue state: it must always reach
-    # its matching proposal regardless of version, since the coordinator
-    # falls back to version=state.cloud_version when the wire error carries
-    # none, which the version-stale gate would otherwise always swallow.
+    # Some events are control/transport, not queue-list state, and must NOT be
+    # dropped by the queue-version-stale gate:
     #
-    # A snapshot is the authoritative full-queue answer to our own
-    # AskSnapshot: it MUST apply at the *equal* version (CloudSessionState /
-    # CloudVersionChanged advance cloud_version to the very version the
-    # snapshot then reports, so `<=` would drop it as a duplicate and the
-    # queue would never populate — the app→MA handoff would show nothing).
-    # It is rejected only if *strictly* older than what we already hold.
-    if version is not None and not isinstance(event, CloudQueueError):
+    # - CloudQueueError: a rejection must always reach its matching proposal
+    #   (the coordinator falls back to version=cloud_version when the wire
+    #   error carries none, which `<=` would always swallow).
+    # - CloudSetState: the live "which track is playing / play / pause / skip"
+    #   command. Its queue_version can lag our cloud_version (the app advances
+    #   the queue while we hold an older snapshot), but the transport intent is
+    #   always current and orthogonal to queue-list staleness. Gating it froze
+    #   MA on the wrong track and made phone skips no-ops (live 2026-07-09). It
+    #   is idempotent (``_apply_transport`` only acts on a real change) and also
+    #   re-asks for a fresh snapshot when its version advances.
+    if version is not None and not isinstance(event, (CloudQueueError, CloudSetState)):
+        # A snapshot is the authoritative full-queue answer to our own
+        # AskSnapshot: apply it at the *equal* version (CloudSessionState /
+        # CloudVersionChanged pre-advance cloud_version to the version the
+        # snapshot then reports), rejecting only if *strictly* older.
         stale = (
             _version_lt(version, state.cloud_version)
             if isinstance(event, CloudSnapshot)
