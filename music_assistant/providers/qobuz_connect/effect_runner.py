@@ -111,6 +111,7 @@ class EffectRunner:
 
     async def run(self, effect: Effect) -> None:
         """Execute a single reducer effect."""
+        LOGGER.debug("effect_runner.run %s", type(effect).__name__)
         if isinstance(
             effect,
             MaPlayTrack

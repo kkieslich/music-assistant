@@ -313,8 +313,23 @@ class QobuzConnectCoordinator:
         async with self._lock:
             result = reduce(self._state, event)
             self._state = result.state
+            if LOGGER.isEnabledFor(logging.DEBUG):
+                state = result.state
+                LOGGER.debug(
+                    "reduce %s -> [%s] | active=%s playing=%s current_id=%s tracks=%d pending=%d",
+                    type(event).__name__,
+                    ",".join(type(e).__name__ for e in result.effects) or "-",
+                    state.active,
+                    getattr(state.playing, "name", state.playing),
+                    state.current_id,
+                    len(state.tracks),
+                    len(state.pending),
+                )
             for effect in result.effects:
-                await self._runner.run(effect)
+                try:
+                    await self._runner.run(effect)
+                except Exception:
+                    LOGGER.exception("Qobuz Connect effect %s failed", type(effect).__name__)
             self._sync_proposal_timers()
 
     # ---- session callback translators ---------------------------------------
