@@ -282,20 +282,24 @@ class EffectRunner:
         Reuses existing MA ``QueueItem`` instances for tracks already present (preserving
         their ``queue_item_id`` so the stream buffer stays stable) and resolves metadata
         only for tracks MA doesn't have yet, then commits the whole list via one
-        ``update_items``. This is the safe subset of the old reconciler
-        (``command_handler._materialize_full_queue``) the reducer-driven tests need;
-        deferred: chunked metadata resolution, non-Qobuz tail preservation, mirror/MA
-        duplicate-count bucketing for repeated tracks, and skipping ``update_items`` when
-        nothing actually changed.
+        ``update_items``. Non-Qobuz MA queue items (e.g. a local/Spotify track a user
+        manually queued during an active Connect session) are preserved, appended after
+        the reconciled Qobuz block — mirroring the old reconciler's
+        (``command_handler._materialize_full_queue``) non-Qobuz tail preservation. This is
+        still the safe subset of that reconciler; deferred: chunked metadata resolution and
+        mirror/MA duplicate-count bucketing for repeated tracks.
         """
         pid = self._target_player_id("MaResyncQueue")
         if pid is None or self._metadata is None:
             return
         ma_by_track_id: dict[str, list[Any]] = {}
+        non_qobuz_items: list[Any] = []
         for item in self._bridge.queue_items(pid):
             track_id = self._bridge.qobuz_track_id_for(item)
             if track_id is not None:
                 ma_by_track_id.setdefault(track_id, []).append(item)
+            else:
+                non_qobuz_items.append(item)
 
         final_items: list[Any] = []
         current_index: int | None = None
@@ -312,6 +316,7 @@ class EffectRunner:
                 current_index = len(final_items)
             final_items.append(item)
 
+        final_items.extend(non_qobuz_items)
         if not final_items:
             return
         if current_index is not None:

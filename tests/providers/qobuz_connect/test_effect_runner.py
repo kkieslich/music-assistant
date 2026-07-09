@@ -411,6 +411,30 @@ async def test_ma_resync_queue_reuses_existing_items_and_sets_current_index() ->
     assert metadata.requested == []
 
 
+async def test_ma_resync_preserves_non_qobuz_items() -> None:
+    """MaResyncQueue keeps a non-Qobuz MA queue item instead of dropping it."""
+    session, bridge, metadata = _FakeSession(), _FakeBridge(), _FakeMetadata()
+    qobuz_item = {"track_id": "900001"}
+    non_qobuz_item = {"track_id": None}
+    bridge.queue_items_result = [qobuz_item, non_qobuz_item]
+    runner = _runner(session, bridge, metadata=metadata)
+    await runner.run(MaResyncQueue(track_ids=(900001,), current_track_id=900001))
+    _, (_pid, items) = next(c for c in bridge.calls if c[0] == "update_items")
+    assert non_qobuz_item in items
+    assert items == [qobuz_item, non_qobuz_item]
+
+
+async def test_ma_resync_empty_tracks_keeps_non_qobuz() -> None:
+    """An empty MaResyncQueue still commits, keeping non-Qobuz items rather than no-op'ing."""
+    session, bridge, metadata = _FakeSession(), _FakeBridge(), _FakeMetadata()
+    non_qobuz_item = {"track_id": None}
+    bridge.queue_items_result = [non_qobuz_item]
+    runner = _runner(session, bridge, metadata=metadata)
+    await runner.run(MaResyncQueue(track_ids=(), current_track_id=None))
+    _, (_pid, items) = next(c for c in bridge.calls if c[0] == "update_items")
+    assert items == [non_qobuz_item]
+
+
 async def test_ma_set_loop_maps_to_ma_repeat_mode() -> None:
     """MaSetLoop maps Qobuz LoopMode to MA's RepeatMode string via bridge.set_repeat."""
     session, bridge = _FakeSession(), _FakeBridge()

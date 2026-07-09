@@ -15,6 +15,7 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     CloudSetState,
     MaPause,
     MaPlayTrack,
+    MaResyncQueue,
 )
 
 
@@ -89,7 +90,7 @@ def test_setstate_pause_toggle_does_not_restart() -> None:
 
 
 def test_setactive_takeover_plays_current_when_playing() -> None:
-    """SET_ACTIVE(true) adopts canonical current and plays it once."""
+    """SET_ACTIVE(true) adopts canonical current, resyncs the queue, then plays it once."""
     state = CanonicalState(
         cloud_version=QueueVersion(5, 1),
         tracks=_refs(0, 1, 2),
@@ -99,9 +100,13 @@ def test_setactive_takeover_plays_current_when_playing() -> None:
     )
     result = reduce(state, CloudSetActive(now_ms=1, active=True))
     assert result.state.active is True
-    plays = [e for e in result.effects if isinstance(e, MaPlayTrack)]
-    assert len(plays) == 1
-    assert plays[0].track_id == 900001
+    assert len(result.effects) == 2
+    resync, play = result.effects
+    assert isinstance(resync, MaResyncQueue)
+    assert resync.track_ids == (900000, 900001, 900002)
+    assert resync.current_track_id == 900001
+    assert isinstance(play, MaPlayTrack)
+    assert play.track_id == 900001
 
 
 def test_setactive_takeover_paused_does_not_play() -> None:

@@ -400,9 +400,14 @@ def _takeover(state: CanonicalState) -> ReduceResult:
     """Activate this renderer and adopt canonical current, playing it once if it's live."""
     active = dataclasses.replace(state, active=True)
     if state.current_id is not None and state.playing is PlayingState.PLAYING:
-        return ReduceResult(
-            active, (MaPlayTrack(track_id=state.current_id, position_ms=state.position_ms),)
+        # Resync first so MA's queue is populated (a prior deactivate may have
+        # released/cleared it) before the play fast-paths off that queue.
+        resync = MaResyncQueue(
+            track_ids=tuple(qid for t in state.tracks if (qid := _safe_qid(t)) is not None),
+            current_track_id=state.current_id,
         )
+        play = MaPlayTrack(track_id=state.current_id, position_ms=state.position_ms)
+        return ReduceResult(active, (resync, play))
     return ReduceResult(active, (ReportState(),))
 
 
