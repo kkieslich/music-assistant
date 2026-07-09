@@ -706,6 +706,7 @@ class _ReporterHost:
 
     @property
     def _is_active(self) -> bool:
+        """Whether the cloud currently considers us the active renderer."""
         return self._state_getter().active
 
     def _current_duration_ms(self) -> int:
