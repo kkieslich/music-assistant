@@ -290,9 +290,10 @@ def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
     if isinstance(event, CloudAddRenderer):
         # Own-renderer matching against device_uuid needs uuid-comparison
         # context the pure reducer doesn't hold; the coordinator resolves
-        # own-ness and drives own_rid through the events the reducer does
-        # understand (e.g. CloudActiveRendererChanged).
-        return ReduceResult(state, ())
+        # own-ness and carries the verdict on event.is_own.
+        if not event.is_own or state.own_rid == event.renderer_id:
+            return ReduceResult(state, ())
+        return ReduceResult(dataclasses.replace(state, own_rid=event.renderer_id), ())
     if isinstance(event, CloudRemoveRenderer):
         return _remove_renderer(state, event)
     if isinstance(event, Connected):

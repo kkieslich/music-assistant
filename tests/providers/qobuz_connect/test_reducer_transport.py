@@ -10,6 +10,7 @@ from music_assistant.providers.qobuz_connect.models import (
 from music_assistant.providers.qobuz_connect.reducer import reduce
 from music_assistant.providers.qobuz_connect.sync_types import (
     CanonicalState,
+    CloudAddRenderer,
     CloudRendererStateUpdated,
     CloudSetActive,
     CloudSetState,
@@ -163,6 +164,27 @@ def test_heartbeat_position_zero_is_preserved() -> None:
         ),
     )
     assert result.state.position_ms == 0
+
+
+def test_add_renderer_own_sets_own_rid() -> None:
+    """CloudAddRenderer with is_own=True adopts the renderer id as own_rid."""
+    state = CanonicalState(cloud_version=QueueVersion(5, 1))
+    result = reduce(
+        state,
+        CloudAddRenderer(now_ms=1, renderer_id=7, device_uuid=b"\x01" * 16, is_own=True),
+    )
+    assert result.state.own_rid == 7
+    assert result.effects == ()
+
+
+def test_add_renderer_not_own_leaves_own_rid_untouched() -> None:
+    """CloudAddRenderer with is_own=False (another renderer) is a no-op."""
+    state = CanonicalState(cloud_version=QueueVersion(5, 1), own_rid=3)
+    result = reduce(
+        state,
+        CloudAddRenderer(now_ms=1, renderer_id=7, device_uuid=b"\x02" * 16, is_own=False),
+    )
+    assert result.state.own_rid == 3
 
 
 def test_setstate_new_current_plays_qobuz_id() -> None:
