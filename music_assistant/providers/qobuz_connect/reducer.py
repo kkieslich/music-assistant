@@ -547,11 +547,13 @@ def _reject_proposal(
     """Rebase a rejected proposal once against the newer version, else converge MA."""
     absorbed = dataclasses.replace(state, cloud_version=event.version)
     if proposal.retries_left > 0:
+        rebased_target = _rebase_target(absorbed, proposal)
         rebased = dataclasses.replace(
             proposal,
             base_version=event.version,
             retries_left=proposal.retries_left - 1,
-            target_track_ids=_rebase_target(absorbed, proposal),
+            target_track_ids=rebased_target,
+            push_payload_ids=_rebase_push_payload(absorbed, proposal, rebased_target),
         )
         pending = tuple(rebased if p is proposal else p for p in absorbed.pending)
         new = dataclasses.replace(absorbed, pending=pending)
@@ -580,6 +582,25 @@ def _rebase_target(state: CanonicalState, proposal: Proposal) -> tuple[int, ...]
     return canonical_ids + tail
 
 
+def _rebase_push_payload(
+    state: CanonicalState, proposal: Proposal, rebased_target: tuple[int, ...]
+) -> tuple[int, ...]:
+    """
+    Recompute a rejected proposal's wire payload against current canonical tracks.
+
+    Only ADD's payload is worth rebasing: the retry path has no
+    resolvable-vs-unresolvable distinction available, so the positional tail
+    against full current canonical is the correct approximation, since a
+    rebased ADD target is always current-canonical + tail. LOAD/CLEAR/REORDER
+    payloads stay empty; they're either translated fresh at emit time or
+    unused.
+    """
+    if proposal.kind is not ProposalKind.ADD:
+        return ()
+    canonical_ids = tuple(qid for t in state.tracks if (qid := _safe_qid(t)) is not None)
+    return rebased_target[len(canonical_ids) :]
+
+
 def _diff_ma_list(state: CanonicalState, event: MaQueueChanged) -> Proposal | None:
     """
     Detect an MA-origin structural change and turn it into a proposal.
@@ -602,18 +623,25 @@ def _diff_ma_list(state: CanonicalState, event: MaQueueChanged) -> Proposal | No
         return None
     if not event.track_ids:
         kind = ProposalKind.CLEAR
+        push_payload_ids: tuple[int, ...] = ()
     elif canonical_ids and event.track_ids[: len(canonical_ids)] == canonical_ids:
         kind = ProposalKind.ADD
+        # Positional tail against the resolvable-filtered canonical prefix —
+        # preserves duplicate ids, unlike a set-membership filter would.
+        push_payload_ids = event.track_ids[len(canonical_ids) :]
     elif set(event.track_ids) == set(canonical_ids):
         kind = ProposalKind.REORDER
+        push_payload_ids = ()  # translated to slot ids at emit time.
     else:
         kind = ProposalKind.LOAD
+        push_payload_ids = event.track_ids
     return Proposal(
         action_uuid=event.action_uuid,
         base_version=state.cloud_version,
         kind=kind,
         target_track_ids=event.track_ids,
         current_track_id=event.current_track_id,
+        push_payload_ids=push_payload_ids,
     )
 
 
@@ -641,21 +669,23 @@ def _emit_push(state: CanonicalState, proposal: Proposal) -> Effect:
         return PushLoad(
             action_uuid=proposal.action_uuid,
             base_version=proposal.base_version,
-            track_ids=proposal.target_track_ids,
+            track_ids=proposal.push_payload_ids,
             current_index=current_index,
             context_uuid=b"\x00" * 16,
         )
     if proposal.kind is ProposalKind.ADD:
         # The cloud's add command APPENDS its payload to the existing cloud
-        # queue, so only the ids not already present in canonical may be
-        # pushed — the full target list would duplicate tracks the cloud
-        # already has. The proposal itself still carries the full target
-        # list since _confirm_proposal folds that into canonical truth on
-        # echo.
-        present = {qid for t in state.tracks if (qid := _safe_qid(t)) is not None}
-        tail = tuple(q for q in proposal.target_track_ids if q not in present)
+        # queue, so only the appended tail may be pushed — the full target
+        # list would duplicate tracks the cloud already has. The tail is
+        # computed positionally (not by set-membership) where the proposal
+        # is built, so a duplicate re-add of an already-canonical track is
+        # preserved rather than dropped. The proposal itself still carries
+        # the full target list since _confirm_proposal folds that into
+        # canonical truth on echo.
         return PushAdd(
-            action_uuid=proposal.action_uuid, base_version=proposal.base_version, track_ids=tail
+            action_uuid=proposal.action_uuid,
+            base_version=proposal.base_version,
+            track_ids=proposal.push_payload_ids,
         )
     if proposal.kind is ProposalKind.INSERT:
         # No diff path produces INSERT proposals yet; implemented
@@ -663,7 +693,7 @@ def _emit_push(state: CanonicalState, proposal: Proposal) -> Effect:
         return PushInsert(
             action_uuid=proposal.action_uuid,
             base_version=proposal.base_version,
-            track_ids=proposal.target_track_ids,
+            track_ids=proposal.push_payload_ids,
             insert_after=0,
         )
     if proposal.kind is ProposalKind.REMOVE:

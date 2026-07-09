@@ -70,6 +70,13 @@ class Proposal:
     target_track_ids: tuple[int, ...]  # Qobuz track IDs.
     current_track_id: int | None  # Qobuz track ID.
     retries_left: int = 1
+    push_payload_ids: tuple[int, ...] = ()
+    """
+    Qobuz track ids to actually send on the wire for LOAD/ADD/INSERT — the
+    full list for LOAD, the appended tail for ADD, the inserted ids for
+    INSERT; unused (empty) for REORDER/CLEAR/REMOVE, which translate to slot
+    ids at emit time.
+    """
 
 
 # ---- events: cloud list lane ----

@@ -120,6 +120,37 @@ def test_append_pushes_only_the_appended_tail() -> None:
     assert push.track_ids == (900002,)
 
 
+def test_add_tail_preserves_duplicate_track() -> None:
+    """
+    A duplicate re-add of a track already in canonical must not be dropped.
+
+    Queue multiplicity (the same Qobuz track appearing twice) is a real,
+    supported case; the ADD tail must be computed positionally, not by
+    set-membership, or a duplicate re-add silently becomes a no-op push.
+    """
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1), current_id=900000, active=True
+    )
+    result = reduce(
+        state,
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xaa" * 16,
+            track_ids=(900000, 900001, 900000),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001}),
+        ),
+    )
+    assert len(result.state.pending) == 1
+    proposal = result.state.pending[0]
+    assert proposal.kind is ProposalKind.ADD
+    assert proposal.target_track_ids == (900000, 900001, 900000)
+    assert len(result.effects) == 1
+    push = result.effects[0]
+    assert isinstance(push, PushAdd)
+    assert push.track_ids == (900000,)
+
+
 def test_empty_ma_list_with_nonempty_canonical_is_clear() -> None:
     """MA reports an empty queue while canonical has tracks -> CLEAR proposal."""
     result = reduce(
