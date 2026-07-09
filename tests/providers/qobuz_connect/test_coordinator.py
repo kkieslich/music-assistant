@@ -497,6 +497,28 @@ async def test_on_ma_volume_event() -> None:
     assert any(isinstance(e, PushMute) and e.muted is True for e in runner.effects)
 
 
+async def test_on_ma_volume_event_dedups_unchanged_volume() -> None:
+    """Repeated PLAYER_UPDATED with the same volume/mute pushes to cloud only once."""
+    coord, runner, bridge = _coordinator()
+    bridge.player = _FakePlayer(volume_level=42, volume_muted=False)
+
+    await coord.on_ma_volume_event("player")
+    await coord.on_ma_volume_event("player")
+
+    volume_pushes = [e for e in runner.effects if isinstance(e, PushVolume)]
+    mute_pushes = [e for e in runner.effects if isinstance(e, PushMute)]
+    assert len(volume_pushes) == 1
+    assert len(mute_pushes) == 1
+
+    # A genuine change re-pushes.
+    bridge.player = _FakePlayer(volume_level=55, volume_muted=False)
+    await coord.on_ma_volume_event("player")
+
+    volume_pushes = [e for e in runner.effects if isinstance(e, PushVolume)]
+    assert len(volume_pushes) == 2
+    assert volume_pushes[1].volume == 55
+
+
 async def test_controller_disabled_suppresses_ma_modes_push() -> None:
     """With controller_enabled=False, on_ma_modes_event never submits — no PushLoop."""
     coord, runner, bridge = _coordinator(controller_enabled=False)

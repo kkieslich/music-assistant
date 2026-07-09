@@ -18,6 +18,7 @@ from music_assistant.providers.qobuz_connect import (
     CONF_TARGET_PLAYER,
     PLAYER_ID_AUTO,
     QobuzConnectProvider,
+    _ReporterHost,
 )
 from music_assistant.providers.qobuz_connect.coordinator import QobuzConnectCoordinator
 from music_assistant.providers.qobuz_connect.effect_runner import EffectRunner
@@ -27,6 +28,11 @@ from music_assistant.providers.qobuz_connect.models import (
     QueueTrackRef,
     QueueVersion,
     SetStateEvent,
+)
+from music_assistant.providers.qobuz_connect.sync_types import (
+    CanonicalState,
+    PushVolume,
+    ReportState,
 )
 
 if TYPE_CHECKING:
@@ -228,6 +234,59 @@ async def test_player_updated_event_delegates_to_volume_event() -> None:
     await provider._on_ma_player_updated(event)
 
     provider._coordinator.on_ma_volume_event.assert_awaited_once_with("player_1")
+
+
+async def test_cloud_effect_noops_when_no_session() -> None:
+    """A cloud Push*/ReportState effect through the real EffectRunner no-ops with no session."""
+    provider, _mass = _make_provider()
+    assert provider._session is None
+
+    # _LiveSessionProxy must swallow the send with no live session rather than
+    # raising AttributeError; ReportState short-circuits in report_state() too.
+    await provider._effect_runner.run(PushVolume(volume=30))
+    await provider._effect_runner.run(ReportState())
+
+
+def test_reporter_host_projects_canonical_state_with_duration() -> None:
+    """_ReporterHost projects CanonicalState + a live MA duration into the QobuzMirror."""
+    current_queue_item = SimpleNamespace(duration=200)  # seconds
+    fake_queue = SimpleNamespace(current_item=current_queue_item)
+    fake_bridge = SimpleNamespace(
+        target_player_id=lambda: "player_1",
+        get_queue=lambda _pid: fake_queue,
+    )
+    state = CanonicalState(
+        cloud_version=QueueVersion(3, 2),
+        tracks=(QueueTrackRef(queue_item_id=7, track_id="501"),),
+        current_id=501,
+        playing=PlayingState.PLAYING,
+        position_ms=1234,
+        position_anchor_ms=9999,
+    )
+    host = _ReporterHost(cast("Any", fake_bridge), lambda: state)
+
+    mirror = host.qobuz_state
+
+    assert mirror.current_item is not None
+    assert mirror.current_item.track_id == "501"
+    assert mirror.playing_state is PlayingState.PLAYING
+    assert mirror.position_ms == 1234
+    assert mirror.queue_version == QueueVersion(3, 2)
+    # duration is read live from MA's queue (seconds -> ms) rather than the
+    # hardcoded 0 CanonicalState carries.
+    assert mirror.duration_ms == 200_000
+
+
+def test_reporter_host_duration_falls_back_to_zero_without_queue() -> None:
+    """_ReporterHost falls back to duration_ms=0 when MA has no current queue item."""
+    fake_bridge = SimpleNamespace(
+        target_player_id=lambda: "player_1",
+        get_queue=lambda _pid: None,
+    )
+    state = CanonicalState(current_id=None)
+    host = _ReporterHost(cast("Any", fake_bridge), lambda: state)
+
+    assert host.qobuz_state.duration_ms == 0
 
 
 async def test_ma_events_ignore_non_target_player() -> None:
