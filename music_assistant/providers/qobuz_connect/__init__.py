@@ -673,7 +673,9 @@ class _ReporterHost:
     remember to keep in sync) so the heartbeat / ``ReportState`` effect keeps
     reporting current position/track/playing data. ``CanonicalState`` doesn't
     carry ``duration_ms``/``buffer_state``/``next_item`` (those lived on the
-    retired ``QobuzMirror`` only), so those three fall back to safe defaults.
+    retired ``QobuzMirror`` only); ``buffer_state``/``next_item`` fall back to
+    safe defaults, while ``duration_ms`` is read live from MA's current queue
+    item so the Qobuz app's progress bar isn't stuck at a zero-length track.
     """
 
     __slots__ = ("_state_getter", "bridge")
@@ -698,6 +700,7 @@ class _ReporterHost:
             playing_state=state.playing,
             position_ms=state.position_ms,
             position_timestamp_ms=state.position_anchor_ms,
+            duration_ms=self._current_duration_ms(),
             tracks=list(state.tracks),
             loop_mode=state.loop,
             autoplay_mode=state.autoplay,
@@ -706,6 +709,20 @@ class _ReporterHost:
     @property
     def _is_active(self) -> bool:
         return self._state_getter().active
+
+    def _current_duration_ms(self) -> int:
+        """
+        Return the target player's current queue-item duration in milliseconds.
+
+        ``CanonicalState`` carries no track duration, so read it live from MA's
+        queue (``QueueItem.duration`` is in seconds); falls back to ``0`` when no
+        queue / current item / duration is available.
+        """
+        player_id = self.bridge.target_player_id()
+        queue = self.bridge.get_queue(player_id) if player_id else None
+        current_item = getattr(queue, "current_item", None) if queue is not None else None
+        duration_s = getattr(current_item, "duration", None) if current_item is not None else None
+        return int(duration_s * 1000) if duration_s else 0
 
 
 def _normalize_quality_id(value: int) -> int | None:

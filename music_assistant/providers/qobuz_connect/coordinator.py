@@ -158,6 +158,11 @@ class QobuzConnectCoordinator:
         self._lock = asyncio.Lock()
         self._last_track_index = 0
         self._timers: dict[bytes, asyncio.TimerHandle] = {}
+        # Last (volume, muted) pair pushed to the cloud, so repeated
+        # PLAYER_UPDATED events for an unchanged level don't spam
+        # PushVolume/PushMute. ``None`` sentinel forces the first real value
+        # through.
+        self._last_volume_state: tuple[int, bool] | None = None
 
     @property
     def state(self) -> CanonicalState:
@@ -279,11 +284,16 @@ class QobuzConnectCoordinator:
         player = self._bridge.get_player(player_id)
         if player is None:
             return
+        volume = player.volume_level or 0
+        muted = bool(player.volume_muted)
+        if self._last_volume_state == (volume, muted):
+            return
+        self._last_volume_state = (volume, muted)
         await self._submit(
             MaVolumeChanged(
                 now_ms=self._now(),
-                volume=player.volume_level or 0,
-                muted=bool(player.volume_muted),
+                volume=volume,
+                muted=muted,
             )
         )
 
