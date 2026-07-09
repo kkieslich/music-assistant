@@ -117,6 +117,36 @@ def test_reject_rebases_once_then_converges() -> None:
     assert any(isinstance(e, MaResyncQueue) for e in r3.effects)
 
 
+def test_reject_at_equal_version_still_rebases() -> None:
+    """A rejection carrying the coordinator's version-less fallback (== cloud_version) still rebases."""
+    state = _state()
+    r1 = reduce(
+        state,
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xaa" * 16,
+            track_ids=(900000, 900001, 900002),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001, 900002}),
+        ),
+    )
+    # No version on the wire error -> coordinator falls back to cloud_version,
+    # which is exactly equal to state.cloud_version.
+    r2 = reduce(
+        r1.state,
+        CloudQueueError(
+            now_ms=2,
+            version=r1.state.cloud_version,
+            action_uuid=b"\xaa" * 16,
+            code="1",
+            message="Queue version mismatch",
+        ),
+    )
+    assert len(r2.state.pending) == 1  # rebased, still pending
+    assert r2.state.pending[0].retries_left == 0
+    assert any(isinstance(e, PushAdd) for e in r2.effects)  # re-pushed
+
+
 def test_proposal_timeout_drops_and_converges() -> None:
     """A proposal that never gets a cloud echo is dropped; MA converges to canonical."""
     state = _state()
