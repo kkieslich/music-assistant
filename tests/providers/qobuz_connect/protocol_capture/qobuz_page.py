@@ -300,14 +300,22 @@ class QobuzPage:
 
     async def set_volume_percent(self, percent: int) -> None:
         """Set the volume by clicking on the volume rangeslider track."""
+        # The slider is collapsed until the volume control is hovered; hover
+        # first so it expands to a real, clickable width. The track is only a
+        # couple of pixels tall, so an absolute-coordinate mouse click is
+        # unreliable — click the element itself at a relative position with
+        # force=True, which lands on the track regardless of its thinness.
+        await self.page.locator(".player__settings-volume").first.hover()
+        await self.page.wait_for_timeout(400)
         slider = self.page.locator(".player__settings-volume-slider .rangeslider").first
         box = await slider.bounding_box()
-        if box is None:
-            raise RuntimeError("Could not locate the player volume slider")
+        if box is None or box["width"] < 2:
+            raise RuntimeError("Could not locate an expanded player volume slider")
         clamped = max(0.0, min(100.0, percent)) / 100.0
-        target_x = box["x"] + clamped * box["width"]
-        target_y = box["y"] + box["height"] / 2
-        await self.page.mouse.click(target_x, target_y)
+        await slider.click(
+            position={"x": clamped * box["width"], "y": max(1.0, box["height"] / 2)},
+            force=True,
+        )
 
     # ---- track loading via deterministic URL navigation ------------------
 
@@ -436,6 +444,18 @@ class QobuzPage:
                 has_text=name,
             ),
         ).first.click()
+
+    async def select_local_output(self) -> None:
+        """
+        Route playback back to this browser's local audio output.
+
+        Picks the "Default audio output" entry under the picker's
+        *Direct devices* list, which deactivates any active Qobuz Connect
+        renderer and makes this web client the active player again — the
+        clean-state reset for handoff scenarios.
+        """
+        await self.open_connect_picker()
+        await self.page.locator(".DirectAudioOutputListItem").first.click()
 
     async def select_connect_target_other_web_player(self) -> None:
         """
