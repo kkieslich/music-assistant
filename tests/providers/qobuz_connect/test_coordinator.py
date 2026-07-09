@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+import music_assistant.providers.qobuz_connect.coordinator as coordinator_module
 from music_assistant.providers.qobuz_connect.coordinator import QobuzConnectCoordinator
 from music_assistant.providers.qobuz_connect.models import (
+    LoopMode,
     PlayingState,
+    QueueError,
+    QueueStateSnapshot,
     QueueTrackRef,
     QueueVersion,
     RendererRecord,
+    RendererStateUpdate,
+    SessionStateEvent,
+    SetStateEvent,
 )
 from music_assistant.providers.qobuz_connect.sync_types import (
     CloudSetActive,
@@ -21,7 +28,14 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     MaQueueChanged,
     MaResyncQueue,
     PushAdd,
+    PushLoop,
+    PushMute,
+    PushPlayerState,
+    PushVolume,
 )
+
+if TYPE_CHECKING:
+    import pytest
 
 OUR_DEVICE_UUID = b"\x01" * 16
 
@@ -243,3 +257,248 @@ async def test_controller_disabled_suppresses_ma_queue_push() -> None:
     await coord.on_ma_queue_event("player")
     assert runner.effects == []
     assert coord.state.pending == ()
+
+
+# ---- proposal-timeout timer lifecycle -----------------------------------
+
+
+async def _seed_and_propose(coord: QobuzConnectCoordinator, bridge: _FakeBridge) -> Any:
+    """
+    Seed a one-track canonical snapshot, then trigger an MA-origin ADD proposal.
+
+    :param coord: Coordinator to drive.
+    :param bridge: The coordinator's fake bridge; its ``items`` are set to
+        produce an append relative to the seeded canonical track.
+    :return: The resulting pending proposal.
+    """
+    await coord._submit(
+        CloudSnapshot(
+            now_ms=1,
+            version=QueueVersion(5, 1),
+            tracks=_refs(0),
+            autoplay_tracks=(),
+            shuffle=False,
+            autoplay=False,
+            track_index=1,
+        )
+    )
+    bridge.items = [{"track_id": "100"}, {"track_id": "101"}]
+    await coord.on_ma_queue_event("player")
+    return coord.state.pending[0]
+
+
+async def test_pending_proposal_schedules_timer() -> None:
+    """A newly pending MA-origin proposal gets exactly one live timeout timer."""
+    coord, _runner, bridge = _coordinator()
+    proposal = await _seed_and_propose(coord, bridge)
+    assert set(coord._timers) == {proposal.action_uuid}
+
+
+async def test_timer_cancelled_on_confirm() -> None:
+    """Confirming a proposal cancels its timeout timer instead of leaking it."""
+    coord, _runner, bridge = _coordinator()
+    proposal = await _seed_and_propose(coord, bridge)
+    await coord._submit(
+        CloudTracksAdded(
+            now_ms=2,
+            version=QueueVersion(6, 1),
+            action_uuid=proposal.action_uuid,
+            tracks=(QueueTrackRef(queue_item_id=1, track_id="101"),),
+            after_index=1,
+        )
+    )
+    assert coord.state.pending == ()
+    assert proposal.action_uuid not in coord._timers
+    assert coord._timers == {}
+
+
+async def test_timer_fires_and_converges(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A proposal that never gets a cloud echo times out and converges MA to canonical."""
+    monkeypatch.setattr(coordinator_module, "PROPOSAL_TIMEOUT_S", 0.01)
+    coord, runner, bridge = _coordinator()
+    await coord._submit(
+        CloudSnapshot(
+            now_ms=1,
+            version=QueueVersion(5, 1),
+            tracks=_refs(0),
+            autoplay_tracks=(),
+            shuffle=False,
+            autoplay=False,
+            track_index=1,
+        )
+    )
+    await coord._submit(
+        CloudSetState(
+            now_ms=2,
+            version=None,
+            playing=PlayingState.PLAYING,
+            position_ms=0,
+            current_ref=_refs(0)[0],
+            next_ref=None,
+        )
+    )
+    await coord._submit(CloudSetActive(now_ms=3, active=True))
+    runner.effects.clear()
+
+    bridge.items = [{"track_id": "100"}, {"track_id": "101"}]
+    await coord.on_ma_queue_event("player")
+    pending_before = coord.state.pending
+    assert len(pending_before) == 1
+
+    await asyncio.sleep(0.05)
+
+    pending_after = coord.state.pending
+    assert pending_after == ()
+    assert coord._timers == {}
+    assert any(isinstance(e, MaResyncQueue) for e in runner.effects)
+
+
+# ---- build_session_callbacks() translation paths -------------------------
+
+
+async def test_on_set_state_translates() -> None:
+    """The real ``on_set_state`` callback translates a SetStateEvent into CloudSetState."""
+    coord, runner, _bridge = _coordinator()
+    await coord._submit(
+        CloudSnapshot(
+            now_ms=1,
+            version=QueueVersion(5, 1),
+            tracks=_refs(0, 1),
+            autoplay_tracks=(),
+            shuffle=False,
+            autoplay=False,
+            track_index=1,
+        )
+    )
+    callbacks = coord.build_session_callbacks()
+    await callbacks.on_set_state(
+        SetStateEvent(
+            playing_state=PlayingState.PLAYING,
+            position_ms=1234,
+            queue_version=None,
+            current_item=_refs(1)[0],
+            next_item=None,
+        )
+    )
+    assert coord.state.playing is PlayingState.PLAYING
+    assert any(
+        isinstance(e, MaPlayTrack) and e.track_id == 101 and e.position_ms == 1234
+        for e in runner.effects
+    )
+
+
+async def test_on_queue_state_uses_remembered_track_index() -> None:
+    """on_queue_state falls back to the track_index remembered from the last SESSION_STATE."""
+    coord, _runner, _bridge = _coordinator()
+    callbacks = coord.build_session_callbacks()
+    await callbacks.on_session_state(
+        SessionStateEvent(
+            session_uuid=b"\x02" * 16,
+            session_id=1,
+            queue_version=QueueVersion(1, 0),
+            track_index=3,
+        )
+    )
+    tracks = list(_refs(0, 1, 2, 3))
+    await callbacks.on_queue_state(
+        QueueStateSnapshot(
+            queue_version=QueueVersion(2, 0),
+            action_uuid=b"\x03" * 16,
+            tracks=tracks,
+            shuffle_mode=False,
+            autoplay_mode=False,
+            autoplay_tracks=[],
+        )
+    )
+    # track_index=3 is one-indexed, so the remembered pointer resolves to
+    # tracks[2] — proving on_queue_state actually consumed the value
+    # on_session_state stashed, rather than defaulting to 0.
+    assert coord.state.current_id == int(tracks[2].track_id)
+
+
+async def test_on_queue_error_falls_back_to_cloud_version() -> None:
+    """
+    A QueueError with no queue_version doesn't crash and leaves the proposal alone.
+
+    The fallback value the coordinator supplies equals ``state.cloud_version``
+    exactly (``CloudQueueError.version`` is non-optional), so the reducer's
+    top-of-``reduce()`` version gate treats it as not-newer-than-current and
+    drops it before it ever reaches ``_reject_proposal`` — recovery is left to
+    the ProposalTimeout safety net rather than an immediate reject/rebase.
+    """
+    coord, _runner, bridge = _coordinator()
+    proposal = await _seed_and_propose(coord, bridge)
+
+    callbacks = coord.build_session_callbacks()
+    await callbacks.on_queue_error(
+        QueueError(action_uuid=proposal.action_uuid, queue_version=None, code="1", message="failed")
+    )
+
+    assert coord.state.pending == (proposal,)
+    assert coord.state.cloud_version == QueueVersion(5, 1)
+
+
+async def test_on_renderer_state_updated_maps_current_queue_index() -> None:
+    """on_renderer_state_updated maps current_queue_index onto current_id while inactive."""
+    coord, _runner, _bridge = _coordinator()
+    await coord._submit(
+        CloudSnapshot(
+            now_ms=1,
+            version=QueueVersion(5, 1),
+            tracks=_refs(0, 1, 2),
+            autoplay_tracks=(),
+            shuffle=False,
+            autoplay=False,
+            track_index=1,
+        )
+    )
+    assert coord.state.active is False
+    callbacks = coord.build_session_callbacks()
+    assert callbacks.on_renderer_state_updated is not None
+    await callbacks.on_renderer_state_updated(
+        RendererStateUpdate(renderer_id=7, current_queue_index=2)
+    )
+    assert coord.state.current_id == int(_refs(0, 1, 2)[2].track_id)
+
+
+# ---- MA-side entry points -------------------------------------------------
+
+
+async def test_on_ma_transport_event() -> None:
+    """on_ma_transport_event reads MA's queue state and pushes it to cloud."""
+    coord, runner, bridge = _coordinator()
+    bridge.queue = _FakeQueue(current_item={"track_id": "100"}, state="paused", elapsed=12.5)
+    await coord.on_ma_transport_event("player")
+    assert coord.state.playing is PlayingState.PAUSED
+    assert coord.state.current_id == 100
+    pushes = [e for e in runner.effects if isinstance(e, PushPlayerState)]
+    assert len(pushes) == 1
+    assert pushes[0].playing is PlayingState.PAUSED
+    assert pushes[0].position_ms == 12500
+
+
+async def test_on_ma_modes_event() -> None:
+    """on_ma_modes_event reads MA's repeat mode and pushes a changed loop mode to cloud."""
+    coord, runner, bridge = _coordinator()
+    bridge.queue = _FakeQueue(repeat="all")
+    await coord.on_ma_modes_event("player")
+    assert coord.state.loop is LoopMode.REPEAT_ALL
+    assert any(isinstance(e, PushLoop) and e.loop is LoopMode.REPEAT_ALL for e in runner.effects)
+
+
+async def test_on_ma_volume_event() -> None:
+    """on_ma_volume_event reads MA's player volume/mute and pushes both to cloud."""
+    coord, runner, bridge = _coordinator()
+    bridge.player = _FakePlayer(volume_level=42, volume_muted=True)
+    await coord.on_ma_volume_event("player")
+    assert any(isinstance(e, PushVolume) and e.volume == 42 for e in runner.effects)
+    assert any(isinstance(e, PushMute) and e.muted is True for e in runner.effects)
+
+
+async def test_controller_disabled_suppresses_ma_modes_push() -> None:
+    """With controller_enabled=False, on_ma_modes_event never submits — no PushLoop."""
+    coord, runner, bridge = _coordinator(controller_enabled=False)
+    bridge.queue = _FakeQueue(repeat="all")
+    await coord.on_ma_modes_event("player")
+    assert runner.effects == []
+    assert coord.state.loop is LoopMode.OFF
