@@ -9,6 +9,7 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     AskSnapshot,
     CanonicalState,
     CloudCleared,
+    CloudSessionState,
     CloudSnapshot,
     CloudTracksAdded,
     CloudTracksRemoved,
@@ -182,3 +183,53 @@ def test_snapshot_arrival_sets_last_asked() -> None:
     r2 = reduce(r1.state, CloudVersionChanged(now_ms=2, version=QueueVersion(6, 1)))
     assert r2.state is r1.state  # stale version (== cloud_version) is ignored entirely
     assert not any(isinstance(e, AskSnapshot) for e in r2.effects)
+
+
+def test_snapshot_applies_at_equal_version_after_session_state() -> None:
+    """
+    A snapshot at the version CloudSessionState just advanced to must still apply.
+
+    CloudSessionState advances cloud_version to the session's version, then the
+    QUEUE_STATE snapshot arrives at that SAME version. It must still apply (the
+    authoritative answer to our ask) — otherwise the queue never populates and an
+    app->MA handoff shows nothing. Rejected only if strictly older.
+    """
+    state = CanonicalState()
+    after_session = reduce(
+        state, CloudSessionState(now_ms=1, version=QueueVersion(46, 1), track_index=2)
+    ).state
+    assert after_session.cloud_version == QueueVersion(46, 1)  # version pre-advanced
+
+    result = reduce(
+        after_session,
+        CloudSnapshot(
+            now_ms=2,
+            version=QueueVersion(46, 1),
+            tracks=_refs(0, 1, 2, 3),
+            autoplay_tracks=(),
+            shuffle=False,
+            autoplay=False,
+            track_index=2,
+        ),
+    )
+    assert len(result.state.tracks) == 4  # snapshot applied, not dropped as stale
+    # trackIndex 2 -> current index 1 -> that track's Qobuz id (900000 + 1)
+    assert result.state.current_id == 900001
+
+
+def test_strictly_older_snapshot_is_still_dropped() -> None:
+    """A snapshot strictly older than what we hold is still rejected."""
+    state = CanonicalState(cloud_version=QueueVersion(50, 1), tracks=_refs(0, 1), active=True)
+    result = reduce(
+        state,
+        CloudSnapshot(
+            now_ms=1,
+            version=QueueVersion(48, 1),
+            tracks=_refs(9),
+            autoplay_tracks=(),
+            shuffle=False,
+            autoplay=False,
+            track_index=1,
+        ),
+    )
+    assert result.state is state  # dropped, older

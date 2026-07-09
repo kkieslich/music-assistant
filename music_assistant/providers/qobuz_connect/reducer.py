@@ -154,12 +154,21 @@ def reduce(state: CanonicalState, event: Event) -> ReduceResult:
     # its matching proposal regardless of version, since the coordinator
     # falls back to version=state.cloud_version when the wire error carries
     # none, which the version-stale gate would otherwise always swallow.
-    if (
-        version is not None
-        and not isinstance(event, CloudQueueError)
-        and _version_le(version, state.cloud_version)
-    ):
-        return ReduceResult(state, ())
+    #
+    # A snapshot is the authoritative full-queue answer to our own
+    # AskSnapshot: it MUST apply at the *equal* version (CloudSessionState /
+    # CloudVersionChanged advance cloud_version to the very version the
+    # snapshot then reports, so `<=` would drop it as a duplicate and the
+    # queue would never populate — the app→MA handoff would show nothing).
+    # It is rejected only if *strictly* older than what we already hold.
+    if version is not None and not isinstance(event, CloudQueueError):
+        stale = (
+            _version_lt(version, state.cloud_version)
+            if isinstance(event, CloudSnapshot)
+            else _version_le(version, state.cloud_version)
+        )
+        if stale:
+            return ReduceResult(state, ())
     if isinstance(event, MaQueueChanged):
         return _reduce_ma_queue_changed(state, event)
     if isinstance(event, ProposalTimeout):
@@ -595,6 +604,10 @@ def _reorder(
 
 def _version_le(a: QueueVersion, b: QueueVersion) -> bool:
     return (a.major, a.minor) <= (b.major, b.minor)
+
+
+def _version_lt(a: QueueVersion, b: QueueVersion) -> bool:
+    return (a.major, a.minor) < (b.major, b.minor)
 
 
 def _matching_proposal(state: CanonicalState, action_uuid: bytes) -> Proposal | None:
