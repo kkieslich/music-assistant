@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .audio_probe import AudioProbe
 from .harness import AUTH_DIR, _open_client
 from .ma_probe import MAProbe, ProbeEvents
 
@@ -85,6 +86,7 @@ class IntegrationSession:
         """Bind a web-client controller handle to a live MA probe."""
         self.client = client
         self.ma = ma
+        self.audio = AudioProbe()
 
     @property
     def q(self) -> QobuzPage:
@@ -117,6 +119,30 @@ class IntegrationSession:
     def observe(self, cursor: int) -> ProbeEvents:
         """Parse MA log events written since ``cursor``."""
         return self.ma.events_since(cursor)
+
+    def wait_for_stream(self, cursor: int, *, timeout: float = 25.0) -> ProbeEvents:
+        """Wait until MA logs at least one StreamStart after ``cursor``."""
+        return self.ma.wait_for_event(cursor, lambda ev: bool(ev.streams), timeout=timeout)
+
+    def wait_for_sound(self, timeout: float = 15.0) -> bool:
+        """Wait until real audio is present on the BlackHole output."""
+        return self.audio.wait_for_sound(timeout)
+
+    def wait_for_silence(self, timeout: float = 15.0) -> bool:
+        """Wait until the BlackHole output is silent."""
+        return self.audio.wait_for_silence(timeout)
+
+    def assert_sound(self, result: ScenarioResult, name: str, *, timeout: float = 15.0) -> None:
+        """Record a check that real audio is flowing to the output device."""
+        ok = self.wait_for_sound(timeout)
+        level = self.audio.measure(1.0)
+        result.check(name, ok, detail=f"mean_db={level.mean_db} max_db={level.max_db}")
+
+    def assert_silence(self, result: ScenarioResult, name: str, *, timeout: float = 10.0) -> None:
+        """Record a check that the output device is silent."""
+        ok = self.wait_for_silence(timeout)
+        level = self.audio.measure(1.0)
+        result.check(name, ok, detail=f"mean_db={level.mean_db} max_db={level.max_db}")
 
 
 async def ma_play_media(uri: str, *, queue_id: str = BLACKHOLE_PLAYER_ID) -> str | None:
