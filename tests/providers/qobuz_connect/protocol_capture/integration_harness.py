@@ -146,9 +146,29 @@ class IntegrationSession:
         result.check(name, ok, detail=f"mean_db={level.mean_db} max_db={level.max_db}")
 
     def ma_current_title(self) -> str:
-        """Return the title of the track MA most recently started streaming."""
-        streams = self.ma.events_since(0).streams
-        return streams[-1].title if streams else ""
+        """
+        Return the title of the track MA is actually *playing* (its reported current).
+
+        Uses MA's renderer-state Report (``item=slot:trackid``) as the audible
+        truth, NOT the last ``StreamStart`` — the flow stream buffers the next
+        track read-ahead, so the newest StreamStart is what MA is loading next,
+        not what is playing now. The title is resolved from the id->title pairs
+        that StreamStart lines provide.
+        """
+        events = self.ma.events_since(0)
+        if not events.reports:
+            return ""
+        current_id = events.reports[-1].track_id
+        for stream in reversed(events.streams):
+            if stream.track_id == current_id:
+                return stream.title
+        return ""
+
+    def wait_for_playing(self, cursor: int, *, timeout: float = 25.0) -> ProbeEvents:
+        """Wait until MA reports playing (Report state=2) after ``cursor``."""
+        return self.ma.wait_for_event(
+            cursor, lambda ev: any(r.state == 2 for r in ev.reports), timeout=timeout
+        )
 
     async def assert_in_sync(
         self, result: ScenarioResult, name: str, *, timeout: float = 12.0

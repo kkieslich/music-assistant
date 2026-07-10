@@ -45,7 +45,9 @@ _REDUCE = re.compile(
     r"cloud_v=(?P<cmaj>\d+)\.(?P<cmin>\d+) tracks=(?P<tracks>\d+) pending=(?P<pending>\d+)"
 )
 _STREAM = re.compile(
-    r"Start Streaming queue track: \S+://track/(?P<track>\d+) \((?P<title>[^)]*)\)"
+    # Title may itself contain parentheses ("(Skit)", "(Album Version)"), so
+    # match greedily up to the trailing " for queue" rather than the first ")".
+    r"Start Streaming queue track: \S+://track/(?P<track>\d+) \((?P<title>.*)\) for queue"
 )
 _REPORT = re.compile(
     r"Qobuz report state=(?P<state>\d+) buffer=\d+ wire_buffer=\d+ pos=(?P<pos>\d+)ms "
