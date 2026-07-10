@@ -25,6 +25,10 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -208,6 +212,33 @@ class MAProbe:
                 return True
             time.sleep(0.3)
         return False
+
+    def wait_for_event(
+        self,
+        cursor: int,
+        predicate: Callable[[ProbeEvents], bool],
+        *,
+        timeout: float = 25.0,
+        poll: float = 0.5,
+    ) -> ProbeEvents:
+        """
+        Poll parsed events since ``cursor`` until ``predicate`` holds or timeout.
+
+        :param cursor: Byte offset from :meth:`cursor` taken before the action.
+        :param predicate: Called with the accumulated events; return True to stop.
+        :param timeout: Max seconds to wait.
+        :param poll: Seconds between polls.
+        :returns: The events slice when the predicate held, else the final slice
+            at timeout.
+        """
+        deadline = time.monotonic() + timeout
+        events = self.events_since(cursor)
+        while time.monotonic() < deadline:
+            events = self.events_since(cursor)
+            if predicate(events):
+                return events
+            time.sleep(poll)
+        return events
 
     def _has(self, needle: str, cursor: int) -> bool:
         if not self.log_path.exists():
