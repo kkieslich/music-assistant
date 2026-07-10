@@ -107,6 +107,7 @@ class QobuzPage:
         await self._play_pause_locator().click()
 
     pause = play  # The same element is clicked to pause when playing.
+    resume = play  # ...and to resume when paused.
 
     async def skip_next(self) -> None:
         """Skip to the next track."""
@@ -125,8 +126,21 @@ class QobuzPage:
         await self.page.locator(".player__action-repeat").first.click()
 
     async def toggle_mute(self) -> None:
-        """Click the mute toggle button."""
-        await self.page.locator(".pct-volume").first.click()
+        """
+        Click the volume/mute button in the player bar.
+
+        WARNING: empirically, while a Qobuz Connect renderer is active, the
+        button that carries ``aria-label="Mute"`` (the ``.pct-volume`` speaker
+        icon) toggles AUTOPLAY on the cloud rather than muting the renderer —
+        two cursor-correlated runs on 2026-07-10 each produced
+        ``SET_AUTOPLAY_MODE`` and the renderer's audio stayed unmuted. There is
+        no reliably drivable controller→renderer mute in the current web UI, so
+        the mute scenario is omitted. This helper is retained for completeness
+        but should not be relied on as a renderer mute.
+        """
+        await self.page.locator(".player__settings-volume").first.hover()
+        await self.page.wait_for_timeout(300)
+        await self.page.locator('.player__settings-volume [aria-label="Mute"]').first.click()
 
     async def seek_to_fraction(self, fraction: float) -> None:
         """
@@ -348,6 +362,19 @@ class QobuzPage:
         :param track_index: 1-based row index in the album track list.
         """
         await self.page.locator(".ListItem__number").nth(track_index - 1).click()
+
+    async def play_track_by_index_on_album(self, album_url: str, track_index: int) -> None:
+        """
+        Open ``album_url`` and start its 1-based ``track_index`` track.
+
+        :param album_url: The album page URL (absolute or site-relative).
+        :param track_index: 1-based row index to start.
+        """
+        if not album_url.startswith("http"):
+            album_url = f"{QOBUZ_WEB_URL.rstrip('/')}{album_url}"
+        await self.page.goto(album_url, wait_until="domcontentloaded")
+        await self.page.wait_for_load_state("networkidle", timeout=15_000)
+        await self.play_track_on_open_album(track_index)
 
     async def add_track_to_queue_on_open_album(self, track_index: int) -> None:
         """
