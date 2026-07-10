@@ -350,13 +350,27 @@ class SendspinLocalAudioBridge:
 
     def _on_bridge_stream_start(self) -> None:
         """Start the audio writer task for a new stream."""
-        if self._writer_task is not None and not self._writer_task.done():
-            self._writer_task.cancel()
         self._is_streaming = True
-        while not self._write_queue.empty():
-            self._write_queue.get_nowait()
-        self._writer_task = self.mass.create_task(self._audio_writer())
-        self.logger.info("Bridge writer started for %s", self.device_name)
+        self.mass.create_task(self._restart_writer_locked())
+
+    async def _restart_writer_locked(self) -> None:
+        """
+        Restart the audio writer, fully stopping the previous one first.
+
+        Serialized under the bridge lock so a previous writer's teardown — which
+        closes the shared output stream and clears ``_is_streaming`` in its
+        ``finally`` — completes BEFORE the new writer opens its own device
+        stream. The old code cancelled the writer without awaiting it and
+        immediately started a new one, so on a rapid track change the old
+        writer's ``finally`` could close the NEW writer's stream out from under
+        it (and clear ``_is_streaming``), producing an intermittently silent
+        track that only recovered on the next skip.
+        """
+        async with self._lock:
+            await self._stop_streaming()
+            self._is_streaming = True
+            self._writer_task = self.mass.create_task(self._audio_writer())
+            self.logger.info("Bridge writer started for %s", self.device_name)
 
     def _on_bridge_stream_end(self) -> None:
         """Stop streaming when the stream ends."""
