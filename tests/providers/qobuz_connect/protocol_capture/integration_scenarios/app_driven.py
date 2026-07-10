@@ -13,6 +13,7 @@ from tests.providers.qobuz_connect.protocol_capture.integration_harness import (
     IntegrationSession,
     ScenarioResult,
 )
+from tests.providers.qobuz_connect.protocol_capture.ma_probe import ProbeEvents
 
 TRACK0 = 1065476
 ALBUM_A_IDS = set(range(1065476, 1065492))  # Daft Punk — Discovery
@@ -122,10 +123,143 @@ async def scenario_skip_prev(session: IntegrationSession) -> ScenarioResult:
     return result
 
 
+async def scenario_play_new_album(session: IntegrationSession) -> ScenarioResult:
+    """
+    Load a different album from the app after handoff — plays it WITH SOUND.
+
+    Regression baseline for the reported "MA shows playing but no audio" case:
+    MA must adopt the new cloud queue, stream a new-album track, and actually
+    produce sound.
+    """
+    result = ScenarioResult(scenario="play_new_album")
+    await session.reset_to_clean_state()
+    await session.handoff_to_ma()
+    session.wait_for_stream(session.ma.cursor(), timeout=20.0)
+    cursor = session.ma.cursor()
+    await session.q.play_album_by_url(ALBUM_B_URL)
+    ev = session.ma.wait_for_event(
+        cursor, lambda e: any(s.track_id in ALBUM_B_IDS for s in e.streams), timeout=30.0
+    )
+    result.check(
+        "MA streamed a new-album track",
+        any(s.track_id in ALBUM_B_IDS for s in ev.streams),
+        detail=f"streams={[s.track_id for s in ev.streams]}",
+    )
+    session.assert_sound(result, "audio actually plays for the new album")
+    return result
+
+
+async def scenario_play_new_track(session: IntegrationSession) -> ScenarioResult:
+    """Play a specific track of another album from the app; MA plays it with sound."""
+    result = ScenarioResult(scenario="play_new_track")
+    await session.reset_to_clean_state()
+    await session.handoff_to_ma()
+    session.wait_for_stream(session.ma.cursor(), timeout=20.0)
+    cursor = session.ma.cursor()
+    await session.q.play_track_by_index_on_album(ALBUM_B_URL, 3)
+    ev = session.ma.wait_for_event(
+        cursor, lambda e: any(s.track_id in ALBUM_B_IDS for s in e.streams), timeout=30.0
+    )
+    result.check(
+        "MA streamed the chosen new track",
+        any(s.track_id in ALBUM_B_IDS for s in ev.streams),
+        detail=f"streams={[s.track_id for s in ev.streams]}",
+    )
+    session.assert_sound(result, "audio plays for the new track")
+    return result
+
+
+async def scenario_seek_scrub(session: IntegrationSession) -> ScenarioResult:
+    """Keep audio flowing on an app seek without restarting the track."""
+    result = ScenarioResult(scenario="seek_scrub")
+    await session.reset_to_clean_state()
+    await session.handoff_to_ma()
+    session.wait_for_stream(session.ma.cursor(), timeout=20.0)
+    cursor = session.ma.cursor()
+    await session.q.seek_to_fraction(0.7)
+    session.ma.wait_for_event(
+        cursor, lambda e: any(r.event == "CloudSetState" for r in e.reduces), timeout=15.0
+    )
+    ev = session.observe(cursor)
+    result.check(
+        "seek did not restart playback (<=1 MaPlayTrack)",
+        len([e for e in ev.effects() if e == "MaPlayTrack"]) <= 1,
+        detail=f"effects={ev.effects()}",
+    )
+    session.assert_sound(result, "audio continues after seek")
+    return result
+
+
+async def scenario_queue_add(session: IntegrationSession) -> ScenarioResult:
+    """Adding a track to the queue in the app is reflected on MA without a restart."""
+    result = ScenarioResult(scenario="queue_add")
+    await session.reset_to_clean_state()
+    await session.handoff_to_ma()
+    settle = session.wait_for_stream(session.ma.cursor(), timeout=20.0)
+    settle_last = settle.last_reduce()
+    base_tracks = settle_last.tracks if settle_last else 0
+    cursor = session.ma.cursor()
+    await session.q.play_album_by_url(ALBUM_B_URL)  # open album B page
+    await session.q.add_track_to_queue_on_open_album(1)
+
+    def _grew(events: ProbeEvents) -> bool:
+        last = events.last_reduce()
+        return last is not None and last.tracks != base_tracks
+
+    ev = session.ma.wait_for_event(cursor, _grew, timeout=20.0)
+    last = ev.last_reduce()
+    result.check(
+        "MA queue changed size",
+        bool(last and last.tracks != base_tracks),
+        detail=f"tracks={last.tracks if last else '?'} (was {base_tracks})",
+    )
+    session.assert_sound(result, "audio continues after queue add")
+    return result
+
+
+async def scenario_queue_reorder(session: IntegrationSession) -> ScenarioResult:
+    """Reordering the queue in the app must not restart MA audio."""
+    result = ScenarioResult(scenario="queue_reorder")
+    await session.reset_to_clean_state()
+    await session.handoff_to_ma()
+    session.wait_for_stream(session.ma.cursor(), timeout=20.0)
+    cursor = session.ma.cursor()
+    await session.q.reorder_current_forward(1)
+    await session.q.page.wait_for_timeout(5000)
+    ev = session.observe(cursor)
+    result.check(
+        "reorder did not restart the current track",
+        len([e for e in ev.effects() if e == "MaPlayTrack"]) == 0,
+        detail=f"effects={ev.effects()}",
+    )
+    session.assert_sound(result, "audio continues after reorder")
+    return result
+
+
+async def scenario_pause_resume(session: IntegrationSession) -> ScenarioResult:
+    """Pause silences MA output; resume brings sound back."""
+    result = ScenarioResult(scenario="pause_resume")
+    await session.reset_to_clean_state()
+    await session.handoff_to_ma()
+    session.wait_for_stream(session.ma.cursor(), timeout=20.0)
+    session.assert_sound(result, "sound before pause")
+    await session.q.pause()
+    session.assert_silence(result, "silent after pause")
+    await session.q.resume()
+    session.assert_sound(result, "sound after resume")
+    return result
+
+
 SCENARIOS = {
     "handoff_fresh": scenario_handoff_fresh,
     "handoff_midtrack": scenario_handoff_midtrack,
     "handoff_paused": scenario_handoff_paused,
     "skip_next": scenario_skip_next,
     "skip_prev": scenario_skip_prev,
+    "play_new_album": scenario_play_new_album,
+    "play_new_track": scenario_play_new_track,
+    "seek_scrub": scenario_seek_scrub,
+    "queue_add": scenario_queue_add,
+    "queue_reorder": scenario_queue_reorder,
+    "pause_resume": scenario_pause_resume,
 }
