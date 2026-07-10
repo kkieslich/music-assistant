@@ -229,7 +229,22 @@ def _reduce_proposal_timeout(state: CanonicalState, event: ProposalTimeout) -> R
 def _reduce_list_inbound(state: CanonicalState, event: Event) -> ReduceResult:
     if isinstance(event, CloudSnapshot):
         tracks = tuple(event.tracks)
-        current_id = _current_from_pointer(tracks, event.track_index)
+        # When we are the ACTIVE renderer, WE own "current" — the cloud follows
+        # our reported playback. A snapshot pulled after a queue edit (reorder)
+        # carries the cloud's own trackIndex, which lags/shifts relative to what
+        # we are actually playing; adopting it flipped canonical current to a
+        # track we were not playing, then diverged the app and MA on the next
+        # skip (live 2026-07-10 bidirectional-edit drift). Keep our current as
+        # long as it is still in the queue; only fall back to the snapshot
+        # pointer when inactive or when our track is gone.
+        keep_current = (
+            state.active
+            and state.current_id is not None
+            and any(_safe_qid(t) == state.current_id for t in tracks)
+        )
+        current_id = state.current_id if keep_current else _current_from_pointer(
+            tracks, event.track_index
+        )
         # We now hold this version's queue: record it as asked-for so an
         # immediately-following notification at the same version doesn't
         # trigger a redundant re-ask.

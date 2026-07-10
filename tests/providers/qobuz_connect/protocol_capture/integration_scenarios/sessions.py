@@ -90,7 +90,52 @@ async def scenario_skip_storm(session: IntegrationSession) -> ScenarioResult:
     return result
 
 
+async def scenario_bidirectional_edit(session: IntegrationSession) -> ScenarioResult:
+    """
+    Reorder the queue from BOTH the app and MA, interleaved with skips.
+
+    Reproduces the reported "reordered in both Qobuz and MA, then they showed
+    different tracks" drift. After every edit and skip, assert the app and MA
+    still agree on the current track and audio is still playing. Needs an MA
+    token (skips cleanly otherwise).
+    """
+    result = ScenarioResult(scenario="bidirectional_edit")
+    await session.reset_to_clean_state()
+    cursor = session.ma.cursor()
+    await session.handoff_to_ma()
+    session.wait_for_playing(cursor, timeout=25.0)
+
+    cursor = session.ma.cursor()
+    await session.q.play_album_by_url(ALBUM_B_URL)
+    session.wait_for_playing(cursor, timeout=30.0)
+    await session.assert_playing_and_synced(result, "new_album")
+
+    if (await session.ma_reorder(5, -3)) == "no-token":
+        result.check("skipped (no MA token; run mint_ma_token)", True)
+        return result
+
+    for round_no in range(3):
+        # MA-side reorder: move a later item near the front.
+        await session.ma_reorder(6 + round_no, -4)
+        await session.q.page.wait_for_timeout(3500)
+        await session.assert_playing_and_synced(result, f"ma_reorder#{round_no + 1}")
+
+        # App-side reorder.
+        await session.q.reorder_current_forward(1)
+        await session.q.page.wait_for_timeout(3500)
+        await session.assert_playing_and_synced(result, f"app_reorder#{round_no + 1}")
+
+        # Skip from the app and re-check.
+        cursor = session.ma.cursor()
+        await session.q.skip_next()
+        session.wait_for_playing(cursor, timeout=20.0)
+        await session.assert_playing_and_synced(result, f"skip#{round_no + 1}")
+
+    return result
+
+
 SCENARIOS = {
     "marathon_app": scenario_marathon_app,
     "skip_storm": scenario_skip_storm,
+    "bidirectional_edit": scenario_bidirectional_edit,
 }
