@@ -145,42 +145,85 @@ class IntegrationSession:
         result.check(name, ok, detail=f"mean_db={level.mean_db} max_db={level.max_db}")
 
 
-async def ma_play_media(uri: str, *, queue_id: str = BLACKHOLE_PLAYER_ID) -> str | None:
+def _resolve_ma_token() -> str | None:
+    """Return the MA access token from ``MA_TOKEN`` or the ``.auth/ma_token`` file."""
+    token = os.environ.get("MA_TOKEN")
+    if token:
+        return token
+    token_file = AUTH_DIR / "ma_token"
+    if token_file.exists():
+        return token_file.read_text().strip() or None
+    return None
+
+
+async def _ma_send(command: str, args: dict[str, object]) -> str | None:
     """
-    Start playback of ``uri`` on an MA queue via the MA WebSocket API.
+    Send an authenticated MA WebSocket command and return the outcome.
 
-    Used by the initiate-from-MA scenario to begin Qobuz playback on the MA
-    side (rather than via the web client). Player commands require auth, so
-    an MA access token must be supplied via the ``MA_TOKEN`` env var.
+    Authenticates via an ``Authorization: Bearer`` header on the WS upgrade
+    (MA authenticates the connection from that header). The token comes from
+    ``MA_TOKEN`` or ``.auth/ma_token``.
 
-    :param uri: Media URI to play (e.g. ``qobuz://album/0724384260958``).
-    :param queue_id: The MA queue/player to play on (default: BlackHole).
-    :returns: ``None`` on success, or a short error string (including
-        ``"no-token"`` when ``MA_TOKEN`` is unset).
+    :param command: The MA API command (e.g. ``player_queues/play_media``).
+    :param args: The command arguments.
+    :returns: ``None`` on success, ``"no-token"`` when unauthenticated, or a
+        short error string.
     """
     import aiohttp  # noqa: PLC0415
 
-    token = os.environ.get("MA_TOKEN")
+    token = _resolve_ma_token()
     if not token:
         return "no-token"
-    async with aiohttp.ClientSession() as session, session.ws_connect(MA_WS_URL) as ws:
+    headers = {"Authorization": f"Bearer {token}"}
+    async with (
+        aiohttp.ClientSession() as session,
+        session.ws_connect(MA_WS_URL, headers=headers) as ws,
+    ):
         await ws.receive_json()  # server-info greeting
-        await ws.send_json({"command": "auth", "message_id": "auth", "args": {"token": token}})
-        await ws.send_json(
-            {
-                "command": "player_queues/play_media",
-                "message_id": "play",
-                "args": {"queue_id": queue_id, "media": uri},
-            }
-        )
-        for _ in range(8):
+        await ws.send_json({"command": command, "message_id": "cmd", "args": args})
+        for _ in range(10):
             try:
                 msg = await asyncio.wait_for(ws.receive_json(), timeout=8)
             except TimeoutError:
                 return "timeout"
-            if isinstance(msg, dict) and msg.get("message_id") == "play":
-                return None if not msg.get("error_code") else str(msg.get("details"))
+            if isinstance(msg, dict) and msg.get("message_id") == "cmd":
+                if msg.get("error_code"):
+                    return str(msg.get("details") or msg.get("error_code"))
+                return None
     return "no-response"
+
+
+async def ma_play_media(
+    uri: str, *, queue_id: str = BLACKHOLE_PLAYER_ID, option: str | None = None
+) -> str | None:
+    """
+    Start (or enqueue) playback of ``uri`` on an MA queue via the WebSocket API.
+
+    :param uri: Media URI to play (e.g. ``qobuz://album/0060694932902``).
+    :param queue_id: The MA queue/player to play on (default: BlackHole).
+    :param option: Optional enqueue mode (e.g. ``"add"`` to append).
+    :returns: ``None`` on success, ``"no-token"`` when unauthenticated, or an
+        error string.
+    """
+    args: dict[str, object] = {"queue_id": queue_id, "media": uri}
+    if option is not None:
+        args["option"] = option
+    return await _ma_send("player_queues/play_media", args)
+
+
+async def ma_player_command(command: str, extra: dict[str, object] | None = None) -> str | None:
+    """
+    Issue a player/queue command on the BlackHole queue via the WebSocket API.
+
+    :param command: The MA API command (e.g. ``players/cmd/next``).
+    :param extra: Optional extra args merged into ``{"queue_id": BlackHole}``.
+    :returns: ``None`` on success, ``"no-token"`` when unauthenticated, or an
+        error string.
+    """
+    args: dict[str, object] = {"queue_id": BLACKHOLE_PLAYER_ID}
+    if extra:
+        args.update(extra)
+    return await _ma_send(command, args)
 
 
 async def open_session(
