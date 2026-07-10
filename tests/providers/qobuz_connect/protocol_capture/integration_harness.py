@@ -213,14 +213,16 @@ async def ma_play_media(
 
 async def ma_player_command(command: str, extra: dict[str, object] | None = None) -> str | None:
     """
-    Issue a player/queue command on the BlackHole queue via the WebSocket API.
+    Issue a ``players/cmd/*`` command on the BlackHole player via the WS API.
 
-    :param command: The MA API command (e.g. ``players/cmd/next``).
-    :param extra: Optional extra args merged into ``{"queue_id": BlackHole}``.
+    :param command: The MA API command (e.g. ``players/cmd/next``). These take
+        ``player_id`` (not ``queue_id``); for the BlackHole target the two ids
+        are identical.
+    :param extra: Optional extra args merged into ``{"player_id": BlackHole}``.
     :returns: ``None`` on success, ``"no-token"`` when unauthenticated, or an
         error string.
     """
-    args: dict[str, object] = {"queue_id": BLACKHOLE_PLAYER_ID}
+    args: dict[str, object] = {"player_id": BLACKHOLE_PLAYER_ID}
     if extra:
         args.update(extra)
     return await _ma_send(command, args)
