@@ -198,6 +198,34 @@ class IntegrationSession:
         self.assert_sound(result, f"{step}: audio playing")
         await self.assert_in_sync(result, f"{step}: app and MA agree on track")
 
+    async def ma_reorder(self, index: int, pos_shift: int) -> str | None:
+        """
+        Reorder MA's queue: move the item at ``index`` by ``pos_shift`` slots.
+
+        Drives an MA-side queue edit (the reconciliation/proposal path), the
+        counterpart to a controller-side reorder. Requires an MA token.
+
+        :param index: 0-based position of the queue item to move.
+        :param pos_shift: Positive moves it later, negative earlier.
+        :returns: ``None`` on success or a short error string.
+        """
+        items = await ma_query(
+            "player_queues/items", {"queue_id": BLACKHOLE_PLAYER_ID, "limit": 200}
+        )
+        if not isinstance(items, list) or not 0 <= index < len(items):
+            return "no-items"
+        item = items[index]
+        if not isinstance(item, dict):
+            return "bad-item"
+        return await _ma_send(
+            "player_queues/move_item",
+            {
+                "queue_id": BLACKHOLE_PLAYER_ID,
+                "queue_item_id": item["queue_item_id"],
+                "pos_shift": pos_shift,
+            },
+        )
+
 
 def _resolve_ma_token() -> str | None:
     """Return the MA access token from ``MA_TOKEN`` or the ``.auth/ma_token`` file."""
@@ -210,41 +238,57 @@ def _resolve_ma_token() -> str | None:
     return None
 
 
-async def _ma_send(command: str, args: dict[str, object]) -> str | None:
+async def _ma_call(command: str, args: dict[str, object]) -> tuple[str | None, object]:
     """
-    Send an authenticated MA WebSocket command and return the outcome.
+    Send an authenticated MA WebSocket command; return ``(error, result)``.
 
-    Authenticates via an ``Authorization: Bearer`` header on the WS upgrade
-    (MA authenticates the connection from that header). The token comes from
-    ``MA_TOKEN`` or ``.auth/ma_token``.
+    MA authenticates a WS connection via an ``auth`` command sent as the first
+    message (``args={"token": ...}``); we wait for it to succeed before issuing
+    the real command. The token comes from ``MA_TOKEN`` or ``.auth/ma_token``.
 
     :param command: The MA API command (e.g. ``player_queues/play_media``).
     :param args: The command arguments.
-    :returns: ``None`` on success, ``"no-token"`` when unauthenticated, or a
-        short error string.
+    :returns: ``(None, result)`` on success; ``("no-token", None)`` when
+        unauthenticated; ``(error_string, None)`` otherwise.
     """
     import aiohttp  # noqa: PLC0415
 
     token = _resolve_ma_token()
     if not token:
-        return "no-token"
-    headers = {"Authorization": f"Bearer {token}"}
-    async with (
-        aiohttp.ClientSession() as session,
-        session.ws_connect(MA_WS_URL, headers=headers) as ws,
-    ):
+        return "no-token", None
+    async with aiohttp.ClientSession() as session, session.ws_connect(MA_WS_URL) as ws:
         await ws.receive_json()  # server-info greeting
+        await ws.send_json({"command": "auth", "message_id": "auth", "args": {"token": token}})
         await ws.send_json({"command": command, "message_id": "cmd", "args": args})
-        for _ in range(10):
+        auth_ok = False
+        for _ in range(200):
             try:
                 msg = await asyncio.wait_for(ws.receive_json(), timeout=8)
             except TimeoutError:
-                return "timeout"
-            if isinstance(msg, dict) and msg.get("message_id") == "cmd":
+                return "timeout", None
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("message_id") == "auth" and msg.get("error_code"):
+                return f"auth failed: {msg.get('details')}", None
+            if msg.get("message_id") == "auth":
+                auth_ok = True
+            if msg.get("message_id") == "cmd":
                 if msg.get("error_code"):
-                    return str(msg.get("details") or msg.get("error_code"))
-                return None
-    return "no-response"
+                    return str(msg.get("details") or msg.get("error_code")), None
+                return None, msg.get("result")
+        return ("no-response" if auth_ok else "auth-no-response"), None
+
+
+async def _ma_send(command: str, args: dict[str, object]) -> str | None:
+    """Send an authenticated MA command and return only the error (None on success)."""
+    error, _ = await _ma_call(command, args)
+    return error
+
+
+async def ma_query(command: str, args: dict[str, object]) -> object:
+    """Send an authenticated MA command and return its result payload (or None)."""
+    _, result = await _ma_call(command, args)
+    return result
 
 
 async def ma_play_media(

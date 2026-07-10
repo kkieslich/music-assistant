@@ -17,11 +17,75 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     CloudSessionState,
     CloudSetActive,
     CloudSetState,
+    CloudSnapshot,
     Disconnected,
     MaPause,
     MaPlayTrack,
     MaResyncQueue,
 )
+
+
+def _snapshot(tracks: tuple[QueueTrackRef, ...], track_index: int) -> CloudSnapshot:
+    return CloudSnapshot(
+        now_ms=1,
+        version=QueueVersion(6, 1),
+        tracks=tracks,
+        autoplay_tracks=(),
+        shuffle=False,
+        autoplay=False,
+        track_index=track_index,
+    )
+
+
+def test_active_snapshot_keeps_current_track() -> None:
+    """
+    While MA is the active renderer, a pulled snapshot must not move current.
+
+    The active renderer OWNS 'current' — the cloud follows its report. A
+    snapshot pulled after a queue reorder carries a stale/shifted trackIndex;
+    honouring it flipped canonical current to a track MA was not playing,
+    which then diverged the app and MA on the next skip (live 2026-07-10
+    bidirectional-edit drift). Current stays put as long as it is still in the
+    queue.
+    """
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0, 1, 2),
+        current_id=900000,
+        playing=PlayingState.PLAYING,
+        active=True,
+    )
+    # Snapshot pointer resolves to a DIFFERENT track (index 3 -> 1-indexed ->
+    # tracks[2] == 900002), but 900000 is still present in the queue.
+    result = reduce(state, _snapshot(_refs(0, 1, 2), track_index=3))
+    assert result.state.current_id == 900000  # kept, not overridden to 900002
+    assert tuple(t.queue_item_id for t in result.state.tracks) == (0, 1, 2)
+
+
+def test_inactive_snapshot_adopts_pointer() -> None:
+    """When NOT the active renderer, MA follows the snapshot's current pointer."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0, 1, 2),
+        current_id=900000,
+        active=False,
+    )
+    result = reduce(state, _snapshot(_refs(0, 1, 2), track_index=3))
+    assert result.state.current_id == 900002  # index 3 -> tracks[2]
+
+
+def test_active_snapshot_adopts_pointer_when_current_gone() -> None:
+    """If MA's current track is no longer in the queue, adopt the snapshot pointer."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0, 1, 2),
+        current_id=900000,
+        playing=PlayingState.PLAYING,
+        active=True,
+    )
+    # New queue does not contain 900000 anymore -> fall back to the pointer.
+    result = reduce(state, _snapshot(_refs(7, 8, 9), track_index=1))
+    assert result.state.current_id == 900007  # index 1 -> tracks[0]
 
 
 def _refs(*ids: int) -> tuple[QueueTrackRef, ...]:
