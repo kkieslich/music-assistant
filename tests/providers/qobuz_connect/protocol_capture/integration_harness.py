@@ -22,6 +22,7 @@ import asyncio
 import logging
 import os
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -143,6 +144,39 @@ class IntegrationSession:
         ok = self.wait_for_silence(timeout)
         level = self.audio.measure(1.0)
         result.check(name, ok, detail=f"mean_db={level.mean_db} max_db={level.max_db}")
+
+    def ma_current_title(self) -> str:
+        """Return the title of the track MA most recently started streaming."""
+        streams = self.ma.events_since(0).streams
+        return streams[-1].title if streams else ""
+
+    async def assert_in_sync(
+        self, result: ScenarioResult, name: str, *, timeout: float = 12.0
+    ) -> None:
+        """
+        Record a check that the app's shown track matches what MA is streaming.
+
+        Polls to tolerate brief update races: passes as soon as the web
+        client's ``current_track_name`` appears within MA's most-recently
+        streamed title; fails if they stay divergent (the drift bug). Also
+        records the observed pair in the detail.
+        """
+        deadline = time.monotonic() + timeout
+        app_name = ""
+        ma_title = ""
+        while time.monotonic() < deadline:
+            app_name = (await self.q.current_track_name()).lower()
+            ma_title = self.ma_current_title().lower()
+            if app_name and ma_title and app_name in ma_title:
+                result.check(name, True, detail=f"app={app_name!r} ma={ma_title!r}")
+                return
+            await asyncio.sleep(1.0)
+        result.check(name, False, detail=f"DRIFT app={app_name!r} ma={ma_title!r}")
+
+    async def assert_playing_and_synced(self, result: ScenarioResult, step: str) -> None:
+        """Assert both real audio and app/MA track agreement for a step."""
+        self.assert_sound(result, f"{step}: audio playing")
+        await self.assert_in_sync(result, f"{step}: app and MA agree on track")
 
 
 def _resolve_ma_token() -> str | None:

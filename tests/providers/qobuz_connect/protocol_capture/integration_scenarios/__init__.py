@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
-from . import app_driven, ma_driven, modes_volume
+from . import app_driven, ma_driven, modes_volume, sessions
 
-SCENARIOS = {**app_driven.SCENARIOS, **modes_volume.SCENARIOS, **ma_driven.SCENARIOS}
+SCENARIOS = {
+    **app_driven.SCENARIOS,
+    **modes_volume.SCENARIOS,
+    **ma_driven.SCENARIOS,
+    **sessions.SCENARIOS,
+}
