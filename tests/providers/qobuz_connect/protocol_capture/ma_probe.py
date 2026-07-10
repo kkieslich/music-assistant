@@ -20,6 +20,7 @@ what a phone/web controller would observe.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import time
@@ -31,6 +32,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
+
+# The silent BlackHole player MA renders to during integration runs.
+_BLACKHOLE = "upb97b9910b8fe5ff0946cef06b0d44273"
 
 # Strip terminal colour codes MA emits so the regexes match cleanly.
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -150,9 +154,11 @@ class MAProbe:
         self.data_dir = data_dir
         self.cache_dir = cache_dir
         self._proc: subprocess.Popen[bytes] | None = None
+        self._saved_target: str | None = None
 
     def start(self, *, connect_timeout: float = 90.0) -> None:
-        """Launch MA and block until the Qobuz Connect WebSocket connects."""
+        """Launch MA (Connect target pinned to BlackHole) and block until it connects."""
+        self._pin_target(_BLACKHOLE)
         self.log_path.write_bytes(b"")
         log_fh = self.log_path.open("wb")
         self._proc = subprocess.Popen(  # noqa: S603 - fixed argv launching our own venv python
@@ -174,7 +180,7 @@ class MAProbe:
         self.wait_for("Qobuz Connect WebSocket connected", timeout=connect_timeout)
 
     def stop(self) -> None:
-        """Terminate the MA process if this probe started it."""
+        """Terminate MA if this probe started it, then restore the target player."""
         if self._proc is not None:
             self._proc.terminate()
             try:
@@ -182,6 +188,7 @@ class MAProbe:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
             self._proc = None
+        self._restore_target()
 
     def cursor(self) -> int:
         """Return the current byte length of the log; pass to :meth:`events_since`."""
@@ -246,3 +253,23 @@ class MAProbe:
         with self.log_path.open("rb") as fh:
             fh.seek(cursor)
             return needle in fh.read().decode("utf-8", errors="replace")
+
+    def _pin_target(self, player_id: str) -> None:
+        settings = self.data_dir / "settings.json"
+        data = json.loads(settings.read_text())
+        for value in data.get("providers", {}).values():
+            if isinstance(value, dict) and value.get("domain") == "qobuz_connect":
+                self._saved_target = value["values"].get("target_player")
+                value["values"]["target_player"] = player_id
+        settings.write_text(json.dumps(data, indent=1))
+
+    def _restore_target(self) -> None:
+        if self._saved_target is None:
+            return
+        settings = self.data_dir / "settings.json"
+        data = json.loads(settings.read_text())
+        for value in data.get("providers", {}).values():
+            if isinstance(value, dict) and value.get("domain") == "qobuz_connect":
+                value["values"]["target_player"] = self._saved_target
+        settings.write_text(json.dumps(data, indent=1))
+        self._saved_target = None
