@@ -32,18 +32,18 @@ async def scenario_marathon_app(session: IntegrationSession) -> ScenarioResult:
 
     cursor = session.ma.cursor()
     await session.handoff_to_ma()
-    session.wait_for_stream(cursor, timeout=25.0)
+    session.wait_for_playing(cursor, timeout=25.0)
     await session.assert_playing_and_synced(result, "handoff")
 
     for i in range(3):
         cursor = session.ma.cursor()
         await session.q.skip_next()
-        session.wait_for_stream(cursor, timeout=20.0)
+        session.wait_for_playing(cursor, timeout=20.0)
         await session.assert_playing_and_synced(result, f"skip#{i + 1}")
 
     cursor = session.ma.cursor()
     await session.q.play_album_by_url(ALBUM_B_URL)
-    session.wait_for_stream(cursor, timeout=30.0)
+    session.wait_for_playing(cursor, timeout=30.0)
     await session.assert_playing_and_synced(result, "new_album")
 
     cursor = session.ma.cursor()
@@ -54,7 +54,7 @@ async def scenario_marathon_app(session: IntegrationSession) -> ScenarioResult:
     for i in range(2):
         cursor = session.ma.cursor()
         await session.q.skip_next()
-        session.wait_for_stream(cursor, timeout=20.0)
+        session.wait_for_playing(cursor, timeout=20.0)
         await session.assert_playing_and_synced(result, f"skip_after_reorder#{i + 1}")
 
     cursor = session.ma.cursor()
@@ -64,7 +64,7 @@ async def scenario_marathon_app(session: IntegrationSession) -> ScenarioResult:
 
     cursor = session.ma.cursor()
     await session.q.skip_next()
-    session.wait_for_stream(cursor, timeout=20.0)
+    session.wait_for_playing(cursor, timeout=20.0)
     await session.assert_playing_and_synced(result, "final_skip")
     return result
 
@@ -79,13 +79,13 @@ async def scenario_skip_storm(session: IntegrationSession) -> ScenarioResult:
     await session.reset_to_clean_state()
     cursor = session.ma.cursor()
     await session.handoff_to_ma()
-    session.wait_for_stream(cursor, timeout=25.0)
+    session.wait_for_playing(cursor, timeout=25.0)
     await session.assert_playing_and_synced(result, "handoff")
 
     for i in range(6):
         cursor = session.ma.cursor()
         await session.q.skip_next()
-        session.wait_for_stream(cursor, timeout=20.0)
+        session.wait_for_playing(cursor, timeout=20.0)
         await session.assert_playing_and_synced(result, f"skip#{i + 1}")
     return result
 

@@ -26,11 +26,13 @@ _AVF_DEVICE = re.compile(r"\[(\d+)\]\s*BlackHole", re.IGNORECASE)
 # (a fixed, trusted binary — never user input).
 _FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 
-# Calibrated 2026-07-10: BlackHole reads exactly -91 dB when MA is idle
-# (digital silence) and ~-44 dB during full-volume playback. The default
-# -70 dB threshold sits 21 dB above the silence floor, so it catches even
-# quiet/low-volume playback yet reports true silence (mute, or the "UI says
-# playing but no sound" bug) as not-playing.
+# Calibrated 2026-07-10. We threshold on PEAK (max) level, not mean: real
+# playback always has peaks well above the silence floor even when the mean is
+# low (quiet skits/intros measured mean -79 but peak -61), whereas true silence
+# — MA idle, paused, or the "UI says playing but no sound" bug — reads peak -91
+# on BlackHole. The default -80 dB threshold sits 11 dB above the -91 floor and
+# ~19 dB below the quietest real playback, cleanly separating the two. Mean is
+# unreliable here (quiet content and brief transition gaps depress it).
 
 
 @dataclass(slots=True)
@@ -100,23 +102,23 @@ class AudioProbe:
         )
         return parse_volumedetect(proc.stderr)
 
-    def is_playing(self, seconds: float = 2.0, threshold_db: float = -70.0) -> bool:
+    def is_playing(self, seconds: float = 2.0, threshold_db: float = -80.0) -> bool:
         """
-        Return whether audio is clearly above the silence floor.
+        Return whether real audio (a peak above the silence floor) is present.
 
         :param seconds: Capture window length.
-        :param threshold_db: Mean level above which we call it "playing".
+        :param threshold_db: Peak level above which we call it "playing".
         """
-        return self.measure(seconds).mean_db > threshold_db
+        return self.measure(seconds).max_db > threshold_db
 
     def wait_for_sound(
-        self, timeout: float, *, threshold_db: float = -70.0, poll: float = 2.0
+        self, timeout: float, *, threshold_db: float = -80.0, poll: float = 2.0
     ) -> bool:
         """Poll until audio is present or ``timeout`` elapses."""
         return self._wait(timeout, threshold_db, poll, want_sound=True)
 
     def wait_for_silence(
-        self, timeout: float, *, threshold_db: float = -70.0, poll: float = 2.0
+        self, timeout: float, *, threshold_db: float = -80.0, poll: float = 2.0
     ) -> bool:
         """Poll until audio is absent or ``timeout`` elapses."""
         return self._wait(timeout, threshold_db, poll, want_sound=False)
@@ -124,7 +126,7 @@ class AudioProbe:
     def _wait(self, timeout: float, threshold_db: float, poll: float, *, want_sound: bool) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            playing = self.measure(poll).mean_db > threshold_db
+            playing = self.measure(poll).max_db > threshold_db
             if playing == want_sound:
                 return True
         return False
