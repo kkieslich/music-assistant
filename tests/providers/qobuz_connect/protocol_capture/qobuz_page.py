@@ -109,6 +109,19 @@ class QobuzPage:
     pause = play  # The same element is clicked to pause when playing.
     resume = play  # ...and to resume when paused.
 
+    async def current_track_name(self) -> str:
+        """
+        Return the track name the app currently shows as playing.
+
+        Reads the player bar's ``.player__track-name`` — the controller's view
+        of "now playing", to cross-check against what MA actually streams
+        (drift detection). Empty string if nothing is shown.
+        """
+        loc = self.page.locator(".player__track-name").first
+        if await loc.count() == 0:
+            return ""
+        return (await loc.inner_text()).strip()
+
     async def skip_next(self) -> None:
         """Skip to the next track."""
         await self.page.locator(".player__action-next").first.click()
