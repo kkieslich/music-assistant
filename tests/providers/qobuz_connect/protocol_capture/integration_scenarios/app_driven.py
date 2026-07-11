@@ -9,14 +9,17 @@ playback also asserts real audio on the BlackHole loopback.
 
 from __future__ import annotations
 
+from itertools import pairwise
+
 from tests.providers.qobuz_connect.protocol_capture.integration_harness import (
+    ALBUM_URL,
     IntegrationSession,
     ScenarioResult,
 )
 from tests.providers.qobuz_connect.protocol_capture.ma_probe import ProbeEvents
 
 TRACK0 = 1065476
-ALBUM_A_IDS = set(range(1065476, 1065492))  # Daft Punk — Discovery
+ALBUM_A_IDS = set(range(1065476, 1065492))  # Daft Punk — Discovery (ALBUM_URL)
 ALBUM_B_URL = "https://play.qobuz.com/album/0060694932902"  # Eminem — The Eminem Show
 ALBUM_B_IDS = set(range(3879017, 3879037))
 
@@ -95,7 +98,9 @@ async def scenario_skip_next(session: IntegrationSession) -> ScenarioResult:
     ev = session.wait_for_stream(cursor, timeout=20.0)
     result.check(
         "MA advanced off track 0",
-        bool(ev.streams) and ev.streams[-1].track_id != TRACK0 and ev.streams[-1].track_id in ALBUM_A_IDS,
+        bool(ev.streams)
+        and ev.streams[-1].track_id != TRACK0
+        and ev.streams[-1].track_id in ALBUM_A_IDS,
         detail=f"streams={[s.track_id for s in ev.streams]}",
     )
     result.check("no play storm", len([e for e in ev.effects() if e == "MaPlayTrack"]) <= 3)
@@ -185,6 +190,86 @@ async def scenario_seek_scrub(session: IntegrationSession) -> ScenarioResult:
         "seek did not restart playback (<=1 MaPlayTrack)",
         len([e for e in ev.effects() if e == "MaPlayTrack"]) <= 1,
         detail=f"effects={ev.effects()}",
+    )
+    session.assert_sound(result, "audio continues after seek")
+    return result
+
+
+async def scenario_skip_to_later_position(session: IntegrationSession) -> ScenarioResult:
+    """
+    Skipping to a later queue track reports the NEW track at a low position, not the old one.
+
+    Reproduces the live 2026-07-11 desync: after ~6s of track 0, jump to a much
+    later track. MA's ``corrected_elapsed_time`` still reflects track 0's ~6s
+    until the new stream reports, so an unguarded renderer reported the new
+    track at that stale position (the app showed the wrong playing position,
+    self-healing "after some commands"). MA's reports for the skipped-to track
+    must start low and never jump backward.
+    """
+    result = ScenarioResult(scenario="skip_to_later_position")
+    await session.reset_to_clean_state()
+    await session.handoff_to_ma()
+    session.wait_for_stream(session.ma.cursor(), timeout=20.0)
+    await session.q.page.wait_for_timeout(6000)  # let track 0 play so its position is high
+    cursor = session.ma.cursor()
+    await session.q.play_track_by_index_on_album(ALBUM_URL, 5)  # jump to a much later track
+    ev = session.ma.wait_for_event(
+        cursor,
+        lambda e: any(r.track_id in ALBUM_A_IDS and r.track_id != TRACK0 for r in e.reports),
+        timeout=30.0,
+    )
+    new_reports = [r for r in ev.reports if r.track_id in ALBUM_A_IDS and r.track_id != TRACK0]
+    new_id = new_reports[-1].track_id
+    positions = [r.position_ms for r in ev.reports if r.track_id == new_id]
+    result.check(
+        "new track's first reported position is low (not the old track's ~6s)",
+        bool(positions) and positions[0] < 20000,
+        detail=f"positions={positions}",
+    )
+    backward = [(a, b) for a, b in pairwise(positions) if b + 3000 < a]
+    result.check(
+        "new track position never jumps backward",
+        not backward,
+        detail=f"positions={positions} backward={backward}",
+    )
+    session.assert_sound(result, "audio plays on the skipped-to track")
+    return result
+
+
+async def scenario_seek_no_backward_jump(session: IntegrationSession) -> ScenarioResult:
+    """
+    Report the position moving forward on a forward app seek — never snapping back.
+
+    Reproduces the live 2026-07-11 seek desync: after a seek, MA's
+    ``corrected_elapsed_time`` keeps reporting the pre-seek position (counting
+    up from the old anchor) until the seeked stream reports, so an unguarded
+    renderer snapped the app's slider back even though MA had seeked. The
+    reported position must rise toward the seek target and never drop back.
+    """
+    result = ScenarioResult(scenario="seek_no_backward_jump")
+    await session.reset_to_clean_state()
+    await session.handoff_to_ma()
+    session.wait_for_stream(session.ma.cursor(), timeout=20.0)
+    await session.q.page.wait_for_timeout(4000)  # play ~4s so the pre-seek position is small
+    cursor = session.ma.cursor()
+    await session.q.seek_to_fraction(0.7)  # seek far forward
+    session.ma.wait_for_event(cursor, lambda e: any(r.state == 2 for r in e.reports), timeout=20.0)
+    await session.q.page.wait_for_timeout(4000)
+    positions = [
+        r.position_ms
+        for r in session.observe(cursor).reports
+        if r.state == 2 and r.track_id == TRACK0
+    ]
+    result.check(
+        "seek moved the reported position forward (no snap-back to ~4s)",
+        bool(positions) and max(positions) > 60000,
+        detail=f"positions={positions}",
+    )
+    backward = [(a, b) for a, b in pairwise(positions) if b + 3000 < a]
+    result.check(
+        "reported position never jumps backward after seek",
+        not backward,
+        detail=f"positions={positions} backward={backward}",
     )
     session.assert_sound(result, "audio continues after seek")
     return result
@@ -302,6 +387,8 @@ SCENARIOS = {
     "play_new_album": scenario_play_new_album,
     "play_new_track": scenario_play_new_track,
     "seek_scrub": scenario_seek_scrub,
+    "skip_to_later_position": scenario_skip_to_later_position,
+    "seek_no_backward_jump": scenario_seek_no_backward_jump,
     "queue_add": scenario_queue_add,
     "queue_reorder": scenario_queue_reorder,
     "pause_resume": scenario_pause_resume,

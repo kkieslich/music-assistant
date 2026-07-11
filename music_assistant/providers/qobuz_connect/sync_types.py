@@ -32,6 +32,17 @@ class CanonicalState:
     playing: PlayingState = PlayingState.STOPPED
     position_ms: int = 0
     position_anchor_ms: int = 0
+    settling_position: bool = False
+    """
+    True while we've applied a cloud-commanded seek/track-change and are
+    waiting for MA's reported position to catch up to the commanded target.
+
+    MA's ``corrected_elapsed_time`` lags an audio transition by ~1s (it keeps
+    reporting the pre-transition track/position until the new/seeked stream
+    reports back). While settling, the transport lane holds the commanded
+    target instead of adopting MA's stale report, so the app's slider doesn't
+    jump. Cleared once MA converges to the target or the settle window expires.
+    """
     loop: LoopMode = LoopMode.OFF
     autoplay: bool = False
     active: bool = False
