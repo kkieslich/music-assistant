@@ -250,6 +250,49 @@ async def scenario_pause_resume(session: IntegrationSession) -> ScenarioResult:
     return result
 
 
+async def scenario_pause_resume_reporting(session: IntegrationSession) -> ScenarioResult:
+    """
+    Pause/resume report a clean PAUSED/PLAYING state with a stable position.
+
+    Guards the live 2026-07-11 report bugs: pausing must report PAUSED (never a
+    STOPPED that jumps the slider), and resume must not flap play->pause->play.
+    Uses MA's renderer-state reports (state 1=STOPPED, 2=PLAYING, 3=PAUSED).
+    """
+    result = ScenarioResult(scenario="pause_resume_reporting")
+    await session.reset_to_clean_state()
+    await session.handoff_to_ma()
+    session.wait_for_stream(session.ma.cursor(), timeout=20.0)
+    await session.q.page.wait_for_timeout(7000)  # play ~7s so the position is clearly non-zero
+
+    cursor = session.ma.cursor()
+    await session.q.pause()
+    await session.q.page.wait_for_timeout(4000)
+    reports = session.observe(cursor).reports
+    states = [r.state for r in reports]
+    result.check(
+        "pause reports PAUSED (3), never STOPPED (1)",
+        3 in states and 1 not in states,
+        detail=f"report states={states}",
+    )
+    paused_pos = [r.position_ms for r in reports if r.state == 3]
+    result.check(
+        "paused position is non-zero and frozen (no snap-back)",
+        bool(paused_pos) and min(paused_pos) > 3000 and (max(paused_pos) - min(paused_pos)) < 500,
+        detail=f"paused positions={paused_pos}",
+    )
+
+    cursor = session.ma.cursor()
+    await session.q.resume()
+    await session.q.page.wait_for_timeout(4000)
+    states2 = [r.state for r in session.observe(cursor).reports]
+    result.check(
+        "resume reports PLAYING (2), no STOPPED (1) bounce",
+        2 in states2 and 1 not in states2,
+        detail=f"report states={states2}",
+    )
+    return result
+
+
 SCENARIOS = {
     "handoff_fresh": scenario_handoff_fresh,
     "handoff_midtrack": scenario_handoff_midtrack,
@@ -262,4 +305,5 @@ SCENARIOS = {
     "queue_add": scenario_queue_add,
     "queue_reorder": scenario_queue_reorder,
     "pause_resume": scenario_pause_resume,
+    "pause_resume_reporting": scenario_pause_resume_reporting,
 }

@@ -22,6 +22,7 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     MaPause,
     MaPlayTrack,
     MaResyncQueue,
+    MaTransportChanged,
 )
 
 
@@ -420,6 +421,111 @@ def test_load_ack_while_inactive_does_not_play() -> None:
         ),
     )
     assert not any(isinstance(e, MaPlayTrack) for e in result.effects)
+
+
+def test_pause_captures_live_position() -> None:
+    """
+    Pausing freezes the position at base+elapsed, not the stale anchor base.
+
+    During PLAYING the reporter interpolates position from (position_ms, anchor).
+    Pausing must capture that live position, or the app's slider snaps back to
+    the base (live 2026-07-11 "slider moves back the wrong 2-3s").
+    """
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0, 1),
+        current_id=900000,
+        playing=PlayingState.PLAYING,
+        position_ms=1000,
+        position_anchor_ms=1000,
+        active=True,
+    )
+    result = reduce(
+        state,
+        CloudSetState(
+            now_ms=11000,
+            version=None,
+            playing=PlayingState.PAUSED,
+            position_ms=None,
+            current_ref=None,
+            next_ref=None,
+        ),
+    )
+    assert result.state.playing is PlayingState.PAUSED
+    assert result.state.position_ms == 11000  # 1000 base + 10000ms elapsed while playing
+
+
+def test_paused_renderer_keeps_paused_when_player_idles() -> None:
+    """
+    Keep PAUSED (frozen position) when the idling player emits STOPPED.
+
+    Pausing stops the flow stream, so the MA player idles (STOPPED) a moment
+    after the user pauses — but the renderer's logical state is PAUSED.
+    Reporting STOPPED with the stream's overshot position made the app flap
+    play->pause and jump the slider (live 2026-07-11). While paused, a STOPPED
+    transition from the idling player must keep PAUSED and freeze the position.
+    """
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0, 1),
+        current_id=900000,
+        playing=PlayingState.PAUSED,
+        position_ms=76000,
+        position_anchor_ms=1000,
+        active=True,
+    )
+    result = reduce(
+        state,
+        MaTransportChanged(
+            now_ms=2000, playing=PlayingState.STOPPED, current_track_id=None, position_ms=80565
+        ),
+    )
+    assert result.state.playing is PlayingState.PAUSED  # not overridden to STOPPED
+    assert result.state.position_ms == 76000  # frozen at the pause point, not 80565
+
+
+def test_playing_renderer_transient_stop_keeps_playing() -> None:
+    """
+    A transient STOPPED while PLAYING with a current track keeps PLAYING.
+
+    Resume and track changes briefly idle the flow stream; reporting the
+    transient STOPPED made the app bounce play->pause->play on resume (live
+    2026-07-11). With a current track held, keep PLAYING and freeze position.
+    """
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0, 1),
+        current_id=900000,
+        playing=PlayingState.PLAYING,
+        position_ms=1000,
+        active=True,
+    )
+    result = reduce(
+        state,
+        MaTransportChanged(
+            now_ms=2000, playing=PlayingState.STOPPED, current_track_id=None, position_ms=2000
+        ),
+    )
+    assert result.state.playing is PlayingState.PLAYING
+    assert result.state.position_ms == 1000
+
+
+def test_genuine_stop_on_empty_queue_reports_stopped() -> None:
+    """With no current track (empty queue), a STOPPED transition is a real stop."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=(),
+        current_id=None,
+        playing=PlayingState.PLAYING,
+        active=True,
+    )
+    result = reduce(
+        state,
+        MaTransportChanged(
+            now_ms=2000, playing=PlayingState.STOPPED, current_track_id=None, position_ms=0
+        ),
+    )
+    assert result.state.playing is PlayingState.STOPPED
 
 
 def test_empty_load_ack_keeps_tracks() -> None:

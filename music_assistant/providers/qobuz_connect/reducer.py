@@ -449,7 +449,18 @@ def _apply_transport(
         )
         return ReduceResult(new, (MaPlayTrack(track_id=current_id, position_ms=position_ms or 0),))
     if playing is not None and playing != state.playing:
-        new = dataclasses.replace(state, playing=playing)
+        # Capture the live interpolated position when toggling play/pause. During
+        # PLAYING the reporter interpolates position from (position_ms, anchor),
+        # so position_ms is a stale base; if we pause without capturing the
+        # elapsed time, the frozen report snaps the slider back to that base
+        # (live 2026-07-11 "slider moves back"). Freeze at base + elapsed and
+        # re-anchor; on resume this simply continues from the paused position.
+        live_position_ms = state.position_ms
+        if state.playing is PlayingState.PLAYING:
+            live_position_ms = state.position_ms + max(0, now_ms - state.position_anchor_ms)
+        new = dataclasses.replace(
+            state, playing=playing, position_ms=live_position_ms, position_anchor_ms=now_ms
+        )
         effect = MaPause() if playing is PlayingState.PAUSED else MaResume()
         return ReduceResult(new, (effect,))
     if position_ms is not None and abs(position_ms - state.position_ms) > _SEEK_THRESHOLD_MS:
@@ -487,13 +498,35 @@ def _deactivate(state: CanonicalState) -> ReduceResult:
 
 def _ma_transport(state: CanonicalState, event: MaTransportChanged) -> ReduceResult:
     """Fold MA's own transport into canonical and REPORT it as a renderer (not a command)."""
+    playing = event.playing
+    position_ms = event.position_ms
+    position_anchor_ms = event.now_ms
+    # Pause and resume both stop/restart the underlying MA flow stream, so the
+    # MA player briefly transitions to IDLE (-> STOPPED) around a pause, a
+    # resume, and a track change. The renderer's LOGICAL state across those is
+    # still PAUSED or PLAYING — it is never "STOPPED" while it holds a current
+    # track. Reporting the transient STOPPED (with the stopped stream's overshot
+    # position) made the app flap play->pause->play and jump the slider by a few
+    # seconds (live 2026-07-11). While active and holding a current track, a
+    # STOPPED transition is a transport-transition side-effect: keep the current
+    # intent and freeze the position. A genuine stop (empty queue, current_id
+    # None) still reports STOPPED.
+    if (
+        state.active
+        and event.playing is PlayingState.STOPPED
+        and state.playing in (PlayingState.PAUSED, PlayingState.PLAYING)
+        and state.current_id is not None
+    ):
+        playing = state.playing
+        position_ms = state.position_ms
+        position_anchor_ms = state.position_anchor_ms
     current_id = event.current_track_id if event.current_track_id is not None else state.current_id
     new = dataclasses.replace(
         state,
-        playing=event.playing,
+        playing=playing,
         current_id=current_id,
-        position_ms=event.position_ms,
-        position_anchor_ms=event.now_ms,
+        position_ms=position_ms,
+        position_anchor_ms=position_anchor_ms,
     )
     # MA is the RENDERER: it reports its live state via rndrSrvrStateUpdated
     # (the ReportState effect), NOT ctrlSrvrSetPlayerState. The latter is a
