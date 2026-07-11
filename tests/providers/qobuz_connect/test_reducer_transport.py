@@ -376,6 +376,10 @@ def test_load_ack_while_playing_plays_new_current() -> None:
     assert plays[0].track_id == 900007  # tracks[0] Qobuz id of the new queue
     assert result.state.current_id == 900007
     assert any(isinstance(e, MaResyncQueue) for e in result.effects)
+    # The new track restarts audio at 0; canonical anchors there and settles so
+    # MA's lagging position can't briefly show the new track at the old spot.
+    assert result.state.position_ms == 0
+    assert result.state.settling_position is True
 
 
 def test_load_ack_same_current_does_not_restart() -> None:
@@ -545,6 +549,142 @@ def test_empty_load_ack_keeps_tracks() -> None:
     )
     assert tuple(t.queue_item_id for t in result.state.tracks) == (0, 1)
     assert result.state.cloud_version == QueueVersion(6, 1)
+
+
+def test_seek_ignores_stale_ma_position_until_converged() -> None:
+    """
+    After a cloud seek, MA's lagging position must not drag the slider back.
+
+    ``corrected_elapsed_time`` keeps reporting the pre-seek position (still
+    counting up from the old anchor) for ~1s until MA's seeked stream reports
+    back. Adopting it snapped the app's slider backward while MA had actually
+    seeked (live 2026-07-11 "the slider jumps back but MA actually seeked").
+    The commanded target holds until MA's report converges to it.
+    """
+    r1 = reduce(
+        _playing_state(),
+        CloudSetState(
+            now_ms=1000,
+            version=None,
+            playing=PlayingState.PLAYING,
+            position_ms=60000,
+            current_ref=_refs(0)[0],
+            next_ref=None,
+        ),
+    )
+    assert r1.state.position_ms == 60000  # commanded seek target
+
+    # MA still reports the OLD position (~30s) on the SAME track: stale lag.
+    r2 = reduce(
+        r1.state,
+        MaTransportChanged(
+            now_ms=1500, playing=PlayingState.PLAYING, current_track_id=900000, position_ms=30000
+        ),
+    )
+    assert r2.state.position_ms == 60000  # held, not dragged back to 30000
+
+    # MA's seeked stream now reports ~60s: converged -> adopt MA as truth.
+    r3 = reduce(
+        r2.state,
+        MaTransportChanged(
+            now_ms=2500, playing=PlayingState.PLAYING, current_track_id=900000, position_ms=60050
+        ),
+    )
+    assert r3.state.position_ms == 60050
+
+
+def test_skip_ignores_stale_ma_position_until_converged() -> None:
+    """
+    After a cloud skip, MA's stale elapsed must not show the new track at the old position.
+
+    Skipping to a later track resets audio to 0, but MA's ``elapsed_time``
+    still reflects the previous track (~50s, not reset until the new stream
+    reports). Adopting it showed the new track at a wrong, too-high position
+    (live 2026-07-11 "new track played but app showed the wrong position, after
+    some commands it worked again"). The commanded track+0 hold until MA
+    catches up.
+    """
+    r1 = reduce(
+        _playing_state(),
+        CloudSetState(
+            now_ms=1000,
+            version=None,
+            playing=PlayingState.PLAYING,
+            position_ms=0,
+            current_ref=_refs(2)[0],
+            next_ref=None,
+        ),
+    )
+    assert r1.state.current_id == 900002
+    assert r1.state.position_ms == 0
+
+    # MA still reports the OLD track at its overshot position: stale lag.
+    r2 = reduce(
+        r1.state,
+        MaTransportChanged(
+            now_ms=1400, playing=PlayingState.PLAYING, current_track_id=900000, position_ms=50000
+        ),
+    )
+    assert r2.state.current_id == 900002  # not flipped back to the old track
+    assert r2.state.position_ms == 0  # not dragged to 50000
+
+    # MA's new stream now reports near 0 on the new track: converged.
+    r3 = reduce(
+        r2.state,
+        MaTransportChanged(
+            now_ms=2400, playing=PlayingState.PLAYING, current_track_id=900002, position_ms=200
+        ),
+    )
+    assert r3.state.current_id == 900002
+    assert r3.state.position_ms == 200
+
+
+def test_ma_transport_adopts_position_when_not_settling() -> None:
+    """
+    Absent a just-issued cloud command, MA is the source of truth for position.
+
+    Natural progression and MA-origin seeks flow straight through — the
+    settling guard must only suppress the lag window right after a cloud
+    seek/track-change, never ordinary MA reports.
+    """
+    result = reduce(
+        _playing_state(),
+        MaTransportChanged(
+            now_ms=5000, playing=PlayingState.PLAYING, current_track_id=900000, position_ms=45000
+        ),
+    )
+    assert result.state.position_ms == 45000
+
+
+def test_settling_times_out_and_adopts_ma() -> None:
+    """
+    If MA never converges, adopt its report after the settle timeout (bounded suppression).
+
+    The suppression window is capped so a genuinely divergent MA (e.g. a track
+    shorter than the seek target) can't freeze the reported position forever.
+    """
+    r1 = reduce(
+        _playing_state(),
+        CloudSetState(
+            now_ms=1000,
+            version=None,
+            playing=PlayingState.PLAYING,
+            position_ms=60000,
+            current_ref=_refs(0)[0],
+            next_ref=None,
+        ),
+    )
+    # Well past the settle timeout, still reporting a non-converging position.
+    result = reduce(
+        r1.state,
+        MaTransportChanged(
+            now_ms=1000 + 5001,
+            playing=PlayingState.PLAYING,
+            current_track_id=900000,
+            position_ms=30000,
+        ),
+    )
+    assert result.state.position_ms == 30000  # adopted after timeout
 
 
 def test_setstate_applies_even_when_version_is_stale() -> None:
