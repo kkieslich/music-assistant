@@ -76,7 +76,7 @@ class _FakeQueue:
 class _FakePlayer:
     """Minimal stand-in for MA's Player, exposing only volume fields."""
 
-    def __init__(self, *, volume_level: int = 50, volume_muted: bool = False) -> None:
+    def __init__(self, *, volume_level: int | None = 50, volume_muted: bool = False) -> None:
         """Hold the fixed volume fields the coordinator's on_ma_volume_event reads."""
         self.volume_level = volume_level
         self.volume_muted = volume_muted
@@ -496,6 +496,22 @@ async def test_on_ma_volume_event() -> None:
     await coord.on_ma_volume_event("player")
     assert any(isinstance(e, PushVolume) and e.volume == 42 for e in runner.effects)
     assert any(isinstance(e, PushMute) and e.muted is True for e in runner.effects)
+
+
+async def test_on_ma_volume_event_skips_none_volume() -> None:
+    """
+    A transient volume_level=None must not be reported to the cloud.
+
+    Network players can report volume_level=None while acking a volume change;
+    reporting it as 0 made the Qobuz app show the renderer as muted a short
+    while after the user changed volume (live 2026-07-11). Skip until a real
+    level is known.
+    """
+    coord, runner, bridge = _coordinator()
+    bridge.player = _FakePlayer(volume_level=None, volume_muted=False)
+    await coord.on_ma_volume_event("player")
+    assert not any(isinstance(e, PushVolume) for e in runner.effects)
+    assert not any(isinstance(e, PushMute) for e in runner.effects)
 
 
 async def test_on_ma_volume_event_dedups_unchanged_volume() -> None:
