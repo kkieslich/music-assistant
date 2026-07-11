@@ -295,7 +295,15 @@ class QobuzConnectCoordinator:
         player = self._bridge.get_player(player_id)
         if player is None:
             return
-        volume = player.volume_level or 0
+        # A player can transiently report volume_level=None (network players do
+        # this while acking a volume change; BlackHole never does). The old
+        # `volume_level or 0` reported that as 0, so the Qobuz app showed the
+        # renderer as muted a short while after the user changed volume (live
+        # 2026-07-11). Never report a spurious 0 — skip until a real level is
+        # known.
+        if player.volume_level is None:
+            return
+        volume = player.volume_level
         muted = bool(player.volume_muted)
         if self._last_volume_state == (volume, muted):
             return
