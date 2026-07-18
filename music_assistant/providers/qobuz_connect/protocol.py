@@ -641,7 +641,13 @@ class QobuzConnectCodec:
         state = message.srvrRndrSetState
         event = SetStateEvent()
         if state.HasField("playingState"):
-            event.playing_state = PlayingState(state.playingState)
+            # The wire enum has values MA's PlayingState doesn't (e.g.
+            # PLAYING_STATE_UNKNOWN = 0); degrade instead of raising into
+            # the receive loop.
+            try:
+                event.playing_state = PlayingState(state.playingState)
+            except ValueError:
+                event.playing_state = None
         if state.HasField("currentPosition"):
             event.position_ms = state.currentPosition
         if state.HasField("queueVersion"):

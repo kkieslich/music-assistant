@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
+from music_assistant_models.errors import MediaNotFoundError
+
 if TYPE_CHECKING:
     from music_assistant_models.media_items import Track
 
@@ -52,17 +54,26 @@ class MetadataResolver:
         """
         Fetch an MA ``Track`` for a Qobuz track id, or ``None`` if it fails.
 
-        On failure the track id is added to the fail-cache so we don't keep
-        retrying in the same session.
+        A definitive not-found adds the id to the fail-cache so we don't keep
+        retrying it; transient failures (network blips, rate limits, the qobuz
+        provider briefly reloading) are NOT cached — blacklisting those made
+        tracks silently unplayable for the rest of a long-running session.
         """
         if track_id in self._unresolvable_track_ids:
             return None
         try:
             return await self.get_track(track_id)
-        except Exception:
+        except MediaNotFoundError:
             self._unresolvable_track_ids.add(track_id)
             self._engine.bridge.logger.warning(
                 "Ignoring unresolved Qobuz Connect cloud track %s", track_id
+            )
+            return None
+        except Exception as err:
+            self._engine.bridge.logger.warning(
+                "Qobuz Connect track %s temporarily unavailable (%s); will retry",
+                track_id,
+                err,
             )
             return None
 
@@ -84,12 +95,20 @@ class MetadataResolver:
             return False
         try:
             await self.ensure_track_duration(item)
-        except Exception:
+        except MediaNotFoundError:
             self._unresolvable_track_ids.add(item.track_id)
             self._engine.qobuz_state.duration_ms = 0
             self._engine.bridge.logger.warning(
                 "Ignoring unresolved Qobuz Connect cloud track %s",
                 item.track_id,
+            )
+            return False
+        except Exception as err:
+            self._engine.qobuz_state.duration_ms = 0
+            self._engine.bridge.logger.warning(
+                "Qobuz Connect track %s temporarily unavailable (%s); will retry",
+                item.track_id,
+                err,
             )
             return False
         return True

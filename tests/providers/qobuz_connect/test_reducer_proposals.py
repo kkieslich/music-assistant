@@ -10,6 +10,8 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     CloudTracksAdded,
     MaQueueChanged,
     MaResyncQueue,
+    Proposal,
+    ProposalKind,
     ProposalTimeout,
     PushAdd,
     PushReorder,
@@ -251,3 +253,44 @@ def test_reject_retry_reorder_translates_to_slot_ids() -> None:
     assert len(pushes) == 1
     assert pushes[0].queue_item_ids == (2, 0, 1)
     assert pushes[0].insert_after == 0
+
+
+def test_confirm_with_duplicate_track_keeps_distinct_queue_item_ids() -> None:
+    """
+    Confirming a proposal whose target repeats a track must not collapse slots.
+
+    A queue can legitimately hold the same Qobuz track twice; the cloud
+    assigns each occurrence its own queue_item_id. Folding the echo through a
+    plain qid->ref map gave every occurrence the FIRST matching ref, so
+    canonical ended up with duplicate queue_item_ids and later slot-keyed
+    commands (reorder/remove) targeted the wrong occurrence.
+    """
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0),
+        current_id=900000,
+        active=True,
+        pending=(
+            Proposal(
+                action_uuid=b"\x07" * 16,
+                base_version=QueueVersion(5, 1),
+                kind=ProposalKind.ADD,
+                # User re-added the already-queued track: same qid twice.
+                target_track_ids=(900000, 900000),
+                current_track_id=900000,
+                push_payload_ids=(900000,),
+            ),
+        ),
+    )
+    echo = CloudTracksAdded(
+        now_ms=1,
+        version=QueueVersion(6, 1),
+        action_uuid=b"\x07" * 16,
+        # Cloud assigned slot 5 to the appended duplicate.
+        tracks=(QueueTrackRef(queue_item_id=5, track_id="900000"),),
+        after_index=1,
+    )
+    result = reduce(state, echo)
+    assert result.state.pending == ()
+    item_ids = sorted(t.queue_item_id for t in result.state.tracks)
+    assert item_ids == [0, 5], f"occurrences must keep distinct slots, got {item_ids}"

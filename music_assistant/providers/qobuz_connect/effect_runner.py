@@ -24,6 +24,7 @@ verb) touches exactly one branch.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Callable
@@ -69,6 +70,12 @@ if TYPE_CHECKING:
     from .session import QobuzConnectSession
 
 LOGGER = logging.getLogger(__name__)
+
+# Resync runs while the coordinator lock is held, so metadata lookups for a
+# large queue must overlap — strictly sequential per-track HTTP fetches
+# stalled ALL event intake (including app pause/skip commands) for the whole
+# resolution. Bounded so a huge queue can't stampede the Qobuz API either.
+RESYNC_RESOLVE_CONCURRENCY = 5
 
 # Qobuz LoopMode -> MA RepeatMode string value. Kept local to this shell
 # module so it owns its own Qobuz→MA enum translation.
@@ -300,17 +307,38 @@ class EffectRunner:
             else:
                 non_qobuz_items.append(item)
 
-        final_items: list[Any] = []
-        current_index: int | None = None
+        # First pass reuses existing MA items in order; unknown tracks get a
+        # placeholder slot and are resolved concurrently below.
+        slots: list[Any | None] = []
+        missing: list[tuple[int, str]] = []
         for qid in effect.track_ids:
             track_id_str = str(qid)
             pool = ma_by_track_id.get(track_id_str)
             item = pool.pop(0) if pool else None
             if item is None:
-                track = await self._metadata.get_track_or_none(track_id_str)
-                if track is None:
-                    continue
-                item = QueueItem.from_media_item(pid, track)
+                missing.append((len(slots), track_id_str))
+            slots.append(item)
+
+        if missing:
+            semaphore = asyncio.Semaphore(RESYNC_RESOLVE_CONCURRENCY)
+            metadata = self._metadata
+
+            async def _resolve(track_id_str: str) -> Any | None:
+                async with semaphore:
+                    track = await metadata.get_track_or_none(track_id_str)
+                return None if track is None else QueueItem.from_media_item(pid, track)
+
+            resolved = await asyncio.gather(
+                *(_resolve(track_id_str) for _slot, track_id_str in missing)
+            )
+            for (slot, _track_id_str), item in zip(missing, resolved, strict=True):
+                slots[slot] = item
+
+        final_items: list[Any] = []
+        current_index: int | None = None
+        for qid, item in zip(effect.track_ids, slots, strict=True):
+            if item is None:
+                continue
             if effect.current_track_id == qid and current_index is None:
                 current_index = len(final_items)
             final_items.append(item)

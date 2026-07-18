@@ -97,6 +97,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from .effect_runner import EffectRunner
+    from .flight_recorder import FlightRecorder
     from .ma_bridge import MABridge
 
 LOGGER = logging.getLogger(__name__)
@@ -147,6 +148,8 @@ class QobuzConnectCoordinator:
         device_uuid: bytes,
         controller_enabled: bool = True,
         now: Callable[[], int] = lambda: int(time.time() * 1000),
+        recorder: FlightRecorder | None = None,
+        unresolvable_getter: Callable[[], frozenset[str]] = frozenset,
     ) -> None:
         """
         Bind the coordinator to its collaborators.
@@ -158,12 +161,20 @@ class QobuzConnectCoordinator:
         :param controller_enabled: When ``False``, MA-side entry points no-op instead
             of emitting cloud pushes — inbound cloud events still process normally.
         :param now: Wall-clock-ms provider for event timestamps; injectable for tests.
+        :param recorder: Optional flight recorder fed one entry per reduced event.
+        :param unresolvable_getter: Returns the track ids (as strings) the metadata
+            resolver has marked unfetchable — everything else counts as resolvable
+            when diffing MA's queue against canonical.
         """
         self._runner = runner
         self._bridge = bridge
         self._device_uuid = device_uuid
         self._controller_enabled = controller_enabled
         self._now = now
+        self._recorder = recorder
+        self._unresolvable_getter = unresolvable_getter
+        self._closed = False
+        self._timeout_tasks: set[asyncio.Task[None]] = set()
         self._state = CanonicalState()
         self._lock = asyncio.Lock()
         self._last_track_index = 0
@@ -182,6 +193,21 @@ class QobuzConnectCoordinator:
     def own_rid_getter(self) -> int | None:
         """Return this renderer's own Qobuz renderer id, for ``EffectRunner``'s ``own_rid_getter``."""
         return self._state.own_rid
+
+    def close(self) -> None:
+        """
+        Stop all timer activity — call on provider unload.
+
+        Cancels every live proposal timer and in-flight timeout submission and
+        prevents new ones, so a zombie coordinator can never fire effects
+        against MA or a dead session after the provider is gone.
+        """
+        self._closed = True
+        for handle in self._timers.values():
+            handle.cancel()
+        self._timers.clear()
+        for task in self._timeout_tasks:
+            task.cancel()
 
     def build_session_callbacks(self) -> SessionCallbacks:
         """Build the ``SessionCallbacks`` bundle that translates cloud messages into events."""
@@ -227,6 +253,22 @@ class QobuzConnectCoordinator:
                 continue
             track_ids.append(qid)
             resolvable.add(qid)
+        # Resolvability is a property of the TRACK (can MA materialize it?),
+        # not of the current queue contents. Canonical tracks the metadata
+        # resolver never failed on count as resolvable even when absent from
+        # MA's queue — that absence is exactly what a user-driven removal
+        # looks like, and deriving resolvable from the queue alone made
+        # removals invisible to the differ (the cloud then re-added the
+        # track on the next resync).
+        unresolvable = {
+            qid
+            for raw in self._unresolvable_getter()
+            if (qid := try_parse_qobuz_id(raw)) is not None
+        }
+        for ref in self._state.tracks:
+            qid = try_parse_qobuz_id(ref.track_id)
+            if qid is not None and qid not in unresolvable:
+                resolvable.add(qid)
         current_track_id = None
         queue = self._bridge.get_queue(player_id)
         if queue is not None and queue.current_item is not None:
@@ -321,8 +363,22 @@ class QobuzConnectCoordinator:
     async def _submit(self, event: Event) -> None:
         """Serialize one event through ``reduce()``, store the result, run its effects in order."""
         async with self._lock:
-            result = reduce(self._state, event)
+            try:
+                result = reduce(self._state, event)
+            except Exception as err:
+                # The reducer is pure and should never raise; if it does, make
+                # sure the flight recorder captures the trigger before the
+                # exception propagates into the session's receive loop.
+                if self._recorder is not None:
+                    self._recorder.record_reduce_failure(event, err)
+                raise
             self._state = result.state
+            if self._recorder is not None:
+                self._recorder.record_reduce(event, result)
+            if isinstance(event, Disconnected):
+                # The cloud forgets our reported volume with the session;
+                # drop the dedup so the level is re-sent after reconnect.
+                self._last_volume_state = None
             if LOGGER.isEnabledFor(logging.DEBUG):
                 state = result.state
                 LOGGER.debug(
@@ -540,6 +596,8 @@ class QobuzConnectCoordinator:
         pending_uuids = {p.action_uuid for p in self._state.pending}
         for action_uuid in [uid for uid in self._timers if uid not in pending_uuids]:
             self._timers.pop(action_uuid).cancel()
+        if self._closed:
+            return
         loop = asyncio.get_running_loop()
         for proposal in self._state.pending:
             if proposal.action_uuid in self._timers:
@@ -551,6 +609,12 @@ class QobuzConnectCoordinator:
     def _fire_proposal_timeout(self, action_uuid: bytes) -> None:
         """``call_later`` callback: drop the timer and submit ``ProposalTimeout``."""
         self._timers.pop(action_uuid, None)
-        asyncio.get_running_loop().create_task(
+        if self._closed:
+            return
+        # Hold a strong reference: asyncio only weak-refs scheduled tasks, so
+        # a bare create_task here could be garbage-collected mid-flight.
+        task = asyncio.get_running_loop().create_task(
             self._submit(ProposalTimeout(now_ms=self._now(), action_uuid=action_uuid))
         )
+        self._timeout_tasks.add(task)
+        task.add_done_callback(self._timeout_tasks.discard)

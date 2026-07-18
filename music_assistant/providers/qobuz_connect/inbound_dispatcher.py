@@ -100,7 +100,17 @@ class InboundDispatcher:
         msg_type = msg.messageType
         handler = self._HANDLER_TABLE.get(msg_type)
         if handler is not None:
-            await handler(self, msg)
+            # Containment boundary: dispatch runs inline in the session's
+            # receive loop, so a raising parser/translator/reducer used to
+            # tear down the whole websocket — and since the cloud re-pushes
+            # current state on reconnect, one poison message meant reconnect
+            # churn. One bad message must never cost the connection.
+            try:
+                await handler(self, msg)
+            except Exception:
+                self._logger.exception(
+                    "Error handling Qobuz Connect message type %s; message skipped", msg_type
+                )
             return
         if msg_type in _KNOWN_IGNORED_MESSAGE_TYPES:
             self._logger.debug("Qobuz broadcast ignored: type=%s", msg_type)

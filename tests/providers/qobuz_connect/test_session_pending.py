@@ -6,6 +6,7 @@ import dataclasses
 import time
 import uuid
 
+import music_assistant.providers.qobuz_connect.session as session_module
 from music_assistant.providers.qobuz_connect.models import DeviceConfig, JWTConnectToken
 from music_assistant.providers.qobuz_connect.session import (
     PENDING_MAX_AGE,
@@ -77,3 +78,20 @@ async def test_flush_drops_stale_frames() -> None:
 
     assert fake.sent == [b"fresh-frame"]
     assert session._pending_messages == []
+
+
+async def test_pending_queue_is_bounded_while_disconnected() -> None:
+    """
+    An extended outage must not grow the pending-frame queue without limit.
+
+    Only the last ~2s of frames survive the reconnect flush anyway; keeping
+    every heartbeat frame of a multi-hour WAN outage was pure memory growth.
+    """
+    session = _session()
+    for i in range(session_module.MAX_PENDING_MESSAGES + 25):
+        await session.send_message(bytes([i % 251]))
+    assert len(session._pending_messages) == session_module.MAX_PENDING_MESSAGES
+    # Newest frames are the ones kept.
+    assert session._pending_messages[-1][1] == bytes(
+        [(session_module.MAX_PENDING_MESSAGES + 24) % 251]
+    )

@@ -645,3 +645,26 @@ def test_encode_ask_for_queue_state_round_trip() -> None:
     assert ask.queueVersion.major == 17
     assert ask.queueVersion.minor == 1
     assert ask.queueUuid == ACTION_UUID
+
+
+def test_parse_set_state_survives_unknown_playing_state() -> None:
+    """
+    A playingState outside MA's ``PlayingState`` must degrade to None, not raise.
+
+    The wire enum carries ``PLAYING_STATE_UNKNOWN = 0``, which MA's
+    ``PlayingState`` (1..3) does not — parse_set_state runs inside the
+    websocket receive loop, and a raising parser used to tear down the whole
+    connection; since the cloud re-pushes the current state on reconnect, one
+    such value meant reconnect churn until that state changed.
+    """
+    message = payload_pb2.QConnectMessage()
+    message.messageType = QConnectMessageType.SRVR_RNDR_SET_STATE
+    state = message.srvrRndrSetState
+    state.playingState = 0  # PLAYING_STATE_UNKNOWN
+    state.currentPosition = 5_000
+
+    event = QobuzConnectCodec.parse_set_state(message)
+
+    assert event is not None
+    assert event.playing_state is None
+    assert event.position_ms == 5_000
