@@ -55,7 +55,7 @@ def _to_bytes(data: dict[str, int] | str | None) -> bytes | None:
     if isinstance(data, dict):
         try:
             return bytes(data[str(k)] for k in range(len(data)))
-        except (KeyError, ValueError):
+        except KeyError, ValueError:
             return None
     return None
 

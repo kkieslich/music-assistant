@@ -302,7 +302,7 @@ def _decode_payload(payload_data: str, opcode: int) -> bytes:
     if opcode != 1:
         try:
             return base64.b64decode(payload_data, validate=True)
-        except (binascii.Error, ValueError):
+        except binascii.Error, ValueError:
             return payload_data.encode("latin1", errors="replace")
     # opcode == 1 (text): the existing captures show binary-looking content
     # was sometimes preserved here. Try base64 first because some Chromium
@@ -310,7 +310,7 @@ def _decode_payload(payload_data: str, opcode: int) -> bytes:
     # the bytes as-encoded.
     try:
         decoded = base64.b64decode(payload_data, validate=True)
-    except (binascii.Error, ValueError):
+    except binascii.Error, ValueError:
         decoded = None
     if decoded is not None and len(decoded) > 0:
         return decoded

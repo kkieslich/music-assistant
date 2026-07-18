@@ -92,9 +92,19 @@ class AudioProbe:
         """
         proc = subprocess.run(  # noqa: S603 - fixed ffmpeg argv, no user input
             [
-                _FFMPEG, "-hide_banner", "-f", "avfoundation",
-                "-i", f":{self.device_index()}",
-                "-t", f"{seconds}", "-af", "volumedetect", "-f", "null", "-",
+                _FFMPEG,
+                "-hide_banner",
+                "-f",
+                "avfoundation",
+                "-i",
+                f":{self.device_index()}",
+                "-t",
+                f"{seconds}",
+                "-af",
+                "volumedetect",
+                "-f",
+                "null",
+                "-",
             ],
             capture_output=True,
             text=True,
