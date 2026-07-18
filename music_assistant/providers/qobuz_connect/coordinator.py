@@ -412,7 +412,6 @@ class QobuzConnectCoordinator:
                 playing=event.playing_state,
                 position_ms=event.position_ms,
                 current_ref=event.current_item,
-                next_ref=event.next_item,
             )
         )
 
@@ -474,9 +473,6 @@ class QobuzConnectCoordinator:
                 version=event.queue_version,
                 action_uuid=event.action_uuid,
                 tracks=tuple(event.tracks),
-                # QueueTracksAddedEvent carries no explicit position — an ADD
-                # always appends, so the pre-event track count is the anchor.
-                after_index=len(self._state.tracks),
             )
         )
 

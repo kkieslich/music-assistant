@@ -150,7 +150,6 @@ async def test_snapshot_then_activate_takes_over() -> None:
             playing=PlayingState.PLAYING,
             position_ms=500,
             current_ref=_refs(2)[0],
-            next_ref=None,
         )
     )
     await coord._submit(CloudSetActive(now_ms=3, active=True))
@@ -187,7 +186,6 @@ async def test_ma_append_pushes_add_and_cloud_echo_confirms() -> None:
             version=QueueVersion(6, 1),
             action_uuid=proposal.action_uuid,
             tracks=(QueueTrackRef(queue_item_id=1, track_id="101"),),
-            after_index=1,
         )
     )
     pending_after = coord.state.pending
@@ -307,7 +305,6 @@ async def test_timer_cancelled_on_confirm() -> None:
             version=QueueVersion(6, 1),
             action_uuid=proposal.action_uuid,
             tracks=(QueueTrackRef(queue_item_id=1, track_id="101"),),
-            after_index=1,
         )
     )
     assert coord.state.pending == ()
@@ -337,7 +334,6 @@ async def test_timer_fires_and_converges(monkeypatch: pytest.MonkeyPatch) -> Non
             playing=PlayingState.PLAYING,
             position_ms=0,
             current_ref=_refs(0)[0],
-            next_ref=None,
         )
     )
     await coord._submit(CloudSetActive(now_ms=3, active=True))

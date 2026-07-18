@@ -64,11 +64,7 @@ def test_own_echo_confirms_and_does_not_resync_ma() -> None:
     r2 = reduce(
         r1.state,
         CloudTracksAdded(
-            now_ms=2,
-            version=QueueVersion(6, 1),
-            action_uuid=b"\xaa" * 16,
-            tracks=_refs(2),
-            after_index=2,
+            now_ms=2, version=QueueVersion(6, 1), action_uuid=b"\xaa" * 16, tracks=_refs(2)
         ),
     )
     assert tuple(t.queue_item_id for t in r2.state.tracks) == (0, 1, 2)
@@ -187,7 +183,6 @@ def test_confirm_add_uses_real_item_ids_from_echo() -> None:
             version=QueueVersion(6, 1),
             action_uuid=b"\xaa" * 16,
             tracks=(QueueTrackRef(queue_item_id=2, track_id="900002"),),
-            after_index=2,
         ),
     )
     confirmed = r2.state.tracks[-1]
@@ -288,7 +283,6 @@ def test_confirm_with_duplicate_track_keeps_distinct_queue_item_ids() -> None:
         action_uuid=b"\x07" * 16,
         # Cloud assigned slot 5 to the appended duplicate.
         tracks=(QueueTrackRef(queue_item_id=5, track_id="900000"),),
-        after_index=1,
     )
     result = reduce(state, echo)
     assert result.state.pending == ()

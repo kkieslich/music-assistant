@@ -15,7 +15,6 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     MaSetShuffleFlag,
     MaSetVolume,
     MaVolumeChanged,
-    PushAutoplay,
     PushLoop,
     PushVolume,
 )
@@ -31,15 +30,16 @@ def test_cloud_loop_updates_canonical_and_ma() -> None:
     assert any(isinstance(e, MaSetLoop) for e in result.effects)
 
 
-def test_ma_modes_change_pushes_only_changed_flags() -> None:
-    """An MA loop+autoplay change pushes each flag that actually differs."""
+def test_ma_modes_change_pushes_loop_and_tracks_autoplay() -> None:
+    """An MA loop change pushes PushLoop; autoplay only updates canonical (no cloud verb)."""
     state = CanonicalState(loop=LoopMode.OFF, autoplay=False, active=True)
     result = reduce(
         state,
         MaModesChanged(now_ms=1, action_uuid=b"\xbb" * 16, loop=LoopMode.REPEAT_ONE, autoplay=True),
     )
     assert any(isinstance(e, PushLoop) for e in result.effects)
-    assert any(isinstance(e, PushAutoplay) for e in result.effects)
+    assert result.state.autoplay is True
+    assert all(isinstance(e, PushLoop) for e in result.effects)
 
 
 def test_cloud_volume_drives_ma() -> None:
@@ -55,14 +55,13 @@ def test_ma_volume_pushes_to_cloud() -> None:
 
 
 def test_ma_modes_change_pushes_only_the_changed_flag() -> None:
-    """Only loop changed -> PushLoop present, PushAutoplay absent."""
+    """Only loop changed -> PushLoop present, autoplay unchanged."""
     state = CanonicalState(loop=LoopMode.OFF, autoplay=True, active=True)
     result = reduce(
         state,
         MaModesChanged(now_ms=1, action_uuid=b"\xbb" * 16, loop=LoopMode.REPEAT_ONE, autoplay=True),
     )
     assert any(isinstance(e, PushLoop) for e in result.effects)
-    assert not any(isinstance(e, PushAutoplay) for e in result.effects)
     assert result.state.loop is LoopMode.REPEAT_ONE
 
 

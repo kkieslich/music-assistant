@@ -120,7 +120,6 @@ class CloudTracksAdded:
     version: QueueVersion
     action_uuid: bytes
     tracks: tuple[QueueTrackRef, ...]
-    after_index: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -216,7 +215,6 @@ class CloudSetState:
     playing: PlayingState | None
     position_ms: int | None
     current_ref: QueueTrackRef | None
-    next_ref: QueueTrackRef | None
 
 
 @dataclass(slots=True, frozen=True)
@@ -417,13 +415,6 @@ class MaVolumeChanged:
 
 
 @dataclass(slots=True, frozen=True)
-class Connected:
-    """WebSocket connected."""
-
-    now_ms: int
-
-
-@dataclass(slots=True, frozen=True)
 class Disconnected:
     """WebSocket disconnected."""
 
@@ -518,21 +509,6 @@ class PushLoop:
     """Push loop mode change to cloud."""
 
     loop: LoopMode
-
-
-@dataclass(slots=True, frozen=True)
-class PushShuffle:
-    """Push shuffle mode change to cloud."""
-
-    shuffle: bool
-    base_version: QueueVersion
-
-
-@dataclass(slots=True, frozen=True)
-class PushAutoplay:
-    """Push autoplay mode change to cloud."""
-
-    autoplay: bool
 
 
 @dataclass(slots=True, frozen=True)
@@ -674,7 +650,6 @@ Event = (
     | MaTransportChanged
     | MaModesChanged
     | MaVolumeChanged
-    | Connected
     | Disconnected
     | ProposalTimeout
 )
@@ -689,8 +664,6 @@ Effect = (
     | PushSetActive
     | PushPlayerState
     | PushLoop
-    | PushShuffle
-    | PushAutoplay
     | PushVolume
     | PushMute
     | PushQuality

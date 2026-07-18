@@ -40,7 +40,6 @@ from .sync_types import (
     CloudVersionChanged,
     CloudVolume,
     CloudVolumeDelta,
-    Connected,
     Disconnected,
     Effect,
     Event,
@@ -61,7 +60,6 @@ from .sync_types import (
     ProposalKind,
     ProposalTimeout,
     PushAdd,
-    PushAutoplay,
     PushClear,
     PushInsert,
     PushLoad,
@@ -87,7 +85,6 @@ _TRANSPORT_INBOUND = (
     CloudAddRenderer,
     CloudRemoveRenderer,
     MaTransportChanged,
-    Connected,
     Disconnected,
     CloudLoadAck,
 )
@@ -348,8 +345,6 @@ def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
         return ReduceResult(dataclasses.replace(state, own_rid=event.renderer_id), ())
     if isinstance(event, CloudRemoveRenderer):
         return _remove_renderer(state, event)
-    if isinstance(event, Connected):
-        return ReduceResult(state, ())
     if isinstance(event, Disconnected):
         # Reset the ask-dedup so a reconnect re-seeds a fresh snapshot rather
         # than trusting a possibly-stale last_asked_version. cloud_version is
@@ -412,8 +407,9 @@ def _ma_modes_changed(state: CanonicalState, event: MaModesChanged) -> ReduceRes
         new = dataclasses.replace(new, loop=event.loop)
         effects.append(PushLoop(event.loop))
     if event.autoplay != state.autoplay:
+        # Track MA's autoplay flag in canonical, but there is no cloud push:
+        # the Qobuz session protocol exposes no renderer->cloud autoplay verb.
         new = dataclasses.replace(new, autoplay=event.autoplay)
-        effects.append(PushAutoplay(event.autoplay))
     return ReduceResult(new, tuple(effects))
 
 

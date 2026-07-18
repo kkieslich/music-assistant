@@ -53,7 +53,6 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     CloudTracksReordered,
     CloudVersionChanged,
     CloudVolume,
-    Connected,
     Disconnected,
     Event,
     MaModesChanged,
@@ -120,7 +119,7 @@ class _EventStorm:
             + ["set_active", "add_renderer", "remove_renderer", "active_changed"]
             + ["loop", "shuffle", "autoplay", "volume", "mute", "quality"]
             + ["ma_queue", "ma_modes", "ma_volume"]
-            + ["connected", "disconnected", "proposal_timeout", "state_request"]
+            + ["disconnected", "proposal_timeout", "state_request"]
         )
         event = (
             self._transport_session_event(choice, state, now)
@@ -142,7 +141,6 @@ class _EventStorm:
                 playing=self.rng.choice([None, *PlayingState]),
                 position_ms=self.rng.choice([None, self.rng.randint(0, 400_000)]),
                 current_ref=ref,
-                next_ref=None,
             )
         if choice == "ma_transport":
             return MaTransportChanged(
@@ -176,8 +174,6 @@ class _EventStorm:
             return CloudRemoveRenderer(now_ms=now, renderer_id=self.rng.randint(1, 5))
         if choice == "active_changed":
             return CloudActiveRendererChanged(now_ms=now, renderer_id=self.rng.randint(1, 5))
-        if choice == "connected":
-            return Connected(now_ms=now)
         if choice == "disconnected":
             return Disconnected(now_ms=now)
         if choice == "proposal_timeout":
@@ -210,7 +206,6 @@ class _EventStorm:
                 version=self._some_version(),
                 action_uuid=self._uuid(),
                 tracks=self._refs(5),
-                after_index=len(state.tracks),
             )
         if choice == "inserted":
             return CloudTracksInserted(

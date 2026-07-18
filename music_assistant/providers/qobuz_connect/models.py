@@ -32,11 +32,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import asyncio
-    from typing import Any
 
 OAUTH_APP_ID = "304027809"
 
@@ -390,35 +385,3 @@ class QobuzMirror:
     # renderer-directed SET_STATE with track refs, so this is how we know
     # which track to take over on activation.
     track_index: int = 0
-
-
-class OutboundActionKind(StrEnum):
-    """Kind of queue mutation we sent to the Qobuz cloud and now expect to echo back."""
-
-    LOAD = "load"
-    ADD = "add"
-    INSERT = "insert"
-    REMOVE = "remove"
-    REORDER = "reorder"
-    CLEAR = "clear"
-    SHUFFLE = "shuffle"
-    LOOP = "loop"
-
-
-@dataclass(slots=True)
-class OutboundActionMeta:
-    """
-    Ledger entry for a queue-mutation command we initiated.
-
-    The cloud echoes ``CTRL_SRVR_QUEUE_*`` commands back as their
-    ``SRVR_CTRL_QUEUE_*`` counterpart with the same ``action_uuid``.
-    When we see our own action_uuid come back we still update the
-    mirror (the cloud assigns ``queue_item_id``s on add/insert) but
-    skip the inbound MA reconciler — MA's queue already reflects
-    the change because we originated it.
-    """
-
-    kind: OutboundActionKind
-    queue_version: QueueVersion
-    expires_at: float
-    future: asyncio.Future[Any] | None = None

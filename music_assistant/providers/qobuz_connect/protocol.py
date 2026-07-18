@@ -451,27 +451,6 @@ class QobuzConnectCodec:
         msg.ctrlSrvrAutoplayLoadTracks.CopyFrom(autoplay_load)
         return self._encode_batch(msg)
 
-    def encode_player_state(
-        self,
-        *,
-        playing_state: PlayingState,
-        position_ms: int,
-        queue_version: QueueVersion,
-        queue_item_id: int,
-    ) -> bytes:
-        """Encode controller player-state command."""
-        state = payload_pb2.CtrlSrvrSetPlayerState()
-        state.playingState = int(playing_state)
-        state.currentPosition = position_ms
-        state.currentQueueItem.queueVersion.major = queue_version.major
-        state.currentQueueItem.queueVersion.minor = queue_version.minor
-        state.currentQueueItem.id = queue_item_id
-
-        msg = payload_pb2.QConnectMessage()
-        msg.messageType = QConnectMessageType.CTRL_SRVR_SET_PLAYER_STATE
-        msg.ctrlSrvrSetPlayerState.CopyFrom(state)
-        return self._encode_batch(msg)
-
     def encode_ctrl_set_player_state(
         self,
         *,
