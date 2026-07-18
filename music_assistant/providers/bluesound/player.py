@@ -111,7 +111,7 @@ class BluesoundPlayer(Player):
         if self._listen_task and not self._listen_task.done():
             self._listen_task.cancel()
         if self.client:
-            await self.client.close()
+            await self.client.close()  # type: ignore[no-untyped-call]
         self.connected = False
         self.logger.debug("Disconnected from player API")
 

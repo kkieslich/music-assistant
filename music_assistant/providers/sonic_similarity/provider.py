@@ -950,7 +950,7 @@ class SonicSimilarityPlugin(PluginProvider):
     @staticmethod
     def _make_empty_index() -> Any:
         """Return a fresh, empty USearch HNSW index sized for our 18-dim cosine space."""
-        from usearch.index import (  # type: ignore[attr-defined]  # noqa: PLC0415
+        from usearch.index import (  # noqa: PLC0415
             Index,
             MetricKind,
             ScalarKind,
