@@ -454,20 +454,27 @@ def test_auto_target_repins_when_pinned_player_disappears() -> None:
     assert provider.get_target_player_id() == "p2"
 
 
-def test_missing_configured_player_warns_once() -> None:
+def test_missing_configured_player_falls_back_to_auto_and_warns_once() -> None:
     """
-    A vanished pinned player must not warn on every event of every player.
+    A pinned target that no longer resolves must fall back to auto, not kill playback.
 
-    The subscriptions are unfiltered, so this warning used to fire several
-    times per second for days — a log flood that buried real errors.
+    A stale/offline pinned target (seen live after MA's player-id scheme drifted
+    from ``up<hex>`` to a dashed uuid) used to return ``None`` from
+    ``get_target_player_id``, so ``MaPlayTrack``/``MaResyncQueue`` were dropped
+    with "no target player configured" and the receiver went active-but-silent —
+    "connect, press play, nothing happens". Now it warns once, then resolves an
+    available player so playback still works. The warning must fire once, not on
+    every unfiltered MA event (a log flood otherwise).
     """
     provider, mass = _make_provider()
     provider._target_player_id = "gone"
-    mass.players.get_player.side_effect = lambda _pid: None
+    fallback = _fake_player("fallback_1")
+    mass.players.all_players.return_value = [fallback]
+    mass.players.get_player.side_effect = lambda pid: fallback if pid == "fallback_1" else None
     provider.logger = MagicMock()
 
-    assert provider.get_target_player_id() is None
-    assert provider.get_target_player_id() is None
+    assert provider.get_target_player_id() == "fallback_1"
+    assert provider.get_target_player_id() == "fallback_1"
     assert provider.logger.warning.call_count == 1
 
 

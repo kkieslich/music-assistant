@@ -369,20 +369,26 @@ class QobuzConnectProvider(PluginProvider):
         return self._session
 
     def get_target_player_id(self) -> str | None:
-        """Resolve configured target player."""
+        """Resolve configured target player, falling back to auto if a pinned one is gone."""
         if self._target_player_id != PLAYER_ID_AUTO:
             if self.mass.players.get_player(self._target_player_id):
                 self._warned_missing_target = None
                 return self._target_player_id
-            # Warn once per disappearance: this resolver runs on every MA
-            # event of every player, so an unconditional warning flooded the
-            # log for as long as the player stayed gone.
+            # A pinned target that no longer resolves must NOT silently kill
+            # playback: a stale saved id (e.g. MA's player-id scheme drifted, or
+            # the player is briefly offline) previously returned None, so every
+            # MaPlayTrack/MaResyncQueue was dropped and the receiver went
+            # active-but-silent ("connect, press play, nothing happens"). Warn
+            # once per disappearance (this runs on every MA event, so an
+            # unconditional warning floods the log) and fall through to
+            # auto-resolution so the receiver still plays somewhere.
             if self._warned_missing_target != self._target_player_id:
                 self._warned_missing_target = self._target_player_id
                 self.logger.warning(
-                    "Configured target player no longer exists: %s", self._target_player_id
+                    "Configured target player %s no longer exists; falling back to "
+                    "auto-resolving an available player",
+                    self._target_player_id,
                 )
-            return None
 
         # While the Connect session is ACTIVE the resolved target is pinned:
         # re-resolving "any PLAYING player, else first" on every event meant a

@@ -34,7 +34,9 @@ if TYPE_CHECKING:
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 # The silent BlackHole player MA renders to during integration runs.
-_BLACKHOLE = "upb97b9910b8fe5ff0946cef06b0d44273"
+# NOTE: MA's player-id scheme drifted from the old ``up<hex>`` form to a
+# dashed uuid; keep this in sync with what ``Local Audio Out`` registers.
+_BLACKHOLE = "b97b9910-b8fe-5ff0-946c-ef06b0d44273"
 
 # Strip terminal colour codes MA emits so the regexes match cleanly.
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
