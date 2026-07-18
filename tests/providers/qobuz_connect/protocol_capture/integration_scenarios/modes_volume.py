@@ -69,9 +69,7 @@ async def scenario_volume(session: IntegrationSession) -> ScenarioResult:
     for attempt in range(3):
         cursor = session.ma.cursor()
         await session.q.set_volume_percent(30 + attempt * 10)
-        ev = session.ma.wait_for_event(
-            cursor, lambda e: "MaSetVolume" in e.effects(), timeout=12.0
-        )
+        ev = session.ma.wait_for_event(cursor, lambda e: "MaSetVolume" in e.effects(), timeout=12.0)
         if "MaSetVolume" in ev.effects():
             got = True
             break

@@ -49,7 +49,11 @@ async def _mint() -> int:
             msg = await asyncio.wait_for(ws.receive_json(), timeout=8)
             if isinstance(msg, dict) and msg.get("message_id") == "login":
                 result = msg.get("result")
-                if msg.get("error_code") or not isinstance(result, dict) or not result.get("success"):
+                if (
+                    msg.get("error_code")
+                    or not isinstance(result, dict)
+                    or not result.get("success")
+                ):
                     detail = result.get("error") if isinstance(result, dict) else msg.get("details")
                     print(f"login failed: {detail}", file=sys.stderr)  # noqa: T201
                     return 1
