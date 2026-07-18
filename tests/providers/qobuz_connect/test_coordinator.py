@@ -33,6 +33,7 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     PushLoop,
     PushMute,
     PushPlayerState,
+    PushRemove,
     PushVolume,
     ReportState,
 )
@@ -577,7 +578,12 @@ async def test_ma_removal_is_detected_via_unresolvable_getter() -> None:
     # User removed the middle track in MA's UI.
     bridge.items = [{"track_id": "100"}, {"track_id": "102"}]
     await coord.on_ma_queue_event("player_1")
-    assert any(isinstance(e, PushLoad) for e in runner.effects), runner.effects
+    # A pure removal is a native REMOVE (of the middle slot, queue_item_id=1),
+    # not a full-queue LOAD.
+    removes = [e for e in runner.effects if isinstance(e, PushRemove)]
+    assert removes, runner.effects
+    assert removes[0].queue_item_ids == (1,)
+    assert not any(isinstance(e, PushLoad) for e in runner.effects)
 
 
 async def test_ma_removal_of_unresolvable_track_is_not_a_change() -> None:

@@ -9,6 +9,7 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     MaQueueChanged,
     ProposalKind,
     PushAdd,
+    PushRemove,
     PushReorder,
 )
 
@@ -72,6 +73,77 @@ def test_unresolvable_subsequence_is_not_a_removal() -> None:
         ),
     )
     assert result.state.pending == ()
+
+
+def test_removal_detected_as_remove_not_load() -> None:
+    """A pure removal (subsequence of canonical) -> REMOVE proposal + PushRemove of the slot."""
+    result = reduce(
+        _state(),
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xaa" * 16,
+            track_ids=(900000, 900002),  # dropped the middle track
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001, 900002}),
+        ),
+    )
+    assert len(result.state.pending) == 1
+    proposal = result.state.pending[0]
+    assert proposal.kind is ProposalKind.REMOVE
+    # target stays the survivor list; the removed qid rides push_payload_ids.
+    assert proposal.target_track_ids == (900000, 900002)
+    assert proposal.push_payload_ids == (900001,)
+    push = result.effects[0]
+    assert isinstance(push, PushRemove)
+    # 900001 lives in cloud slot 1 -> that's the queue_item_id removed.
+    assert push.queue_item_ids == (1,)
+
+
+def test_removal_of_duplicate_removes_only_one_occurrence() -> None:
+    """Dropping one of two identical tracks removes a single slot, not both."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=(
+            QueueTrackRef(queue_item_id=0, track_id="900000"),
+            QueueTrackRef(queue_item_id=1, track_id="900000"),
+            QueueTrackRef(queue_item_id=2, track_id="900002"),
+        ),
+        current_id=900000,
+        active=True,
+    )
+    result = reduce(
+        state,
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xaa" * 16,
+            track_ids=(900000, 900002),  # one of the two 900000s is gone
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900002}),
+        ),
+    )
+    assert len(result.state.pending) == 1
+    proposal = result.state.pending[0]
+    assert proposal.kind is ProposalKind.REMOVE
+    assert proposal.push_payload_ids == (900000,)  # exactly one occurrence
+    push = result.effects[0]
+    assert isinstance(push, PushRemove)
+    assert push.queue_item_ids == (0,)  # first matching slot
+
+
+def test_removal_plus_reorder_falls_back_to_load() -> None:
+    """A removal combined with a reorder is not a clean subsequence -> LOAD."""
+    result = reduce(
+        _state(),
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xaa" * 16,
+            track_ids=(900002, 900000),  # dropped 900001 AND reordered
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001, 900002}),
+        ),
+    )
+    assert len(result.state.pending) == 1
+    assert result.state.pending[0].kind is ProposalKind.LOAD
 
 
 def test_genuine_new_load_detected() -> None:
