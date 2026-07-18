@@ -26,6 +26,10 @@ DEVICE_UUID = uuid.UUID("11111111-2222-3333-4444-555555555555").bytes
 SESSION_UUID = uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").bytes
 ACTION_UUID = uuid.UUID("12345678-1234-5678-1234-567812345678").bytes
 
+# The parse_* methods build sync_types events off an instance clock now, so
+# tests call them on a shared codec instead of statically.
+_CODEC = QobuzConnectCodec(DEVICE_UUID, now=lambda: 111)
+
 
 def _first_inner_message(frame: bytes) -> Any:
     codec = QobuzConnectCodec(DEVICE_UUID)
@@ -169,38 +173,32 @@ def test_parse_full_set_state() -> None:
     state.nextQueueItem.queueItemId = 12
     state.nextQueueItem.trackId = 402777208
 
-    event = QobuzConnectCodec.parse_set_state(message)
+    event = _CODEC.parse_set_state(message)
 
     assert event is not None
-    assert event.playing_state == PlayingState.PLAYING
+    assert event.playing == PlayingState.PLAYING
     assert event.position_ms == 12_345
-    assert event.queue_version == QueueVersion(15, 1)
-    assert event.current_item is not None
-    assert event.current_item.queue_item_id == 11
-    assert event.current_item.track_id == "376286112"
-    assert event.current_item.context_uuid == SESSION_UUID
-    assert event.next_item is not None
-    assert event.next_item.queue_item_id == 12
-    assert event.next_item.track_id == "402777208"
+    assert event.version == QueueVersion(15, 1)
+    assert event.current_ref is not None
+    assert event.current_ref.queue_item_id == 11
+    assert event.current_ref.track_id == "376286112"
+    assert event.current_ref.context_uuid == SESSION_UUID
 
 
-def test_parse_set_state_ignores_empty_next_track_sentinel() -> None:
-    """Qobuz uses max uint values to mean there is no next queue item."""
+def test_parse_set_state_exposes_current_ref() -> None:
+    """SET_STATE surfaces the current queue item (the next item is no longer tracked)."""
     message = payload_pb2.QConnectMessage()
     message.messageType = QConnectMessageType.SRVR_RNDR_SET_STATE
     state = message.srvrRndrSetState
     state.playingState = PlayingState.PAUSED
     state.currentQueueItem.queueItemId = 0
     state.currentQueueItem.trackId = 370969289
-    state.nextQueueItem.queueItemId = 0xFFFFFFFFFFFFFFFF
-    state.nextQueueItem.trackId = 0xFFFFFFFF
 
-    event = QobuzConnectCodec.parse_set_state(message)
+    event = _CODEC.parse_set_state(message)
 
     assert event is not None
-    assert event.current_item is not None
-    assert event.current_item.track_id == "370969289"
-    assert event.next_item is None
+    assert event.current_ref is not None
+    assert event.current_ref.track_id == "370969289"
 
 
 def test_parse_queue_ack() -> None:
@@ -216,13 +214,12 @@ def test_parse_queue_ack() -> None:
     ack.tracks.add(queueItemId=21, trackId=111)
     ack.tracks.add(queueItemId=22, trackId=222)
 
-    parsed_ack = QobuzConnectCodec.parse_queue_load_ack(ack_msg)
+    parsed_ack = _CODEC.parse_queue_load_ack(ack_msg)
 
     assert parsed_ack is not None
     assert parsed_ack.action_uuid == ACTION_UUID
-    assert parsed_ack.queue_version == QueueVersion(7, 3)
+    assert parsed_ack.version == QueueVersion(7, 3)
     assert parsed_ack.queue_position == 1
-    assert parsed_ack.qobuz_reference_id == 376286112
     assert [track.queue_item_id for track in parsed_ack.tracks] == [21, 22]
     assert [track.track_id for track in parsed_ack.tracks] == ["111", "222"]
 
@@ -237,11 +234,11 @@ def test_parse_autoplay_ack() -> None:
     autoplay_ack.queueVersion.minor = 1
     autoplay_ack.tracks.add(queueItemId=23, trackId=376286112)
 
-    parsed_autoplay_ack = QobuzConnectCodec.parse_autoplay_load_ack(autoplay_ack_msg)
+    parsed_autoplay_ack = _CODEC.parse_autoplay_load_ack(autoplay_ack_msg)
 
     assert parsed_autoplay_ack is not None
     assert parsed_autoplay_ack.action_uuid == ACTION_UUID
-    assert parsed_autoplay_ack.queue_version == QueueVersion(8, 1)
+    assert parsed_autoplay_ack.version == QueueVersion(8, 1)
     assert [track.queue_item_id for track in parsed_autoplay_ack.tracks] == [23]
     assert [track.track_id for track in parsed_autoplay_ack.tracks] == ["376286112"]
 
@@ -264,16 +261,15 @@ def test_parse_queue_state_snapshot() -> None:
     state.autoplayMode = True
     state.autoplayTracks.add(queueItemId=99, trackId=2000001)
 
-    parsed = QobuzConnectCodec.parse_queue_state(state_msg)
+    parsed = _CODEC.parse_queue_state(state_msg)
 
     assert parsed is not None
-    assert parsed.queue_version == QueueVersion(23, 1)
-    assert parsed.action_uuid == ACTION_UUID
+    assert parsed.version == QueueVersion(23, 1)
     assert [t.queue_item_id for t in parsed.tracks] == [0, 1, 2]
     assert [t.track_id for t in parsed.tracks] == ["1065476", "1065477", "1065478"]
     assert all(t.context_uuid == b"ctx-uuid-16-byte" for t in parsed.tracks)
-    assert parsed.shuffle_mode is False
-    assert parsed.autoplay_mode is True
+    assert parsed.shuffle is False
+    assert parsed.autoplay is True
     assert [t.track_id for t in parsed.autoplay_tracks] == ["2000001"]
 
 
@@ -303,10 +299,10 @@ def test_parse_queue_state_snapshot_applies_shuffled_track_indexes() -> None:
     state.shuffleMode = True
     state.shuffledTrackIndexes.extend([2, 0, 3, 1])
 
-    parsed = QobuzConnectCodec.parse_queue_state(state_msg)
+    parsed = _CODEC.parse_queue_state(state_msg)
 
     assert parsed is not None
-    assert parsed.shuffle_mode is True
+    assert parsed.shuffle is True
     # tracks must follow the shuffled permutation, not the underlying order
     assert [t.track_id for t in parsed.tracks] == ["1002", "1000", "1003", "1001"]
 
@@ -328,10 +324,10 @@ def test_parse_queue_state_snapshot_ignores_shuffle_indexes_when_off() -> None:
     # leave MA's queue scrambled.
     state.shuffledTrackIndexes.extend([2, 0, 1])
 
-    parsed = QobuzConnectCodec.parse_queue_state(state_msg)
+    parsed = _CODEC.parse_queue_state(state_msg)
 
     assert parsed is not None
-    assert parsed.shuffle_mode is False
+    assert parsed.shuffle is False
     assert [t.track_id for t in parsed.tracks] == ["2000", "2001", "2002"]
 
 
@@ -348,13 +344,12 @@ def test_parse_queue_tracks_inserted_delta() -> None:
     evt.insertAfter = 5
     evt.contextUuid = b"ins-context-16-b"
 
-    parsed = QobuzConnectCodec.parse_queue_tracks_inserted(msg)
+    parsed = _CODEC.parse_queue_tracks_inserted(msg)
 
     assert parsed is not None
-    assert parsed.queue_version == QueueVersion(25, 1)
+    assert parsed.version == QueueVersion(25, 1)
     assert parsed.insert_after == 5
     assert [(t.queue_item_id, t.track_id) for t in parsed.tracks] == [(42, "2002"), (43, "2003")]
-    assert parsed.context_uuid == b"ins-context-16-b"
 
 
 def test_parse_queue_tracks_removed_delta() -> None:
@@ -367,11 +362,11 @@ def test_parse_queue_tracks_removed_delta() -> None:
     evt.actionUuid = ACTION_UUID
     evt.queueItemIds.extend([10, 11, 12])
 
-    parsed = QobuzConnectCodec.parse_queue_tracks_removed(msg)
+    parsed = _CODEC.parse_queue_tracks_removed(msg)
 
     assert parsed is not None
-    assert parsed.queue_version == QueueVersion(26, 0)
-    assert parsed.queue_item_ids == [10, 11, 12]
+    assert parsed.version == QueueVersion(26, 0)
+    assert parsed.queue_item_ids == (10, 11, 12)
 
 
 def test_parse_queue_tracks_reordered_delta() -> None:
@@ -385,11 +380,11 @@ def test_parse_queue_tracks_reordered_delta() -> None:
     evt.queueItemIds.extend([5, 6])
     evt.insertAfter = 8
 
-    parsed = QobuzConnectCodec.parse_queue_tracks_reordered(msg)
+    parsed = _CODEC.parse_queue_tracks_reordered(msg)
 
     assert parsed is not None
-    assert parsed.queue_version == QueueVersion(27, 4)
-    assert parsed.queue_item_ids == [5, 6]
+    assert parsed.version == QueueVersion(27, 4)
+    assert parsed.queue_item_ids == (5, 6)
     assert parsed.insert_after == 8
 
 
@@ -402,10 +397,10 @@ def test_parse_queue_cleared_notification() -> None:
     evt.queueVersion.minor = 0
     evt.actionUuid = ACTION_UUID
 
-    parsed = QobuzConnectCodec.parse_queue_cleared(msg)
+    parsed = _CODEC.parse_queue_cleared(msg)
 
     assert parsed is not None
-    assert parsed.queue_version == QueueVersion(28, 0)
+    assert parsed.version == QueueVersion(28, 0)
     assert parsed.action_uuid == ACTION_UUID
 
 
@@ -420,13 +415,12 @@ def test_parse_queue_tracks_added_delta() -> None:
     evt.tracks.add(queueItemId=16, trackId=1065478)
     evt.contextUuid = b"add-context-16-b"
 
-    parsed = QobuzConnectCodec.parse_queue_tracks_added(msg)
+    parsed = _CODEC.parse_queue_tracks_added(msg)
 
     assert parsed is not None
-    assert parsed.queue_version == QueueVersion(24, 2)
+    assert parsed.version == QueueVersion(24, 2)
     assert parsed.action_uuid == ACTION_UUID
     assert [(t.queue_item_id, t.track_id) for t in parsed.tracks] == [(16, "1065478")]
-    assert parsed.context_uuid == b"add-context-16-b"
 
 
 def test_parse_set_loop_mode_maps_proto_enum() -> None:
@@ -439,7 +433,9 @@ def test_parse_set_loop_mode_maps_proto_enum() -> None:
         msg = payload_pb2.QConnectMessage()
         msg.messageType = QConnectMessageType.SRVR_RNDR_SET_LOOP_MODE
         msg.srvrRndrSetLoopMode.mode = proto_value
-        assert QobuzConnectCodec.parse_set_loop_mode(msg) == expected
+        event = _CODEC.parse_set_loop_mode(msg)
+        assert event is not None
+        assert event.loop == expected
 
 
 def test_parse_set_shuffle_and_autoplay_mode() -> None:
@@ -452,8 +448,12 @@ def test_parse_set_shuffle_and_autoplay_mode() -> None:
     autoplay_msg.messageType = QConnectMessageType.SRVR_RNDR_SET_AUTOPLAY_MODE
     autoplay_msg.srvrRndrSetAutoplayMode.autoplayOn = False
 
-    assert QobuzConnectCodec.parse_set_shuffle_mode(shuffle_msg) is True
-    assert QobuzConnectCodec.parse_set_autoplay_mode(autoplay_msg) is False
+    shuffle_event = _CODEC.parse_set_shuffle_mode(shuffle_msg)
+    autoplay_event = _CODEC.parse_set_autoplay_mode(autoplay_msg)
+    assert shuffle_event is not None
+    assert shuffle_event.shuffle is True
+    assert autoplay_event is not None
+    assert autoplay_event.autoplay is False
 
 
 def test_encode_volume_muted_round_trip() -> None:
@@ -477,11 +477,11 @@ def test_parse_queue_error_and_version_change() -> None:
     error.error.code = "NOPE"
     error.error.message = "Rejected"
 
-    parsed_error = QobuzConnectCodec.parse_queue_error(error_msg)
+    parsed_error = _CODEC.parse_queue_error(error_msg)
 
     assert parsed_error is not None
     assert parsed_error.action_uuid == ACTION_UUID
-    assert parsed_error.queue_version == QueueVersion(8, 0)
+    assert parsed_error.version == QueueVersion(8, 0)
     assert parsed_error.code == "NOPE"
     assert parsed_error.message == "Rejected"
 
@@ -490,7 +490,9 @@ def test_parse_queue_error_and_version_change() -> None:
     version_msg.srvrCtrlQueueVersionChanged.queueVersion.major = 9
     version_msg.srvrCtrlQueueVersionChanged.queueVersion.minor = 4
 
-    assert QobuzConnectCodec.parse_queue_version_changed(version_msg) == QueueVersion(9, 4)
+    version_event = _CODEC.parse_queue_version_changed(version_msg)
+    assert version_event is not None
+    assert version_event.version == QueueVersion(9, 4)
 
 
 def test_encode_subscribe_channels_session_uuid() -> None:
@@ -663,8 +665,8 @@ def test_parse_set_state_survives_unknown_playing_state() -> None:
     state.playingState = 0  # PLAYING_STATE_UNKNOWN
     state.currentPosition = 5_000
 
-    event = QobuzConnectCodec.parse_set_state(message)
+    event = _CODEC.parse_set_state(message)
 
     assert event is not None
-    assert event.playing_state is None
+    assert event.playing is None
     assert event.position_ms == 5_000

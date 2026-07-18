@@ -9,11 +9,9 @@ Owns:
   ``PlayingState``, ``BufferState``, ``LoopMode``, ``Origin``.
 - Discovery-side DTOs: ``DeviceConfig``, ``JWTApiToken``,
   ``JWTConnectToken``, ``ConnectTokens``.
-- State DTOs: ``QueueVersion``, ``QueueTrackRef``, ``SetStateEvent``,
-  ``QueueLoadAck``, ``QueueError``, ``QueueStateSnapshot``,
-  ``QueueTracksAddedEvent``, ``QueueTracksInsertedEvent``,
-  ``QueueTracksRemovedEvent``, ``QueueTracksReorderedEvent``,
-  ``QueueClearedEvent``.
+- Wire value types: ``QueueVersion``, ``QueueTrackRef`` (shared by the codec
+  and the ``sync_types`` events; the codec parses frames straight into those
+  events, so no per-message DTO layer exists any more).
 
 Exposes:
 - All of the above as importable names.
@@ -26,7 +24,7 @@ Depends on:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 
 OAUTH_APP_ID = "304027809"
@@ -205,145 +203,3 @@ class QueueTrackRef:
     queue_item_id: int
     track_id: str
     context_uuid: bytes | None = None
-
-
-@dataclass(slots=True)
-class SetStateEvent:
-    """Decoded server-to-renderer state command."""
-
-    playing_state: PlayingState | None = None
-    position_ms: int | None = None
-    queue_version: QueueVersion | None = None
-    current_item: QueueTrackRef | None = None
-    next_item: QueueTrackRef | None = None
-
-
-@dataclass(slots=True)
-class SessionStateEvent:
-    """
-    Decoded ``SRVR_CTRL_SESSION_STATE`` — the cloud's "you're connected" frame.
-
-    Carries the queue identity (``queue_version``) the receiver must echo
-    when sending ``CTRL_SRVR_ASK_FOR_QUEUE_STATE`` to obtain the full
-    track list, plus the session identifier the controller would need
-    if it ever explicitly asked for renderer state.
-    """
-
-    session_uuid: bytes
-    session_id: int
-    queue_version: QueueVersion
-    track_index: int = 0
-
-
-@dataclass(slots=True)
-class RendererRecord:
-    """One renderer entry from the controller bootstrap (``SRVR_CTRL_ADD_RENDERER``)."""
-
-    renderer_id: int
-    device_uuid: bytes
-    friendly_name: str = ""
-
-
-@dataclass(slots=True)
-class RendererStateUpdate:
-    """
-    Decoded ``SRVR_CTRL_RENDERER_STATE_UPDATED`` — the active renderer's state broadcast.
-
-    This is the only live signal a controller-joined connection gets about
-    what the currently active renderer is playing; it feeds the mirror so
-    we can take over playback on ``SRVR_RNDR_SET_ACTIVE``.
-    """
-
-    renderer_id: int
-    playing_state: PlayingState | None = None
-    position_ms: int | None = None
-    duration_ms: int | None = None
-    current_queue_index: int | None = None
-    next_queue_item_id: int | None = None
-
-
-@dataclass(slots=True)
-class QueueLoadAck:
-    """Server acknowledgement for a controller queue-load command."""
-
-    action_uuid: bytes
-    queue_version: QueueVersion
-    tracks: list[QueueTrackRef] = field(default_factory=list)
-    queue_position: int = 0
-    qobuz_reference_id: int | None = None
-
-
-@dataclass(slots=True)
-class QueueStateSnapshot:
-    """
-    Full queue snapshot pushed by the cloud (``SRVR_CTRL_QUEUE_STATE``).
-
-    Authoritative state — replaces the mirror's queue when received.
-    Emitted on every fresh connect / resync (``CTRL_SRVR_ASK_FOR_QUEUE_STATE``)
-    and whenever the cloud needs to re-broadcast canonical state.
-    """
-
-    queue_version: QueueVersion
-    action_uuid: bytes
-    tracks: list[QueueTrackRef] = field(default_factory=list)
-    shuffle_mode: bool = False
-    autoplay_mode: bool = False
-    autoplay_tracks: list[QueueTrackRef] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class QueueTracksAddedEvent:
-    """Server delta: tracks appended to the queue (``SRVR_CTRL_QUEUE_TRACKS_ADDED``)."""
-
-    queue_version: QueueVersion
-    action_uuid: bytes
-    tracks: list[QueueTrackRef] = field(default_factory=list)
-    context_uuid: bytes | None = None
-
-
-@dataclass(slots=True)
-class QueueTracksInsertedEvent:
-    """Server delta: tracks inserted after a given position (``SRVR_CTRL_QUEUE_TRACKS_INSERTED``)."""
-
-    queue_version: QueueVersion
-    action_uuid: bytes
-    tracks: list[QueueTrackRef] = field(default_factory=list)
-    insert_after: int = 0
-    context_uuid: bytes | None = None
-
-
-@dataclass(slots=True)
-class QueueTracksRemovedEvent:
-    """Server delta: tracks removed by queue-item id (``SRVR_CTRL_QUEUE_TRACKS_REMOVED``)."""
-
-    queue_version: QueueVersion
-    action_uuid: bytes
-    queue_item_ids: list[int] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class QueueTracksReorderedEvent:
-    """Server delta: queue items moved after a given position (``SRVR_CTRL_QUEUE_TRACKS_REORDERED``)."""
-
-    queue_version: QueueVersion
-    action_uuid: bytes
-    queue_item_ids: list[int] = field(default_factory=list)
-    insert_after: int = 0
-
-
-@dataclass(slots=True)
-class QueueClearedEvent:
-    """Server notification: queue cleared (``SRVR_CTRL_QUEUE_CLEARED``)."""
-
-    queue_version: QueueVersion
-    action_uuid: bytes
-
-
-@dataclass(slots=True)
-class QueueError:
-    """Server queue command error."""
-
-    action_uuid: bytes
-    queue_version: QueueVersion | None = None
-    code: str = ""
-    message: str = ""

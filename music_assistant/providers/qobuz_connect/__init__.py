@@ -593,7 +593,7 @@ class QobuzConnectProvider(PluginProvider):
                 await self._session.send_quality_reports(self._max_quality)
         else:
             self.logger.info("Qobuz Connect deactivated by cloud; releasing MA player")
-        await self._coordinator._submit(
+        await self._coordinator.submit(
             CloudSetActive(now_ms=int(time.time() * 1000), active=active)
         )
 

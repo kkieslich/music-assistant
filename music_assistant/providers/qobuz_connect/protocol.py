@@ -5,8 +5,9 @@ Owns:
 - ``QobuzConnectCodec`` — encoders for every outbound message type
   (AUTHENTICATE, SUBSCRIBE, RNDR_SRVR_*, CTRL_SRVR_*) and parsers for
   every inbound message type (SRVR_RNDR_SET_STATE, SRVR_CTRL_QUEUE_*,
-  SRVR_RNDR_SET_VOLUME, SRVR_RNDR_SET_ACTIVE, ...). Pure functions of
-  bytes ↔ typed events from :mod:`.models`.
+  SRVR_RNDR_SET_VOLUME, SRVR_RNDR_SET_ACTIVE, ...). The ``parse_*`` methods
+  build :mod:`.sync_types` events straight from the wire (no per-message DTO
+  layer); each stamps ``now_ms`` from the injected clock.
 - The outer-frame format: ``[msg_type:1][varint_length][payload]``
   expressed by ``decode_frame`` / the per-message encode helpers.
 
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,25 +43,37 @@ from .models import (
     OuterMessageType,
     PlayingState,
     QConnectMessageType,
-    QueueClearedEvent,
-    QueueError,
-    QueueLoadAck,
-    QueueStateSnapshot,
     QueueTrackRef,
-    QueueTracksAddedEvent,
-    QueueTracksInsertedEvent,
-    QueueTracksRemovedEvent,
-    QueueTracksReorderedEvent,
     QueueVersion,
-    RendererRecord,
-    RendererStateUpdate,
-    SessionStateEvent,
-    SetStateEvent,
 )
 from .proto import qconnect_common_pb2 as _common_pb2
 from .proto import qconnect_envelope_pb2 as _envelope_pb2
 from .proto import qconnect_payload_pb2 as _payload_pb2
 from .proto import qconnect_queue_pb2 as _queue_pb2
+from .sync_types import (
+    CloudActiveRendererChanged,
+    CloudAddRenderer,
+    CloudAutoplaySet,
+    CloudAutoplayTracksLoaded,
+    CloudCleared,
+    CloudLoadAck,
+    CloudLoopSet,
+    CloudQueueError,
+    CloudRemoveRenderer,
+    CloudRendererStateUpdated,
+    CloudSessionState,
+    CloudSetState,
+    CloudShuffleSet,
+    CloudSnapshot,
+    CloudStateRequest,
+    CloudTracksAdded,
+    CloudTracksInserted,
+    CloudTracksRemoved,
+    CloudTracksReordered,
+    CloudVersionChanged,
+    CloudVolume,
+    CloudVolumeDelta,
+)
 
 common_pb2: Any = _common_pb2
 envelope_pb2: Any = _envelope_pb2
@@ -86,10 +100,17 @@ class DecodedFrame:
 class QobuzConnectCodec:
     """Encode and decode the Qobuz Connect websocket protocol."""
 
-    def __init__(self, device_uuid: bytes) -> None:
-        """Initialize codec."""
+    def __init__(self, device_uuid: bytes, now: Callable[[], int] | None = None) -> None:
+        """
+        Initialize codec.
+
+        :param device_uuid: This device's Qobuz uuid (bytes).
+        :param now: Wall-clock-ms provider stamped onto every parsed event;
+            defaults to real time, injectable for deterministic tests.
+        """
         self.device_uuid = device_uuid
         self._msg_counter = 0
+        self._now = now or self.now_ms
 
     @staticmethod
     def now_ms() -> int:
@@ -584,111 +605,106 @@ class QobuzConnectCodec:
             return None
         return batch
 
-    @staticmethod
-    def parse_set_state(message: Any) -> SetStateEvent | None:
-        """Parse a raw QConnect SET_STATE message."""
+    def parse_set_state(self, message: Any) -> CloudSetState | None:
+        """Parse a raw QConnect SET_STATE message into a ``CloudSetState`` event."""
         if not message.HasField("srvrRndrSetState"):
             return None
         state = message.srvrRndrSetState
-        event = SetStateEvent()
+        playing: PlayingState | None = None
         if state.HasField("playingState"):
             # The wire enum has values MA's PlayingState doesn't (e.g.
             # PLAYING_STATE_UNKNOWN = 0); degrade instead of raising into
             # the receive loop.
             try:
-                event.playing_state = PlayingState(state.playingState)
+                playing = PlayingState(state.playingState)
             except ValueError:
-                event.playing_state = None
-        if state.HasField("currentPosition"):
-            event.position_ms = state.currentPosition
+                playing = None
+        version: QueueVersion | None = None
         if state.HasField("queueVersion"):
-            event.queue_version = QueueVersion(state.queueVersion.major, state.queueVersion.minor)
-        if state.HasField("currentQueueItem"):
-            event.current_item = _parse_track_ref(state.currentQueueItem)
-        if state.HasField("nextQueueItem"):
-            event.next_item = _parse_track_ref(state.nextQueueItem)
-        return event
-
-    @staticmethod
-    def parse_queue_load_ack(message: Any) -> QueueLoadAck | None:
-        """Parse server queue-load acknowledgement."""
-        if not message.HasField("srvrCtrlQueueTracksLoaded"):
-            return None
-        load = message.srvrCtrlQueueTracksLoaded
-        return QueueLoadAck(
-            action_uuid=load.actionUuid,
-            queue_version=QueueVersion(load.queueVersion.major, load.queueVersion.minor),
-            tracks=[
-                track_ref
-                for track in load.tracks
-                if (track_ref := _parse_track_ref(track)) is not None
-            ],
-            queue_position=load.queuePosition if load.HasField("queuePosition") else 0,
-            qobuz_reference_id=(
-                load.qobuzReferenceUuid if load.HasField("qobuzReferenceUuid") else None
+            version = QueueVersion(state.queueVersion.major, state.queueVersion.minor)
+        return CloudSetState(
+            now_ms=self._now(),
+            version=version,
+            playing=playing,
+            position_ms=state.currentPosition if state.HasField("currentPosition") else None,
+            current_ref=(
+                _parse_track_ref(state.currentQueueItem)
+                if state.HasField("currentQueueItem")
+                else None
             ),
         )
 
-    @staticmethod
-    def parse_autoplay_load_ack(message: Any) -> QueueLoadAck | None:
-        """Parse server autoplay-load acknowledgement."""
+    def parse_queue_load_ack(self, message: Any) -> CloudLoadAck | None:
+        """Parse server queue-load acknowledgement into a ``CloudLoadAck`` event."""
+        if not message.HasField("srvrCtrlQueueTracksLoaded"):
+            return None
+        load = message.srvrCtrlQueueTracksLoaded
+        return CloudLoadAck(
+            now_ms=self._now(),
+            version=QueueVersion(load.queueVersion.major, load.queueVersion.minor),
+            action_uuid=load.actionUuid,
+            tracks=tuple(
+                ref for track in load.tracks if (ref := _parse_track_ref(track)) is not None
+            ),
+            queue_position=load.queuePosition if load.HasField("queuePosition") else 0,
+        )
+
+    def parse_autoplay_load_ack(self, message: Any) -> CloudAutoplayTracksLoaded | None:
+        """Parse server autoplay-load ack into a ``CloudAutoplayTracksLoaded`` event."""
         if not message.HasField("srvrCtrlAutoplayTracksLoaded"):
             return None
         load = message.srvrCtrlAutoplayTracksLoaded
-        return QueueLoadAck(
+        return CloudAutoplayTracksLoaded(
+            now_ms=self._now(),
+            version=QueueVersion(load.queueVersion.major, load.queueVersion.minor),
             action_uuid=load.actionUuid,
-            queue_version=QueueVersion(load.queueVersion.major, load.queueVersion.minor),
-            tracks=[
-                track_ref
-                for track in load.tracks
-                if (track_ref := _parse_track_ref(track)) is not None
-            ],
+            tracks=tuple(
+                ref for track in load.tracks if (ref := _parse_track_ref(track)) is not None
+            ),
         )
 
-    @staticmethod
-    def parse_queue_error(message: Any) -> QueueError | None:
-        """Parse server queue error."""
+    def parse_queue_error(self, message: Any) -> CloudQueueError | None:
+        """Parse server queue error into a ``CloudQueueError`` event."""
         if not message.HasField("srvrCtrlQueueErrorMessage"):
             return None
         error_msg = message.srvrCtrlQueueErrorMessage
         error = error_msg.error
-        return QueueError(
+        return CloudQueueError(
+            now_ms=self._now(),
+            version=QueueVersion(error_msg.queueVersion.major, error_msg.queueVersion.minor),
             action_uuid=error_msg.actionUuid,
-            queue_version=QueueVersion(error_msg.queueVersion.major, error_msg.queueVersion.minor),
-            code=error.code,
+            code=str(error.code),
             message=error.message,
         )
 
-    @staticmethod
-    def parse_queue_version_changed(message: Any) -> QueueVersion | None:
-        """Parse queue-version-changed message."""
+    def parse_queue_version_changed(self, message: Any) -> CloudVersionChanged | None:
+        """Parse queue-version-changed into a ``CloudVersionChanged`` event."""
         if not message.HasField("srvrCtrlQueueVersionChanged"):
             return None
         version = message.srvrCtrlQueueVersionChanged.queueVersion
-        return QueueVersion(version.major, version.minor)
+        return CloudVersionChanged(
+            now_ms=self._now(), version=QueueVersion(version.major, version.minor)
+        )
 
-    @staticmethod
-    def parse_session_state(message: Any) -> SessionStateEvent | None:
-        """Parse ``SRVR_CTRL_SESSION_STATE`` — the cloud's session-bound queue version."""
+    def parse_session_state(self, message: Any) -> CloudSessionState | None:
+        """Parse ``SRVR_CTRL_SESSION_STATE`` into a ``CloudSessionState`` event."""
         if not message.HasField("srvrCtrlSessionState"):
             return None
         state = message.srvrCtrlSessionState
-        return SessionStateEvent(
-            session_uuid=state.sessionUuid,
-            session_id=state.sessionId,
-            queue_version=QueueVersion(state.queueVersion.major, state.queueVersion.minor),
+        return CloudSessionState(
+            now_ms=self._now(),
+            version=QueueVersion(state.queueVersion.major, state.queueVersion.minor),
             track_index=state.trackIndex,
         )
 
-    @staticmethod
-    def parse_queue_state(message: Any) -> QueueStateSnapshot | None:
+    def parse_queue_state(self, message: Any) -> CloudSnapshot | None:
         """
         Parse a full ``SRVR_CTRL_QUEUE_STATE`` queue snapshot.
 
         The cloud carries the queue in two parts: ``tracks`` is the
         underlying (unshuffled) track list and ``shuffledTrackIndexes`` is
         the permutation the user sees when shuffle is on. We bake the
-        user-facing order into ``QueueStateSnapshot.tracks`` here so the
+        user-facing order into ``CloudSnapshot.tracks`` here so the
         mirror always represents what MA should display — without this,
         reconciliation would force MA back to the unshuffled order every
         time the cloud reports a shuffled snapshot.
@@ -710,163 +726,183 @@ class QobuzConnectCodec:
             ]
         else:
             effective_tracks = base_tracks
-        return QueueStateSnapshot(
-            queue_version=QueueVersion(state.queueVersion.major, state.queueVersion.minor),
-            action_uuid=state.actionUuid,
-            tracks=effective_tracks,
-            shuffle_mode=shuffle_on,
-            autoplay_mode=state.autoplayMode if state.HasField("autoplayMode") else False,
-            autoplay_tracks=[
+        return CloudSnapshot(
+            now_ms=self._now(),
+            version=QueueVersion(state.queueVersion.major, state.queueVersion.minor),
+            tracks=tuple(effective_tracks),
+            autoplay_tracks=tuple(
                 ref
                 for track in state.autoplayTracks
                 if (ref := _parse_track_ref(track)) is not None
-            ],
+            ),
+            shuffle=shuffle_on,
+            autoplay=state.autoplayMode if state.HasField("autoplayMode") else False,
+            # The snapshot carries no track pointer of its own; the coordinator
+            # injects the last SESSION_STATE trackIndex it saw.
+            track_index=0,
         )
 
-    @staticmethod
-    def parse_queue_tracks_added(message: Any) -> QueueTracksAddedEvent | None:
-        """Parse a ``SRVR_CTRL_QUEUE_TRACKS_ADDED`` queue-delta."""
+    def parse_queue_tracks_added(self, message: Any) -> CloudTracksAdded | None:
+        """Parse ``SRVR_CTRL_QUEUE_TRACKS_ADDED`` into a ``CloudTracksAdded`` event."""
         if not message.HasField("srvrCtrlQueueTracksAdded"):
             return None
         evt = message.srvrCtrlQueueTracksAdded
-        return QueueTracksAddedEvent(
-            queue_version=QueueVersion(evt.queueVersion.major, evt.queueVersion.minor),
+        return CloudTracksAdded(
+            now_ms=self._now(),
+            version=QueueVersion(evt.queueVersion.major, evt.queueVersion.minor),
             action_uuid=evt.actionUuid,
-            tracks=[ref for track in evt.tracks if (ref := _parse_track_ref(track)) is not None],
-            context_uuid=evt.contextUuid if evt.HasField("contextUuid") else None,
+            tracks=tuple(
+                ref for track in evt.tracks if (ref := _parse_track_ref(track)) is not None
+            ),
         )
 
-    @staticmethod
-    def parse_queue_tracks_inserted(message: Any) -> QueueTracksInsertedEvent | None:
-        """Parse a ``SRVR_CTRL_QUEUE_TRACKS_INSERTED`` queue-delta."""
+    def parse_queue_tracks_inserted(self, message: Any) -> CloudTracksInserted | None:
+        """Parse ``SRVR_CTRL_QUEUE_TRACKS_INSERTED`` into a ``CloudTracksInserted`` event."""
         if not message.HasField("srvrCtrlQueueTracksInserted"):
             return None
         evt = message.srvrCtrlQueueTracksInserted
-        return QueueTracksInsertedEvent(
-            queue_version=QueueVersion(evt.queueVersion.major, evt.queueVersion.minor),
+        return CloudTracksInserted(
+            now_ms=self._now(),
+            version=QueueVersion(evt.queueVersion.major, evt.queueVersion.minor),
             action_uuid=evt.actionUuid,
-            tracks=[ref for track in evt.tracks if (ref := _parse_track_ref(track)) is not None],
+            tracks=tuple(
+                ref for track in evt.tracks if (ref := _parse_track_ref(track)) is not None
+            ),
             insert_after=evt.insertAfter if evt.HasField("insertAfter") else 0,
-            context_uuid=evt.contextUuid if evt.HasField("contextUuid") else None,
         )
 
-    @staticmethod
-    def parse_queue_tracks_removed(message: Any) -> QueueTracksRemovedEvent | None:
-        """Parse a ``SRVR_CTRL_QUEUE_TRACKS_REMOVED`` queue-delta."""
+    def parse_queue_tracks_removed(self, message: Any) -> CloudTracksRemoved | None:
+        """Parse ``SRVR_CTRL_QUEUE_TRACKS_REMOVED`` into a ``CloudTracksRemoved`` event."""
         if not message.HasField("srvrCtrlQueueTracksRemoved"):
             return None
         evt = message.srvrCtrlQueueTracksRemoved
-        return QueueTracksRemovedEvent(
-            queue_version=QueueVersion(evt.queueVersion.major, evt.queueVersion.minor),
+        return CloudTracksRemoved(
+            now_ms=self._now(),
+            version=QueueVersion(evt.queueVersion.major, evt.queueVersion.minor),
             action_uuid=evt.actionUuid,
-            queue_item_ids=list(evt.queueItemIds),
+            queue_item_ids=tuple(evt.queueItemIds),
         )
 
-    @staticmethod
-    def parse_queue_tracks_reordered(message: Any) -> QueueTracksReorderedEvent | None:
-        """Parse a ``SRVR_CTRL_QUEUE_TRACKS_REORDERED`` queue-delta."""
+    def parse_queue_tracks_reordered(self, message: Any) -> CloudTracksReordered | None:
+        """Parse ``SRVR_CTRL_QUEUE_TRACKS_REORDERED`` into a ``CloudTracksReordered`` event."""
         if not message.HasField("srvrCtrlQueueTracksReordered"):
             return None
         evt = message.srvrCtrlQueueTracksReordered
-        return QueueTracksReorderedEvent(
-            queue_version=QueueVersion(evt.queueVersion.major, evt.queueVersion.minor),
+        return CloudTracksReordered(
+            now_ms=self._now(),
+            version=QueueVersion(evt.queueVersion.major, evt.queueVersion.minor),
             action_uuid=evt.actionUuid,
-            queue_item_ids=list(evt.queueItemIds),
+            queue_item_ids=tuple(evt.queueItemIds),
             insert_after=evt.insertAfter if evt.HasField("insertAfter") else 0,
         )
 
-    @staticmethod
-    def parse_queue_cleared(message: Any) -> QueueClearedEvent | None:
-        """Parse a ``SRVR_CTRL_QUEUE_CLEARED`` notification."""
+    def parse_queue_cleared(self, message: Any) -> CloudCleared | None:
+        """Parse ``SRVR_CTRL_QUEUE_CLEARED`` into a ``CloudCleared`` event."""
         if not message.HasField("srvrCtrlQueueCleared"):
             return None
         evt = message.srvrCtrlQueueCleared
-        return QueueClearedEvent(
-            queue_version=QueueVersion(evt.queueVersion.major, evt.queueVersion.minor),
+        return CloudCleared(
+            now_ms=self._now(),
+            version=QueueVersion(evt.queueVersion.major, evt.queueVersion.minor),
             action_uuid=evt.actionUuid,
         )
 
-    @staticmethod
-    def parse_set_loop_mode(message: Any) -> LoopMode | None:
-        """Parse a ``SRVR_RNDR_SET_LOOP_MODE`` renderer command."""
+    def parse_set_volume(self, message: Any) -> CloudVolume | CloudVolumeDelta | None:
+        """Parse ``SRVR_RNDR_SET_VOLUME`` into a ``CloudVolume`` / ``CloudVolumeDelta`` event."""
+        if not message.HasField("srvrRndrSetVolume"):
+            return None
+        vol = message.srvrRndrSetVolume
+        if vol.HasField("volume"):
+            return CloudVolume(now_ms=self._now(), volume=vol.volume)
+        if vol.HasField("volumeDelta"):
+            return CloudVolumeDelta(now_ms=self._now(), delta=vol.volumeDelta)
+        return None
+
+    def parse_set_loop_mode(self, message: Any) -> CloudLoopSet | None:
+        """Parse ``SRVR_RNDR_SET_LOOP_MODE`` into a ``CloudLoopSet`` event."""
         if not message.HasField("srvrRndrSetLoopMode"):
             return None
         mode = message.srvrRndrSetLoopMode
         if not mode.HasField("mode"):
             return None
         try:
-            return LoopMode(mode.mode)
+            loop = LoopMode(mode.mode)
         except ValueError:
-            return LoopMode.UNKNOWN
+            loop = LoopMode.UNKNOWN
+        return CloudLoopSet(now_ms=self._now(), action_uuid=None, loop=loop)
 
-    @staticmethod
-    def parse_set_shuffle_mode(message: Any) -> bool | None:
-        """Parse a ``SRVR_RNDR_SET_SHUFFLE_MODE`` renderer command."""
+    def parse_set_shuffle_mode(self, message: Any) -> CloudShuffleSet | None:
+        """Parse ``SRVR_RNDR_SET_SHUFFLE_MODE`` into a ``CloudShuffleSet`` event."""
         if not message.HasField("srvrRndrSetShuffleMode"):
             return None
         evt = message.srvrRndrSetShuffleMode
-        return evt.shuffleOn if evt.HasField("shuffleOn") else None
+        if not evt.HasField("shuffleOn"):
+            return None
+        return CloudShuffleSet(now_ms=self._now(), action_uuid=None, shuffle=evt.shuffleOn)
 
-    @staticmethod
-    def parse_set_autoplay_mode(message: Any) -> bool | None:
-        """Parse a ``SRVR_RNDR_SET_AUTOPLAY_MODE`` renderer command."""
+    def parse_set_autoplay_mode(self, message: Any) -> CloudAutoplaySet | None:
+        """Parse ``SRVR_RNDR_SET_AUTOPLAY_MODE`` into a ``CloudAutoplaySet`` event."""
         if not message.HasField("srvrRndrSetAutoplayMode"):
             return None
         evt = message.srvrRndrSetAutoplayMode
-        return evt.autoplayOn if evt.HasField("autoplayOn") else None
+        if not evt.HasField("autoplayOn"):
+            return None
+        return CloudAutoplaySet(now_ms=self._now(), action_uuid=None, autoplay=evt.autoplayOn)
 
-    @staticmethod
-    def parse_add_renderer(msg: Any) -> RendererRecord | None:
-        """Parse ``SRVR_CTRL_ADD_RENDERER`` into a :class:`RendererRecord`."""
+    def parse_state_request(self, _message: Any) -> CloudStateRequest:
+        """Parse ``CTRL_SRVR_ASK_FOR_RENDERER_STATE`` into a ``CloudStateRequest`` event."""
+        return CloudStateRequest(now_ms=self._now())
+
+    def parse_add_renderer(self, msg: Any) -> CloudAddRenderer | None:
+        """Parse ``SRVR_CTRL_ADD_RENDERER`` into a ``CloudAddRenderer`` event."""
         if not msg.HasField("srvrCtrlAddRenderer"):
             return None
         add = msg.srvrCtrlAddRenderer
-        return RendererRecord(
+        # is_own needs the coordinator's own device uuid; it is injected there.
+        return CloudAddRenderer(
+            now_ms=self._now(),
             renderer_id=add.rendererId,
             device_uuid=bytes(add.renderer.deviceUuid),
-            friendly_name=add.renderer.friendlyName,
         )
 
-    @staticmethod
-    def parse_remove_renderer(msg: Any) -> int | None:
-        """Parse ``SRVR_CTRL_REMOVE_RENDERER`` into the removed renderer id."""
+    def parse_remove_renderer(self, msg: Any) -> CloudRemoveRenderer | None:
+        """Parse ``SRVR_CTRL_REMOVE_RENDERER`` into a ``CloudRemoveRenderer`` event."""
         if not msg.HasField("srvrCtrlRemoveRenderer"):
             return None
-        return int(msg.srvrCtrlRemoveRenderer.rendererId)
+        return CloudRemoveRenderer(
+            now_ms=self._now(), renderer_id=int(msg.srvrCtrlRemoveRenderer.rendererId)
+        )
 
-    @staticmethod
-    def parse_active_renderer_changed(msg: Any) -> int | None:
-        """Parse ``SRVR_CTRL_ACTIVE_RENDERER_CHANGED`` into the new active id."""
+    def parse_active_renderer_changed(self, msg: Any) -> CloudActiveRendererChanged | None:
+        """Parse ``SRVR_CTRL_ACTIVE_RENDERER_CHANGED`` into a ``CloudActiveRendererChanged`` event."""
         if not msg.HasField("srvrCtrlActiveRendererChanged"):
             return None
-        return int(msg.srvrCtrlActiveRendererChanged.rendererId)
+        return CloudActiveRendererChanged(
+            now_ms=self._now(), renderer_id=int(msg.srvrCtrlActiveRendererChanged.rendererId)
+        )
 
-    @staticmethod
-    def parse_renderer_state_updated(msg: Any) -> RendererStateUpdate | None:
-        """Parse ``SRVR_CTRL_RENDERER_STATE_UPDATED`` into a :class:`RendererStateUpdate`."""
+    def parse_renderer_state_updated(self, msg: Any) -> CloudRendererStateUpdated | None:
+        """Parse ``SRVR_CTRL_RENDERER_STATE_UPDATED`` into a ``CloudRendererStateUpdated`` event."""
         if not msg.HasField("srvrCtrlRendererStateUpdated"):
             return None
         upd = msg.srvrCtrlRendererStateUpdated
         state = upd.state
-        playing_state: PlayingState | None = None
+        playing: PlayingState | None = None
         if state.HasField("playingState"):
             try:
-                playing_state = PlayingState(state.playingState)
+                playing = PlayingState(state.playingState)
             except ValueError:
-                playing_state = None
+                playing = None
         position_ms: int | None = None
         if state.HasField("currentPosition") and state.currentPosition.HasField("value"):
             position_ms = int(state.currentPosition.value)
-        return RendererStateUpdate(
+        return CloudRendererStateUpdated(
+            now_ms=self._now(),
             renderer_id=int(upd.rendererId),
-            playing_state=playing_state,
+            playing=playing,
             position_ms=position_ms,
-            duration_ms=int(state.duration) if state.HasField("duration") else None,
-            current_queue_index=(
+            current_index=(
                 int(state.currentQueueIndex) if state.HasField("currentQueueIndex") else None
-            ),
-            next_queue_item_id=(
-                int(state.nextQueueItemId) if state.HasField("nextQueueItemId") else None
             ),
         )
 

@@ -161,25 +161,25 @@ def test_parse_add_and_remove_renderer_and_active_changed() -> None:
     msg.srvrCtrlAddRenderer.renderer.friendlyName = "Local Dev"
     record = codec.parse_add_renderer(msg)
     assert record is not None
-    assert (record.renderer_id, record.device_uuid, record.friendly_name) == (
-        3,
-        DEVICE_UUID,
-        "Local Dev",
-    )
+    assert (record.renderer_id, record.device_uuid) == (3, DEVICE_UUID)
 
     removed = payload_pb2.QConnectMessage()
     removed.messageType = QConnectMessageType.SRVR_CTRL_REMOVE_RENDERER
     removed.srvrCtrlRemoveRenderer.rendererId = 3
-    assert codec.parse_remove_renderer(removed) == 3
+    removed_event = codec.parse_remove_renderer(removed)
+    assert removed_event is not None
+    assert removed_event.renderer_id == 3
 
     changed = payload_pb2.QConnectMessage()
     changed.messageType = QConnectMessageType.SRVR_CTRL_ACTIVE_RENDERER_CHANGED
     changed.srvrCtrlActiveRendererChanged.rendererId = 4
-    assert codec.parse_active_renderer_changed(changed) == 4
+    changed_event = codec.parse_active_renderer_changed(changed)
+    assert changed_event is not None
+    assert changed_event.renderer_id == 4
 
 
 def test_parse_renderer_state_updated() -> None:
-    """The type-82 broadcast decodes into a RendererStateUpdate with presence-aware fields."""
+    """The type-82 broadcast decodes into a CloudRendererStateUpdated with presence-aware fields."""
     codec = _codec()
     msg = payload_pb2.QConnectMessage()
     msg.messageType = QConnectMessageType.SRVR_CTRL_RENDERER_STATE_UPDATED
@@ -192,11 +192,9 @@ def test_parse_renderer_state_updated() -> None:
     update = codec.parse_renderer_state_updated(msg)
     assert update is not None
     assert update.renderer_id == 2
-    assert update.playing_state is PlayingState.PLAYING
+    assert update.playing is PlayingState.PLAYING
     assert update.position_ms == 42000
-    assert update.duration_ms == 174000
-    assert update.current_queue_index == 3
-    assert update.next_queue_item_id is None
+    assert update.current_index == 3
 
 
 def test_parse_renderer_state_updated_sparse_fields() -> None:
@@ -210,5 +208,4 @@ def test_parse_renderer_state_updated_sparse_fields() -> None:
     update = codec.parse_renderer_state_updated(msg)
     assert update is not None
     assert update.position_ms is None
-    assert update.duration_ms is None
-    assert update.current_queue_index is None
+    assert update.current_index is None

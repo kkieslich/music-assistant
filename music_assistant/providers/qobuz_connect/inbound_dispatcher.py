@@ -121,7 +121,7 @@ class InboundDispatcher:
 
     async def _on_error(self, msg: Any) -> None:
         # Message-level rejection — observed live when the cloud has
-        # deregistered this renderer but the socket is still open.
+        # deregistered this device but the socket is still open.
         code = msg.error.code if msg.HasField("error") else "?"
         message = msg.error.message if msg.HasField("error") else ""
         self._logger.warning("Qobuz Connect message error %s: %s", code, message)
@@ -129,25 +129,19 @@ class InboundDispatcher:
             await self._on_error_message(str(message))
 
     async def _on_set_state(self, msg: Any) -> None:
-        if event := self._codec.parse_set_state(msg):
+        if (event := self._codec.parse_set_state(msg)) is not None:
             self._logger.debug(
-                "Qobuz SET_STATE state=%s pos=%s current=%s next=%s qv=%s",
-                event.playing_state,
+                "Qobuz SET_STATE state=%s pos=%s current=%s qv=%s",
+                event.playing,
                 event.position_ms,
-                _format_track_ref(event.current_item),
-                _format_track_ref(event.next_item),
-                event.queue_version,
+                _format_track_ref(event.current_ref),
+                event.version,
             )
-            await self._cb.on_set_state(event)
+            await self._cb.submit(event)
 
     async def _on_set_volume(self, msg: Any) -> None:
-        if not msg.HasField("srvrRndrSetVolume"):
-            return
-        vol = msg.srvrRndrSetVolume
-        if vol.HasField("volume"):
-            await self._cb.on_volume(vol.volume)
-        elif vol.HasField("volumeDelta"):
-            await self._cb.on_volume_delta(vol.volumeDelta)
+        if (event := self._codec.parse_set_volume(msg)) is not None:
+            await self._cb.submit(event)
 
     async def _on_set_max_quality(self, msg: Any) -> None:
         if msg.HasField("srvrRndrSetMaxAudioQuality"):
@@ -161,157 +155,139 @@ class InboundDispatcher:
         await self._cb.on_set_active(active)
 
     async def _on_set_loop_mode(self, msg: Any) -> None:
-        if (mode := self._codec.parse_set_loop_mode(msg)) is not None:
-            self._logger.debug("Qobuz SET_LOOP_MODE mode=%s", mode)
-            await self._cb.on_loop_mode(mode)
+        if (event := self._codec.parse_set_loop_mode(msg)) is not None:
+            self._logger.debug("Qobuz SET_LOOP_MODE mode=%s", event.loop)
+            await self._cb.submit(event)
 
     async def _on_set_shuffle_mode(self, msg: Any) -> None:
-        if (shuffle := self._codec.parse_set_shuffle_mode(msg)) is not None:
-            self._logger.debug("Qobuz SET_SHUFFLE_MODE on=%s", shuffle)
-            await self._cb.on_shuffle_mode(shuffle)
+        if (event := self._codec.parse_set_shuffle_mode(msg)) is not None:
+            self._logger.debug("Qobuz SET_SHUFFLE_MODE on=%s", event.shuffle)
+            await self._cb.submit(event)
 
     async def _on_set_autoplay_mode(self, msg: Any) -> None:
-        if (autoplay := self._codec.parse_set_autoplay_mode(msg)) is not None:
-            self._logger.debug("Qobuz SET_AUTOPLAY_MODE on=%s", autoplay)
-            await self._cb.on_autoplay_mode(autoplay)
+        if (event := self._codec.parse_set_autoplay_mode(msg)) is not None:
+            self._logger.debug("Qobuz SET_AUTOPLAY_MODE on=%s", event.autoplay)
+            await self._cb.submit(event)
 
     async def _on_queue_load_ack(self, msg: Any) -> None:
-        if ack := self._codec.parse_queue_load_ack(msg):
+        if (event := self._codec.parse_queue_load_ack(msg)) is not None:
             self._logger.debug(
                 "Qobuz queue-load ACK qv=%s tracks=%s",
-                ack.queue_version,
-                [_format_track_ref(track) for track in ack.tracks],
+                event.version,
+                [_format_track_ref(track) for track in event.tracks],
             )
-            await self._cb.on_queue_load_ack(ack)
+            await self._cb.submit(event)
 
     async def _on_autoplay_load_ack(self, msg: Any) -> None:
-        if self._cb.on_autoplay_tracks_loaded is None:
-            self._logger.debug("Qobuz broadcast ignored: type=%s", msg.messageType)
-            return
-        if ack := self._codec.parse_autoplay_load_ack(msg):
+        if (event := self._codec.parse_autoplay_load_ack(msg)) is not None:
             self._logger.debug(
                 "Qobuz autoplay-load ACK qv=%s tracks=%s",
-                ack.queue_version,
-                [_format_track_ref(track) for track in ack.tracks],
+                event.version,
+                [_format_track_ref(track) for track in event.tracks],
             )
-            await self._cb.on_autoplay_tracks_loaded(ack)
+            await self._cb.submit(event)
 
     async def _on_queue_error(self, msg: Any) -> None:
-        if error := self._codec.parse_queue_error(msg):
-            await self._cb.on_queue_error(error)
+        if (event := self._codec.parse_queue_error(msg)) is not None:
+            await self._cb.submit(event)
 
     async def _on_queue_version_changed(self, msg: Any) -> None:
-        if version := self._codec.parse_queue_version_changed(msg):
-            await self._cb.on_queue_version(version)
+        if (event := self._codec.parse_queue_version_changed(msg)) is not None:
+            await self._cb.submit(event)
 
     async def _on_queue_state(self, msg: Any) -> None:
-        if snapshot := self._codec.parse_queue_state(msg):
+        if (event := self._codec.parse_queue_state(msg)) is not None:
             self._logger.debug(
                 "Qobuz QUEUE_STATE qv=%s tracks=%d shuffle=%s autoplay=%s",
-                snapshot.queue_version,
-                len(snapshot.tracks),
-                snapshot.shuffle_mode,
-                snapshot.autoplay_mode,
+                event.version,
+                len(event.tracks),
+                event.shuffle,
+                event.autoplay,
             )
-            await self._cb.on_queue_state(snapshot)
+            await self._cb.submit(event)
 
     async def _on_queue_tracks_added(self, msg: Any) -> None:
-        if added := self._codec.parse_queue_tracks_added(msg):
+        if (event := self._codec.parse_queue_tracks_added(msg)) is not None:
             self._logger.debug(
                 "Qobuz QUEUE_TRACKS_ADDED qv=%s tracks=%s",
-                added.queue_version,
-                [_format_track_ref(track) for track in added.tracks],
+                event.version,
+                [_format_track_ref(track) for track in event.tracks],
             )
-            await self._cb.on_queue_tracks_added(added)
+            await self._cb.submit(event)
 
     async def _on_queue_tracks_inserted(self, msg: Any) -> None:
-        if inserted := self._codec.parse_queue_tracks_inserted(msg):
+        if (event := self._codec.parse_queue_tracks_inserted(msg)) is not None:
             self._logger.debug(
                 "Qobuz QUEUE_TRACKS_INSERTED qv=%s after=%s tracks=%s",
-                inserted.queue_version,
-                inserted.insert_after,
-                [_format_track_ref(track) for track in inserted.tracks],
+                event.version,
+                event.insert_after,
+                [_format_track_ref(track) for track in event.tracks],
             )
-            await self._cb.on_queue_tracks_inserted(inserted)
+            await self._cb.submit(event)
 
     async def _on_queue_tracks_removed(self, msg: Any) -> None:
-        if removed := self._codec.parse_queue_tracks_removed(msg):
+        if (event := self._codec.parse_queue_tracks_removed(msg)) is not None:
             self._logger.debug(
                 "Qobuz QUEUE_TRACKS_REMOVED qv=%s ids=%s",
-                removed.queue_version,
-                removed.queue_item_ids,
+                event.version,
+                event.queue_item_ids,
             )
-            await self._cb.on_queue_tracks_removed(removed)
+            await self._cb.submit(event)
 
     async def _on_queue_tracks_reordered(self, msg: Any) -> None:
-        if reordered := self._codec.parse_queue_tracks_reordered(msg):
+        if (event := self._codec.parse_queue_tracks_reordered(msg)) is not None:
             self._logger.debug(
                 "Qobuz QUEUE_TRACKS_REORDERED qv=%s after=%s ids=%s",
-                reordered.queue_version,
-                reordered.insert_after,
-                reordered.queue_item_ids,
+                event.version,
+                event.insert_after,
+                event.queue_item_ids,
             )
-            await self._cb.on_queue_tracks_reordered(reordered)
+            await self._cb.submit(event)
 
     async def _on_queue_cleared(self, msg: Any) -> None:
-        if cleared := self._codec.parse_queue_cleared(msg):
-            self._logger.debug("Qobuz QUEUE_CLEARED qv=%s", cleared.queue_version)
-            await self._cb.on_queue_cleared(cleared)
+        if (event := self._codec.parse_queue_cleared(msg)) is not None:
+            self._logger.debug("Qobuz QUEUE_CLEARED qv=%s", event.version)
+            await self._cb.submit(event)
 
-    async def _on_state_request(self, _msg: Any) -> None:
+    async def _on_state_request(self, msg: Any) -> None:
         self._logger.debug("Qobuz requested renderer state")
-        await self._cb.on_state_request()
+        await self._cb.submit(self._codec.parse_state_request(msg))
 
     async def _on_session_state(self, msg: Any) -> None:
-        if event := self._codec.parse_session_state(msg):
+        if (event := self._codec.parse_session_state(msg)) is not None:
             self._logger.debug(
-                "Qobuz SESSION_STATE sessionId=%s qv=%s.%s trackIndex=%s",
-                event.session_id,
-                event.queue_version.major,
-                event.queue_version.minor,
+                "Qobuz SESSION_STATE qv=%s.%s trackIndex=%s",
+                event.version.major,
+                event.version.minor,
                 event.track_index,
             )
-            await self._cb.on_session_state(event)
+            await self._cb.submit(event)
 
     async def _on_add_renderer(self, msg: Any) -> None:
-        if self._cb.on_add_renderer is None:
-            self._logger.debug("Qobuz broadcast ignored: type=%s", msg.messageType)
-            return
-        if record := self._codec.parse_add_renderer(msg):
-            self._logger.debug(
-                "Qobuz ADD_RENDERER id=%s name=%s", record.renderer_id, record.friendly_name
-            )
-            await self._cb.on_add_renderer(record)
+        if (event := self._codec.parse_add_renderer(msg)) is not None:
+            self._logger.debug("Qobuz ADD_RENDERER id=%s", event.renderer_id)
+            await self._cb.submit(event)
 
     async def _on_remove_renderer(self, msg: Any) -> None:
-        if self._cb.on_remove_renderer is None:
-            self._logger.debug("Qobuz broadcast ignored: type=%s", msg.messageType)
-            return
-        if (renderer_id := self._codec.parse_remove_renderer(msg)) is not None:
-            self._logger.debug("Qobuz REMOVE_RENDERER id=%s", renderer_id)
-            await self._cb.on_remove_renderer(renderer_id)
+        if (event := self._codec.parse_remove_renderer(msg)) is not None:
+            self._logger.debug("Qobuz REMOVE_RENDERER id=%s", event.renderer_id)
+            await self._cb.submit(event)
 
     async def _on_active_renderer_changed(self, msg: Any) -> None:
-        if self._cb.on_active_renderer_changed is None:
-            self._logger.debug("Qobuz broadcast ignored: type=%s", msg.messageType)
-            return
-        if (renderer_id := self._codec.parse_active_renderer_changed(msg)) is not None:
-            self._logger.debug("Qobuz ACTIVE_RENDERER_CHANGED id=%s", renderer_id)
-            await self._cb.on_active_renderer_changed(renderer_id)
+        if (event := self._codec.parse_active_renderer_changed(msg)) is not None:
+            self._logger.debug("Qobuz ACTIVE_RENDERER_CHANGED id=%s", event.renderer_id)
+            await self._cb.submit(event)
 
     async def _on_renderer_state_updated(self, msg: Any) -> None:
-        if self._cb.on_renderer_state_updated is None:
-            self._logger.debug("Qobuz broadcast ignored: type=%s", msg.messageType)
-            return
-        if update := self._codec.parse_renderer_state_updated(msg):
+        if (event := self._codec.parse_renderer_state_updated(msg)) is not None:
             self._logger.debug(
                 "Qobuz RENDERER_STATE_UPDATED id=%s state=%s pos=%s idx=%s",
-                update.renderer_id,
-                update.playing_state,
-                update.position_ms,
-                update.current_queue_index,
+                event.renderer_id,
+                event.playing,
+                event.position_ms,
+                event.current_index,
             )
-            await self._cb.on_renderer_state_updated(update)
+            await self._cb.submit(event)
 
     # Dispatch table — populated below at class scope (`__class_getitem__`
     # style with the methods just defined). Keeps each branch one line

@@ -2,18 +2,22 @@
 Impure shell: serialize inbound events, run the pure reducer, execute effects.
 
 ``QobuzConnectCoordinator`` owns the ONLY mutable :class:`.sync_types.CanonicalState`.
-It translates raw inbound — the old parsed cloud messages the session hands to its
-callbacks, and MA subscription events the provider hands to its ``on_ma_*`` entry
-points — into pure ``Event`` values, then serializes them through :func:`.reducer.reduce`
-one at a time under an ``asyncio.Lock``. Each event is fully processed (state stored,
-every resulting effect awaited on the ``EffectRunner``, in order) before the next
-event starts; that linear ordering is what makes the reducer's version-gated
-decisions correct — nothing ever observes a half-applied state.
+Inbound cloud events are already ``sync_types`` events (the codec parses frames
+straight into them); ``submit`` injects the little shell-only context they can't
+carry (own-renderer verdict, the snapshot's remembered track pointer, an error's
+version fallback) and MA subscription events are turned into ``Ma*Changed`` events
+by the ``on_ma_*`` entry points. Everything is serialized through
+:func:`.reducer.reduce` one at a time under an ``asyncio.Lock``. Each event is
+fully processed (state stored, every resulting effect awaited on the
+``EffectRunner``, in order) before the next event starts; that linear ordering is
+what makes the reducer's version-gated decisions correct — nothing ever observes
+a half-applied state.
 
 Owns:
 - ``self._state`` (via the ``state`` property) — the single source of truth.
-- ``build_session_callbacks()`` — translates :mod:`.session`'s old parsed DTOs
-  into :mod:`.sync_types` events.
+- ``submit()`` — the single intake sink for codec-built cloud events (context
+  injection, then reduce), plus ``build_session_callbacks()`` which hands it and
+  the two provider hooks to the inbound dispatcher.
 - ``on_ma_queue_event`` / ``on_ma_transport_event`` / ``on_ma_modes_event`` /
   ``on_ma_volume_event`` — MA-side entry points the provider wires to MA's event
   bus; each reads current MA state via ``bridge`` and submits the matching
@@ -26,14 +30,14 @@ Depends on:
 - :func:`.reducer.reduce` (pure) and :mod:`.sync_types` (pure event/effect/state
   types) for all sync decisions.
 - :class:`.session.SessionCallbacks` for the shape the transport expects.
-- the local ``try_parse_qobuz_id`` helper and the old parsed DTOs in :mod:`.models`
-  for translating cloud/MA input.
+- the local ``try_parse_qobuz_id`` helper for translating MA input.
 - ``asyncio``/``time``/``uuid`` — this module is the impure shell.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import time
 import uuid
@@ -42,48 +46,18 @@ from typing import TYPE_CHECKING, Any
 from .models import (
     LoopMode,
     PlayingState,
-    QueueClearedEvent,
-    QueueError,
-    QueueLoadAck,
-    QueueStateSnapshot,
-    QueueTracksAddedEvent,
-    QueueTracksInsertedEvent,
-    QueueTracksRemovedEvent,
-    QueueTracksReorderedEvent,
     QueueVersion,
-    RendererRecord,
-    RendererStateUpdate,
-    SessionStateEvent,
-    SetStateEvent,
 )
 from .reducer import reduce
 from .session import SessionCallbacks
 from .sync_types import (
     CanonicalState,
-    CloudActiveRendererChanged,
     CloudAddRenderer,
-    CloudAutoplaySet,
-    CloudAutoplayTracksLoaded,
-    CloudCleared,
-    CloudLoadAck,
-    CloudLoopSet,
     CloudQuality,
     CloudQueueError,
-    CloudRemoveRenderer,
-    CloudRendererStateUpdated,
     CloudSessionState,
     CloudSetActive,
-    CloudSetState,
-    CloudShuffleSet,
     CloudSnapshot,
-    CloudStateRequest,
-    CloudTracksAdded,
-    CloudTracksInserted,
-    CloudTracksRemoved,
-    CloudTracksReordered,
-    CloudVersionChanged,
-    CloudVolume,
-    CloudVolumeDelta,
     Disconnected,
     Event,
     MaModesChanged,
@@ -206,34 +180,45 @@ class QobuzConnectCoordinator:
             task.cancel()
 
     def build_session_callbacks(self) -> SessionCallbacks:
-        """Build the ``SessionCallbacks`` bundle that translates cloud messages into events."""
+        """
+        Build the ``SessionCallbacks`` bundle the inbound dispatcher fans out to.
+
+        Every codec-built cloud event flows through ``submit``; ``on_set_active``
+        / ``on_quality`` are the coordinator defaults the provider overrides to
+        add the activation volume/quality broadcast and quality-config
+        persistence.
+        """
         return SessionCallbacks(
-            on_set_state=self._on_set_state,
-            on_queue_load_ack=self._on_queue_load_ack,
-            on_autoplay_tracks_loaded=self._on_autoplay_tracks_loaded,
-            on_queue_error=self._on_queue_error,
-            on_queue_version=self._on_queue_version,
-            on_queue_state=self._on_queue_state,
-            on_queue_tracks_added=self._on_queue_tracks_added,
-            on_queue_tracks_inserted=self._on_queue_tracks_inserted,
-            on_queue_tracks_removed=self._on_queue_tracks_removed,
-            on_queue_tracks_reordered=self._on_queue_tracks_reordered,
-            on_queue_cleared=self._on_queue_cleared,
-            on_volume=self._on_volume,
-            on_volume_delta=self._on_volume_delta,
-            on_quality=self._on_quality,
-            on_loop_mode=self._on_loop_mode,
-            on_shuffle_mode=self._on_shuffle_mode,
-            on_autoplay_mode=self._on_autoplay_mode,
-            on_state_request=self._on_state_request,
+            submit=self.submit,
             on_set_active=self._on_set_active,
-            on_session_state=self._on_session_state,
-            on_add_renderer=self._on_add_renderer,
-            on_remove_renderer=self._on_remove_renderer,
-            on_active_renderer_changed=self._on_active_renderer_changed,
-            on_renderer_state_updated=self._on_renderer_state_updated,
+            on_quality=self._on_quality,
             on_disconnected=self._on_disconnected,
         )
+
+    async def submit(self, event: Event) -> None:
+        """
+        Intake for codec-built cloud events: inject coordinator context, then reduce.
+
+        A few events carry fields only the shell can fill: the last
+        SESSION_STATE trackIndex (memoized here and stamped onto snapshots),
+        this device's own-renderer verdict, and the version fallback for a
+        wire error that carried none. Everything else passes straight through.
+        """
+        if isinstance(event, CloudSessionState):
+            self._last_track_index = event.track_index
+        elif isinstance(event, CloudSnapshot):
+            # The snapshot carries no track pointer; use the last SESSION_STATE
+            # trackIndex we saw.
+            event = dataclasses.replace(event, track_index=self._last_track_index)
+        elif isinstance(event, CloudAddRenderer):
+            # Own-ness needs uuid-comparison context the pure reducer lacks.
+            event = dataclasses.replace(event, is_own=event.device_uuid == self._device_uuid)
+        elif isinstance(event, CloudQueueError) and event.version == QueueVersion():
+            # A wire error with no queue_version parses to the (0,0) default;
+            # fall back to our current cloud_version so a rejection still
+            # rebases against the version we hold.
+            event = dataclasses.replace(event, version=self._state.cloud_version)
+        await self._submit(event)
 
     # ---- MA-side entry points ----------------------------------------------
 
@@ -390,182 +375,16 @@ class QobuzConnectCoordinator:
                     LOGGER.exception("Qobuz Connect effect %s failed", type(effect).__name__)
             self._sync_proposal_timers()
 
-    # ---- session callback translators ---------------------------------------
-
-    async def _on_set_state(self, event: SetStateEvent) -> None:
-        await self._submit(
-            CloudSetState(
-                now_ms=self._now(),
-                version=event.queue_version,
-                playing=event.playing_state,
-                position_ms=event.position_ms,
-                current_ref=event.current_item,
-            )
-        )
-
-    async def _on_queue_load_ack(self, ack: QueueLoadAck) -> None:
-        await self._submit(
-            CloudLoadAck(
-                now_ms=self._now(),
-                version=ack.queue_version,
-                action_uuid=ack.action_uuid,
-                tracks=tuple(ack.tracks),
-                queue_position=ack.queue_position,
-            )
-        )
-
-    async def _on_autoplay_tracks_loaded(self, ack: QueueLoadAck) -> None:
-        await self._submit(
-            CloudAutoplayTracksLoaded(
-                now_ms=self._now(),
-                version=ack.queue_version,
-                action_uuid=ack.action_uuid,
-                tracks=tuple(ack.tracks),
-            )
-        )
-
-    async def _on_queue_error(self, error: QueueError) -> None:
-        await self._submit(
-            CloudQueueError(
-                now_ms=self._now(),
-                version=error.queue_version or self._state.cloud_version,
-                action_uuid=error.action_uuid,
-                code=str(error.code),
-                message=error.message,
-            )
-        )
-
-    async def _on_queue_version(self, version: QueueVersion) -> None:
-        await self._submit(CloudVersionChanged(now_ms=self._now(), version=version))
-
-    async def _on_queue_state(self, snapshot: QueueStateSnapshot) -> None:
-        await self._submit(
-            CloudSnapshot(
-                now_ms=self._now(),
-                version=snapshot.queue_version,
-                tracks=tuple(snapshot.tracks),
-                autoplay_tracks=tuple(snapshot.autoplay_tracks),
-                shuffle=snapshot.shuffle_mode,
-                autoplay=snapshot.autoplay_mode,
-                # QueueStateSnapshot carries no track pointer of its own; fall
-                # back to the last SESSION_STATE trackIndex the coordinator
-                # has seen.
-                track_index=self._last_track_index,
-            )
-        )
-
-    async def _on_queue_tracks_added(self, event: QueueTracksAddedEvent) -> None:
-        await self._submit(
-            CloudTracksAdded(
-                now_ms=self._now(),
-                version=event.queue_version,
-                action_uuid=event.action_uuid,
-                tracks=tuple(event.tracks),
-            )
-        )
-
-    async def _on_queue_tracks_inserted(self, event: QueueTracksInsertedEvent) -> None:
-        await self._submit(
-            CloudTracksInserted(
-                now_ms=self._now(),
-                version=event.queue_version,
-                action_uuid=event.action_uuid,
-                tracks=tuple(event.tracks),
-                insert_after=event.insert_after,
-            )
-        )
-
-    async def _on_queue_tracks_removed(self, event: QueueTracksRemovedEvent) -> None:
-        await self._submit(
-            CloudTracksRemoved(
-                now_ms=self._now(),
-                version=event.queue_version,
-                action_uuid=event.action_uuid,
-                queue_item_ids=tuple(event.queue_item_ids),
-            )
-        )
-
-    async def _on_queue_tracks_reordered(self, event: QueueTracksReorderedEvent) -> None:
-        await self._submit(
-            CloudTracksReordered(
-                now_ms=self._now(),
-                version=event.queue_version,
-                action_uuid=event.action_uuid,
-                queue_item_ids=tuple(event.queue_item_ids),
-                insert_after=event.insert_after,
-            )
-        )
-
-    async def _on_queue_cleared(self, event: QueueClearedEvent) -> None:
-        await self._submit(
-            CloudCleared(
-                now_ms=self._now(), version=event.queue_version, action_uuid=event.action_uuid
-            )
-        )
-
-    async def _on_volume(self, volume: int) -> None:
-        await self._submit(CloudVolume(now_ms=self._now(), volume=volume))
-
-    async def _on_volume_delta(self, delta: int) -> None:
-        await self._submit(CloudVolumeDelta(now_ms=self._now(), delta=delta))
-
-    async def _on_quality(self, quality: int) -> None:
-        await self._submit(CloudQuality(now_ms=self._now(), quality=quality))
-
-    async def _on_loop_mode(self, mode: LoopMode) -> None:
-        await self._submit(CloudLoopSet(now_ms=self._now(), action_uuid=None, loop=mode))
-
-    async def _on_shuffle_mode(self, shuffle: bool) -> None:
-        await self._submit(CloudShuffleSet(now_ms=self._now(), action_uuid=None, shuffle=shuffle))
-
-    async def _on_autoplay_mode(self, autoplay: bool) -> None:
-        await self._submit(
-            CloudAutoplaySet(now_ms=self._now(), action_uuid=None, autoplay=autoplay)
-        )
-
-    async def _on_state_request(self) -> None:
-        await self._submit(CloudStateRequest(now_ms=self._now()))
+    # ---- provider hooks (overridable) + lifecycle ---------------------------
 
     async def _on_set_active(self, active: bool) -> None:
-        await self._submit(CloudSetActive(now_ms=self._now(), active=active))
+        await self.submit(CloudSetActive(now_ms=self._now(), active=active))
 
-    async def _on_session_state(self, event: SessionStateEvent) -> None:
-        self._last_track_index = event.track_index
-        await self._submit(
-            CloudSessionState(
-                now_ms=self._now(), version=event.queue_version, track_index=event.track_index
-            )
-        )
-
-    async def _on_add_renderer(self, record: RendererRecord) -> None:
-        await self._submit(
-            CloudAddRenderer(
-                now_ms=self._now(),
-                renderer_id=record.renderer_id,
-                device_uuid=record.device_uuid,
-                is_own=record.device_uuid == self._device_uuid,
-            )
-        )
-
-    async def _on_remove_renderer(self, renderer_id: int) -> None:
-        await self._submit(CloudRemoveRenderer(now_ms=self._now(), renderer_id=renderer_id))
-
-    async def _on_active_renderer_changed(self, renderer_id: int) -> None:
-        await self._submit(CloudActiveRendererChanged(now_ms=self._now(), renderer_id=renderer_id))
-
-    async def _on_renderer_state_updated(self, update: RendererStateUpdate) -> None:
-        await self._submit(
-            CloudRendererStateUpdated(
-                now_ms=self._now(),
-                renderer_id=update.renderer_id,
-                playing=update.playing_state,
-                position_ms=update.position_ms,
-                current_index=update.current_queue_index,
-            )
-        )
+    async def _on_quality(self, quality: int) -> None:
+        await self.submit(CloudQuality(now_ms=self._now(), quality=quality))
 
     async def _on_disconnected(self) -> None:
-        await self._submit(Disconnected(now_ms=self._now()))
+        await self.submit(Disconnected(now_ms=self._now()))
 
     # ---- proposal-timeout timer ----------------------------------------------
 

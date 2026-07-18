@@ -19,12 +19,13 @@ Exposes:
 - ``QobuzConnectSession`` (callback-style interface).
 
 Depends on:
-- :mod:`.protocol` for encode/decode, :mod:`.models` for enums + DTOs.
+- :mod:`.protocol` for encode/decode, :mod:`.models` for enums + value types,
+  :mod:`.sync_types` for the ``Event`` type of the ``submit`` callback.
 - The ``websockets`` library (network transport).
-- **No MA imports.** The session has no awareness of the player queue
-  or any MA concept; everything domain-specific is routed via the
-  provider-supplied callbacks (``on_set_state``, ``on_volume``,
-  ``on_set_active``, ``on_queue_load_ack``, ...).
+- **No MA imports.** The session has no awareness of the player queue or any
+  MA concept; the codec turns each inbound frame into a ``sync_types`` event
+  and the dispatcher hands it to the provider-supplied ``submit`` callback
+  (plus the ``on_set_active`` / ``on_quality`` provider hooks).
 
 See :doc:`ARCHITECTURE` for the inbound dispatch table and the steady-state
 message loop diagram.
@@ -51,22 +52,11 @@ from .models import (
     JWTConnectToken,
     LoopMode,
     PlayingState,
-    QueueClearedEvent,
-    QueueError,
-    QueueLoadAck,
-    QueueStateSnapshot,
     QueueTrackRef,
-    QueueTracksAddedEvent,
-    QueueTracksInsertedEvent,
-    QueueTracksRemovedEvent,
-    QueueTracksReorderedEvent,
     QueueVersion,
-    RendererRecord,
-    RendererStateUpdate,
-    SessionStateEvent,
-    SetStateEvent,
 )
 from .protocol import QobuzConnectCodec
+from .sync_types import Event
 
 LOGGER = logging.getLogger(__name__)
 
@@ -109,46 +99,20 @@ class QobuzServerDisconnect(Exception):
 @dataclass(slots=True, frozen=True)
 class SessionCallbacks:
     """
-    Typed bundle of every callback the provider supplies to the session.
+    The callbacks the provider supplies to the session's inbound dispatcher.
 
-    The :class:`.inbound_dispatcher.InboundDispatcher` consumes these
-    when it routes a decoded inner message; the session itself only
-    holds the bundle so it can hand it to the dispatcher at construction
-    time.
+    Every inbound cloud message the codec turns into a :class:`.sync_types`
+    event is fed to ``submit``; only the two provider-level hooks that do more
+    than the reducer (activation volume/quality broadcast, quality-config
+    persistence) and the disconnect lifecycle stay as dedicated callbacks.
     """
 
-    on_set_state: Callable[[SetStateEvent], Awaitable[None]]
-    on_queue_load_ack: Callable[[QueueLoadAck], Awaitable[None]]
-    on_queue_error: Callable[[QueueError], Awaitable[None]]
-    on_queue_version: Callable[[QueueVersion], Awaitable[None]]
-    on_queue_state: Callable[[QueueStateSnapshot], Awaitable[None]]
-    on_queue_tracks_added: Callable[[QueueTracksAddedEvent], Awaitable[None]]
-    on_queue_tracks_inserted: Callable[[QueueTracksInsertedEvent], Awaitable[None]]
-    on_queue_tracks_removed: Callable[[QueueTracksRemovedEvent], Awaitable[None]]
-    on_queue_tracks_reordered: Callable[[QueueTracksReorderedEvent], Awaitable[None]]
-    on_queue_cleared: Callable[[QueueClearedEvent], Awaitable[None]]
-    on_volume: Callable[[int], Awaitable[None]]
-    on_volume_delta: Callable[[int], Awaitable[None]]
-    on_quality: Callable[[int], Awaitable[None]]
-    on_loop_mode: Callable[[LoopMode], Awaitable[None]]
-    on_shuffle_mode: Callable[[bool], Awaitable[None]]
-    on_autoplay_mode: Callable[[bool], Awaitable[None]]
-    on_state_request: Callable[[], Awaitable[None]]
+    submit: Callable[[Event], Awaitable[None]]
     on_set_active: Callable[[bool], Awaitable[None]]
-    on_session_state: Callable[[SessionStateEvent], Awaitable[None]]
-    # Controller-role extras — only wired on the controller session; the
-    # renderer session leaves them None and the dispatcher keeps ignoring
-    # the corresponding broadcasts.
-    on_add_renderer: Callable[[RendererRecord], Awaitable[None]] | None = None
-    on_remove_renderer: Callable[[int], Awaitable[None]] | None = None
-    on_active_renderer_changed: Callable[[int], Awaitable[None]] | None = None
-    on_renderer_state_updated: Callable[[RendererStateUpdate], Awaitable[None]] | None = None
-    # Autoplay continuation tracks (SRVR_CTRL_AUTOPLAY_TRACKS_LOADED) — appended
-    # to the queue, distinct from a full queue (re)load which replaces it.
-    on_autoplay_tracks_loaded: Callable[[QueueLoadAck], Awaitable[None]] | None = None
+    on_quality: Callable[[int], Awaitable[None]]
     # Fired whenever the connection loop tears down the websocket (both on
     # error and on a clean stop iteration); lets owners drop any state that
-    # is only valid while connected (e.g. renderer-registry ids).
+    # is only valid while connected.
     on_disconnected: Callable[[], Awaitable[None]] | None = None
 
 
