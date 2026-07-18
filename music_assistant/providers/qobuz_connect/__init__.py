@@ -69,7 +69,6 @@ from .models import (
     ConnectTokens,
     DeviceConfig,
     JWTConnectToken,
-    QobuzMirror,
     SessionRole,
 )
 from .outbound_reporter import OutboundReporter
@@ -84,8 +83,6 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
     from music_assistant.providers.qobuz import QobuzProvider
-
-    from .sync_types import CanonicalState
 
 
 CONF_TARGET_PLAYER = "target_player"
@@ -216,15 +213,22 @@ class QobuzConnectProvider(PluginProvider):
         self._session: QobuzConnectSession | None = None
         self._enable_controller = bool(config.get_value(CONF_ENABLE_CONTROLLER))
         # Sync core: a pure reducer (reducer.py/sync_types.py) driving an
-        # impure coordinator + effect runner, replacing the retired
-        # QobuzConnectSyncEngine. MABridge stands alone (it already only
-        # wraps ``self``); MetadataResolver/OutboundReporter are built
-        # against a retired-engine-shaped host (below) instead of the real
-        # engine — see ``_MetadataHost``/``_ReporterHost``.
+        # impure coordinator + effect runner. MABridge is the single seam to
+        # MA; MetadataResolver and OutboundReporter take explicit getters for
+        # exactly what they read (no duck-typed engine host).
         self._bridge = MABridge(self)
-        self._metadata = MetadataResolver(cast("Any", _MetadataHost(self._bridge)))
+        self._metadata = MetadataResolver(
+            qobuz_provider_getter=self._bridge.qobuz_music_provider,
+            logger=self.logger,
+        )
         self._reporter = OutboundReporter(
-            cast("Any", _ReporterHost(self._bridge, lambda: self._coordinator.state))
+            session_getter=lambda: self._session,
+            state_getter=lambda: self._coordinator.state,
+            duration_getter=self._current_track_duration_ms,
+            active_getter=lambda: (
+                self._coordinator.state.active and self._bridge.target_player_id() is not None
+            ),
+            logger=self.logger,
         )
         # EffectRunner's ``session`` parameter wants a concrete session, but
         # ours is created later (in ``_setup_websocket``) and gets replaced
@@ -634,6 +638,20 @@ class QobuzConnectProvider(PluginProvider):
             await self._session.send_volume_muted(muted)
             self._last_sent_muted = muted
 
+    def _current_track_duration_ms(self) -> int:
+        """
+        Return the target player's current queue-item duration in milliseconds.
+
+        ``CanonicalState`` carries no track duration, so the reporter reads it
+        live from MA's queue (``QueueItem.duration`` is in seconds); falls back
+        to ``0`` when no queue / current item / duration is available.
+        """
+        player_id = self._bridge.target_player_id()
+        queue = self._bridge.get_queue(player_id) if player_id else None
+        current_item = getattr(queue, "current_item", None) if queue is not None else None
+        duration_s = getattr(current_item, "duration", None) if current_item is not None else None
+        return int(duration_s * 1000) if duration_s else 0
+
     async def _on_ma_queue_event(self, event: MassEvent) -> None:
         """
         Forward MA transport/mode changes (``QUEUE_UPDATED``) into the coordinator.
@@ -723,89 +741,6 @@ class _LiveSessionProxy:
             return False
 
         return _noop
-
-
-class _MetadataHost:
-    """
-    Minimal duck-typed 'engine' satisfying ``MetadataResolver``'s constructor.
-
-    ``MetadataResolver`` was built against the retired ``QobuzConnectSyncEngine``
-    and only ever reads ``engine.bridge`` through the one method the effect
-    runner actually calls (``get_track_or_none``), so this host needs nothing
-    beyond ``bridge``.
-    """
-
-    __slots__ = ("bridge",)
-
-    def __init__(self, bridge: MABridge) -> None:
-        """Wrap the provider's MABridge for MetadataResolver's benefit."""
-        self.bridge = bridge
-
-
-class _ReporterHost:
-    """
-    Minimal duck-typed 'engine' satisfying ``OutboundReporter``'s constructor.
-
-    ``qobuz_state`` is a live projection of the coordinator's
-    ``CanonicalState`` (rather than a field some caller has to remember to
-    keep in sync) so the heartbeat / ``ReportState`` effect keeps reporting
-    current position/track/playing data off a single source of truth.
-    ``CanonicalState`` doesn't
-    carry ``duration_ms``/``buffer_state``/``next_item`` (those lived on the
-    retired ``QobuzMirror`` only); ``buffer_state``/``next_item`` fall back to
-    safe defaults, while ``duration_ms`` is read live from MA's current queue
-    item so the Qobuz app's progress bar isn't stuck at a zero-length track.
-    """
-
-    __slots__ = ("_state_getter", "bridge")
-
-    def __init__(self, bridge: MABridge, state_getter: Callable[[], CanonicalState]) -> None:
-        """Wrap the provider's MABridge and a getter for the coordinator's live state."""
-        self.bridge = bridge
-        self._state_getter = state_getter
-
-    @property
-    def qobuz_state(self) -> QobuzMirror:
-        """Project the coordinator's current ``CanonicalState`` as a ``QobuzMirror``."""
-        state = self._state_getter()
-        current_item = None
-        if state.current_id is not None:
-            current_item = next(
-                (t for t in state.tracks if t.track_id == str(state.current_id)), None
-            )
-        return QobuzMirror(
-            queue_version=state.cloud_version,
-            current_item=current_item,
-            playing_state=state.playing,
-            position_ms=state.position_ms,
-            position_timestamp_ms=state.position_anchor_ms,
-            duration_ms=self._current_duration_ms(),
-            tracks=list(state.tracks),
-            loop_mode=state.loop,
-            autoplay_mode=state.autoplay,
-        )
-
-    @property
-    def _is_active(self) -> bool:
-        """Whether the heartbeat should report: active AND a target player exists."""
-        # Without the target-player check, a removed/vanished player froze
-        # canonical state at its last value and the heartbeat kept reporting
-        # stale PLAYING forever — ghost playback in the Qobuz app.
-        return self._state_getter().active and self.bridge.target_player_id() is not None
-
-    def _current_duration_ms(self) -> int:
-        """
-        Return the target player's current queue-item duration in milliseconds.
-
-        ``CanonicalState`` carries no track duration, so read it live from MA's
-        queue (``QueueItem.duration`` is in seconds); falls back to ``0`` when no
-        queue / current item / duration is available.
-        """
-        player_id = self.bridge.target_player_id()
-        queue = self.bridge.get_queue(player_id) if player_id else None
-        current_item = getattr(queue, "current_item", None) if queue is not None else None
-        duration_s = getattr(current_item, "duration", None) if current_item is not None else None
-        return int(duration_s * 1000) if duration_s else 0
 
 
 def _normalize_quality_id(value: int) -> int | None:
