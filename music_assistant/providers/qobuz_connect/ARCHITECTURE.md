@@ -58,16 +58,14 @@ actually fetches the audio.
     └─ exposes /streamcore/* aiohttp handlers; the Qobuz app POSTs the
        JWT auth tokens + session_id to /streamcore/connect-to-qconnect
 
-3.  Provider opens the cloud WebSocket(s)
-    ├─ on_connect callback in __init__.py creates the renderer
-    │  QobuzConnectSession
+3.  Provider opens the cloud WebSocket
+    ├─ __init__.py creates a single QobuzConnectSession
     ├─ session.py sends OuterMessageType.AUTHENTICATE (JWT) ┐
     ├─ session.py sends OuterMessageType.SUBSCRIBE (QConnect proto)
-    ├─ session.py sends the role's JOIN message: CtrlSrvrJoinSession when
-    │  `enable_controller` is on (dual-role — see "The single dual-role
-    │  connection" below), else the legacy RndrSrvrJoinSession
+    ├─ session.py sends CtrlSrvrJoinSession (see "The single dual-role
+    │  connection" below)
     └─ one websocket per instance carries both renderer reports and
-       controller verbs — same JWT type, role chosen by the JOIN message
+       controller verbs
 
 4.  Steady state: bidirectional message loop
     ├─ session.py decodes outer envelopes via QobuzConnectCodec.decode_frame
@@ -122,10 +120,9 @@ role** (`CtrlSrvrJoinSession{deviceInfo}`), exactly like the reference
 Qobuz Web Client. That single socket both *reports renderer state*
 (`RNDR_SRVR_STATE_UPDATED`, volume/quality reports) and *sends controller
 verbs* (`CTRL_SRVR_*`), and receives everything the cloud routes to the
-device identity. The `enable_controller` config option (on by default)
-falls the join back to the legacy renderer role
-(`RndrSrvrJoinSession` + session-uuid subscribe), which restores the
-pre-controller receive-only behavior.
+device identity. The controller join is the only mode the provider runs —
+the legacy renderer-role join (`RndrSrvrJoinSession` + session-uuid
+subscribe) was retired.
 
 ### Why one connection (history)
 
@@ -148,15 +145,17 @@ connection, matching the reference client.
 `POST qws/createToken` mints the same generic JWT for every connection
 regardless of role; its claims are just `{quid, qaid}`. What makes a
 connection a renderer or a controller is which JOIN message it sends
-after `AUTHENTICATE` → `SUBSCRIBE`:
+after `AUTHENTICATE` → `SUBSCRIBE`. The protocol has two; MA only ever
+sends the controller one:
 
-- `RndrSrvrJoinSession{deviceUuid, sessionUuid, ...}` → renderer
-  (subscribe carries the session uuid channel).
 - `CtrlSrvrJoinSession{deviceInfo}` → controller (subscribe carries no
   channels). `deviceInfo` is mandatory; joining without it is rejected
   with "Error while processing JoinSessionMessage". A controller-joined
   connection still registers a picker entry from its `deviceInfo` and
   receives renderer-directed frames — dual-role, like the web client.
+- `RndrSrvrJoinSession{deviceUuid, sessionUuid, ...}` → renderer
+  (subscribe carries the session uuid channel). Retired — MA no longer
+  builds or sends it.
 
 Verified live against production (`wss://qws-eu-prod.qobuz.com/ws`,
 2026-07-07/08) with the Playwright capture harness — see
@@ -205,18 +204,15 @@ aren't already active. On connection loss (`Disconnected` event, from the
 session's connection loop) both ids are cleared and re-discovered from the
 next bootstrap.
 
-### Eager connect (controller mode)
+### Eager connect
 
 The connection is opened at provider load, self-minting the websocket
-token via `qws/createToken` — NOT on the app's local handshake (the
-legacy renderer behavior). Waiting for the handshake loses the first
-handoff after a restart: the phone's SET_ACTIVE races our
-connect+join and the app bounces playback back when no renderer
-answers (live 2026-07-08). For the same reason, a handshake must never
-swap tokens on an already-connected controller-role session — a token
-swap closes and reopens the socket at the exact moment the cloud needs
-it up. Renderer role keeps the lazy handshake-driven connect (it needs
-the handshake's session uuid to join).
+token via `qws/createToken` — NOT on the app's local handshake. Waiting
+for the handshake loses the first handoff after a restart: the phone's
+SET_ACTIVE races our connect+join and the app bounces playback back when
+no renderer answers (live 2026-07-08). For the same reason, a handshake
+must never swap tokens on an already-connected session — a token swap
+closes and reopens the socket at the exact moment the cloud needs it up.
 
 ### Playback takeover on activation
 
@@ -396,7 +392,6 @@ by `session.py` / the provider.
 |      66 | `CTRL_SRVR_QUEUE_LOAD_TRACKS`            | `encode_queue_load_tracks`               | `PushLoad` effect via `session.send_queue_load_tracks`; MA-origin loads are skipped (one warning per outage) while the controller socket is down |
 |      73 | `CTRL_SRVR_MUTE_VOLUME`                  | `encode_ctrl_mute_volume`                | `PushMute` effect (no reducer callsite yet)                                                |
 |       — | `CTRL_SRVR_QUEUE_ADD/INSERT/REMOVE/REORDER/CLEAR_TRACKS` | (per-verb encoders)       | `PushAdd` / `PushInsert` / `PushRemove` / `PushReorder` / `PushClear` effects              |
-|       — | `RNDR_SRVR_JOIN_SESSION`                 | `encode_join_session`                    | `session.start()` after SUBSCRIBE (renderer role only)                                    |
 
 ## The sync core
 

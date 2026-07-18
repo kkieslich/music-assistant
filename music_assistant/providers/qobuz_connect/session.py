@@ -63,7 +63,6 @@ from .models import (
     QueueVersion,
     RendererRecord,
     RendererStateUpdate,
-    SessionRole,
     SessionStateEvent,
     SetStateEvent,
 )
@@ -161,11 +160,12 @@ class QobuzConnectSession:
         device: DeviceConfig,
         callbacks: SessionCallbacks,
         token_refresher: Callable[[], Awaitable[JWTConnectToken | None]] | None = None,
-        *,
-        role: SessionRole = SessionRole.RENDERER,
     ) -> None:
         """
         Initialize session.
+
+        The session always joins as a controller (the mode that matches the
+        reference web client); the retired renderer role is gone.
 
         :param device: The advertised Qobuz Connect device config.
         :param callbacks: Inbound protocol event callbacks.
@@ -173,17 +173,13 @@ class QobuzConnectSession:
             token independently of the app handshake. Called when the current
             token is missing or about to expire so the cloud session survives
             after the controlling app is closed.
-        :param role: Whether this session acts as a renderer (playback target) or
-            a controller (drives other renderers via the cloud session).
         """
         self.device = device
         self._token_refresher = token_refresher
-        self.role = role
         self._device_uuid = _uuid_to_bytes(device.uuid)
         self._codec = QobuzConnectCodec(self._device_uuid)
         self._ws: ClientConnection | None = None
         self._ws_token: JWTConnectToken | None = None
-        self._session_uuid: bytes | None = None
         self._token_update_event = asyncio.Event()
         self._token_version = 0
         self._should_run = False
@@ -201,7 +197,7 @@ class QobuzConnectSession:
         self._dispatcher = InboundDispatcher(
             self._codec,
             callbacks,
-            label=self.role.value,
+            label="controller",
             # The cloud rejects frames from a deregistered renderer with
             # message-level errors (type 1), not outer ERROR frames — both
             # must funnel into the same rate-limited rejoin.
@@ -216,17 +212,11 @@ class QobuzConnectSession:
     def set_tokens(self, tokens: ConnectTokens) -> None:
         """Set or refresh Qobuz cloud tokens."""
         previous_token = self._ws_token
-        previous_session_uuid = self._session_uuid
         if tokens.ws_token:
             self._ws_token = tokens.ws_token
-        self._session_uuid = _uuid_to_bytes(tokens.session_id)
         self._token_version += 1
         self._token_update_event.set()
-        if (
-            self._should_run
-            and self._ws
-            and (previous_token != self._ws_token or previous_session_uuid != self._session_uuid)
-        ):
+        if self._should_run and self._ws and previous_token != self._ws_token:
             # Cancel a still-pending close from a previous handshake before
             # dropping our only strong reference to it (asyncio tasks are
             # weak-ref'd; an orphaned task can be GC'd mid-close).
@@ -534,25 +524,14 @@ class QobuzConnectSession:
                     self._ws = ws
                     self._is_connected = False
                     await ws.send(self._codec.encode_authenticate(self._ws_token.jwt))
-                    if self.role is SessionRole.CONTROLLER:
-                        await ws.send(self._codec.encode_subscribe(None))
-                        await ws.send(
-                            self._codec.encode_ctrl_join_session(
-                                self._device_uuid,
-                                self.device.name,
-                                self.device.max_quality,
-                            )
+                    await ws.send(self._codec.encode_subscribe(None))
+                    await ws.send(
+                        self._codec.encode_ctrl_join_session(
+                            self._device_uuid,
+                            self.device.name,
+                            self.device.max_quality,
                         )
-                    elif self._session_uuid:
-                        await ws.send(self._codec.encode_subscribe(self._session_uuid))
-                        await ws.send(
-                            self._codec.encode_join_session(
-                                self._device_uuid,
-                                self.device.name,
-                                self._session_uuid,
-                                self.device.max_quality,
-                            )
-                        )
+                    )
                     self._is_connected = True
                     self._reconnect_delay = INITIAL_RECONNECT_DELAY
                     await self._flush_pending_messages()
@@ -694,10 +673,10 @@ class QobuzConnectSession:
 
         The cloud can silently deregister a device while its socket stays
         open — every state report is then answered with a message-level
-        type-1 error. Re-sending the role-appropriate SUBSCRIBE + JOIN
-        restores registration. Rate-limited so an error storm can't loop.
-        Semantic per-report rejections (see ``REPORT_SEMANTIC_ERRORS``) are
-        excluded — they don't indicate lost registration.
+        type-1 error. Re-sending the controller SUBSCRIBE + JOIN restores
+        registration. Rate-limited so an error storm can't loop. Semantic
+        per-report rejections (see ``REPORT_SEMANTIC_ERRORS``) are excluded —
+        they don't indicate lost registration.
         """
         if not self._ws or not self._is_connected:
             return
@@ -705,31 +684,16 @@ class QobuzConnectSession:
         if any(marker in lowered for marker in REPORT_SEMANTIC_ERRORS):
             LOGGER.debug("Skipping rejoin for semantic report error: %s", message)
             return
-        session_uuid = self._session_uuid
-        if self.role is SessionRole.RENDERER and session_uuid is None:
-            return
         now = time.monotonic()
         if now - self._last_rejoin_monotonic < REJOIN_MIN_INTERVAL:
             return
         self._last_rejoin_monotonic = now
-        LOGGER.info("Qobuz Connect ERROR received — re-joining session (role=%s)", self.role.value)
-        if self.role is SessionRole.CONTROLLER:
-            await self._ws.send(self._codec.encode_subscribe(None))
-            await self._ws.send(
-                self._codec.encode_ctrl_join_session(
-                    self._device_uuid,
-                    self.device.name,
-                    self.device.max_quality,
-                )
-            )
-            return
-        assert session_uuid is not None
-        await self._ws.send(self._codec.encode_subscribe(session_uuid))
+        LOGGER.info("Qobuz Connect ERROR received — re-joining controller session")
+        await self._ws.send(self._codec.encode_subscribe(None))
         await self._ws.send(
-            self._codec.encode_join_session(
+            self._codec.encode_ctrl_join_session(
                 self._device_uuid,
                 self.device.name,
-                session_uuid,
                 self.device.max_quality,
             )
         )

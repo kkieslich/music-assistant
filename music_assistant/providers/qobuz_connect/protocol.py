@@ -136,34 +136,6 @@ class QobuzConnectCodec:
         msg.payload = inner_payload
         return self._pack_frame(OuterMessageType.PAYLOAD, msg.SerializeToString())
 
-    def encode_join_session(
-        self,
-        device_uuid: bytes,
-        friendly_name: str,
-        session_uuid: bytes,
-        max_audio_quality: int,
-    ) -> bytes:
-        """
-        Encode renderer join-session message.
-
-        The Qobuz Web Client doesn't send this (it's a controller role
-        authenticating with a user JWT), but a renderer authenticating
-        with a device-session JWT from ``/connect`` must — otherwise the
-        cloud closes the WS with a type-1 ERROR after the SUBSCRIBE.
-        """
-        device_info = self._build_device_info(device_uuid, friendly_name, max_audio_quality)
-
-        join = payload_pb2.RndrSrvrJoinSession()
-        join.sessionUuid = session_uuid
-        join.deviceInfo.CopyFrom(device_info)
-        join.reason = 1
-        join.isActive = True
-
-        msg = payload_pb2.QConnectMessage()
-        msg.messageType = QConnectMessageType.RNDR_SRVR_JOIN_SESSION
-        msg.rndrSrvrJoinSession.CopyFrom(join)
-        return self._encode_batch(msg)
-
     def encode_ctrl_join_session(self, device_uuid: bytes, name: str, max_quality: int) -> bytes:
         """
         Encode ``CTRL_SRVR_JOIN_SESSION`` — the controller-role hello.

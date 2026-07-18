@@ -1,4 +1,4 @@
-"""Tests for renderer rejoin-on-error."""
+"""Tests for controller rejoin-on-error."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from music_assistant.providers.qobuz_connect.models import (
     DeviceConfig,
     JWTConnectToken,
     OuterMessageType,
-    SessionRole,
 )
 from music_assistant.providers.qobuz_connect.protocol import QobuzConnectCodec
 from music_assistant.providers.qobuz_connect.session import (
@@ -39,13 +38,12 @@ def _callbacks() -> SessionCallbacks:
     return SessionCallbacks(**{f.name: _noop for f in dataclasses.fields(SessionCallbacks)})
 
 
-def _session(role: SessionRole = SessionRole.RENDERER) -> tuple[QobuzConnectSession, FakeWebSocket]:
+def _session() -> tuple[QobuzConnectSession, FakeWebSocket]:
     device = DeviceConfig(
         name="MA", uuid=str(uuid.uuid4()), http_port=8695, bind_address="0.0.0.0", max_quality=27
     )
-    session = QobuzConnectSession(device, _callbacks(), role=role)
+    session = QobuzConnectSession(device, _callbacks())
     session._ws_token = JWTConnectToken(jwt="j", exp=int(time.time()) + 3600, endpoint="wss://e")
-    session._session_uuid = uuid.uuid4().bytes
     fake = FakeWebSocket()
     session._ws = fake  # type: ignore[assignment]
     session._is_connected = True
@@ -77,8 +75,8 @@ def _inner_error_frame() -> bytes:
     return codec._encode_batch(msg)
 
 
-async def test_renderer_rejoins_after_error_frame() -> None:
-    """Test that renderer re-joins after receiving an ERROR frame."""
+async def test_rejoins_after_error_frame() -> None:
+    """Test that the controller session re-joins after receiving an ERROR frame."""
     session, fake = _session()
     await session._handle_message(_error_frame())
     # SUBSCRIBE + JOIN_SESSION were re-sent.
@@ -129,22 +127,14 @@ def _inner_field_name(frame: bytes) -> str:
 
 
 async def test_controller_session_rejoins_with_ctrl_join() -> None:
-    """A controller-role session re-sends SUBSCRIBE(empty) + CtrlSrvrJoinSession on ERROR."""
-    session, fake = _session(role=SessionRole.CONTROLLER)
+    """The controller session re-sends SUBSCRIBE(empty) + CtrlSrvrJoinSession on ERROR."""
+    session, fake = _session()
     await session._handle_message(_error_frame())
     assert len(fake.sent) == 2
     assert _inner_field_name(fake.sent[1]) == "ctrlSrvrJoinSession"
 
 
-async def test_renderer_rejoin_sends_renderer_join() -> None:
-    """The renderer-role rejoin still re-sends RndrSrvrJoinSession."""
-    session, fake = _session()
-    await session._handle_message(_error_frame())
-    assert len(fake.sent) == 2
-    assert _inner_field_name(fake.sent[1]) == "rndrSrvrJoinSession"
-
-
-async def test_renderer_rejoins_after_inner_error_message() -> None:
+async def test_rejoins_after_inner_error_message() -> None:
     """A message-level error inside a PAYLOAD batch also triggers the rejoin."""
     session, fake = _session()
     await session._handle_message(_inner_error_frame())

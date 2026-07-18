@@ -1778,8 +1778,6 @@
   "provider.qobuz.config_entries.quality.options.7": "Hi-Res 96kHz/24 bit",
   "provider.qobuz.errors.create_playlist_failed": "Failed to create playlist: {0}",
   "provider.qobuz.manifest.description": "Stream high-resolution music from Qobuz’s catalogue — ideal for audiophiles.",
-  "provider.qobuz_connect.config_entries.enable_controller.description": "Opens a second, controller-role connection to the Qobuz cloud (same device identity) so playback started from Music Assistant is mirrored in the Qobuz apps. Disable to fall back to receive-only behavior.",
-  "provider.qobuz_connect.config_entries.enable_controller.label": "Sync MA-initiated playback to the Qobuz app",
   "provider.qobuz_connect.config_entries.http_port.description": "Port the Qobuz app connects to on this host. Change only if it clashes with another service or you need to open it explicitly through a firewall.",
   "provider.qobuz_connect.config_entries.http_port.label": "HTTP discovery port",
   "provider.qobuz_connect.config_entries.initial_volume.description": "Volume reported to the Qobuz app on connect when the target player's current volume can't be read (e.g. Auto mode with no player available). When a target player is known, its current volume is used instead.",

@@ -146,7 +146,6 @@ class QobuzConnectCoordinator:
         runner: EffectRunner,
         bridge: MABridge,
         device_uuid: bytes,
-        controller_enabled: bool = True,
         now: Callable[[], int] = lambda: int(time.time() * 1000),
         recorder: FlightRecorder | None = None,
         unresolvable_getter: Callable[[], frozenset[str]] = frozenset,
@@ -158,8 +157,6 @@ class QobuzConnectCoordinator:
         :param bridge: MA-facing bridge the ``on_ma_*`` entry points read state from.
         :param device_uuid: This renderer's own Qobuz device uuid, used to resolve
             own-ness on ``SRVR_CTRL_ADD_RENDERER``.
-        :param controller_enabled: When ``False``, MA-side entry points no-op instead
-            of emitting cloud pushes — inbound cloud events still process normally.
         :param now: Wall-clock-ms provider for event timestamps; injectable for tests.
         :param recorder: Optional flight recorder fed one entry per reduced event.
         :param unresolvable_getter: Returns the track ids (as strings) the metadata
@@ -169,7 +166,6 @@ class QobuzConnectCoordinator:
         self._runner = runner
         self._bridge = bridge
         self._device_uuid = device_uuid
-        self._controller_enabled = controller_enabled
         self._now = now
         self._recorder = recorder
         self._unresolvable_getter = unresolvable_getter
@@ -243,8 +239,6 @@ class QobuzConnectCoordinator:
 
     async def on_ma_queue_event(self, player_id: str) -> None:
         """Translate MA's current queue contents into a ``MaQueueChanged`` event."""
-        if not self._controller_enabled:
-            return
         track_ids: list[int] = []
         resolvable: set[int] = set()
         for item in self._bridge.queue_items(player_id):
@@ -287,8 +281,6 @@ class QobuzConnectCoordinator:
 
     async def on_ma_transport_event(self, player_id: str) -> None:
         """Translate MA's current transport state into a ``MaTransportChanged`` event."""
-        if not self._controller_enabled:
-            return
         queue = self._bridge.get_queue(player_id)
         if queue is None:
             return
@@ -311,8 +303,6 @@ class QobuzConnectCoordinator:
 
     async def on_ma_modes_event(self, player_id: str) -> None:
         """Translate MA's current repeat mode into a ``MaModesChanged`` event."""
-        if not self._controller_enabled:
-            return
         queue = self._bridge.get_queue(player_id)
         if queue is None:
             return
@@ -332,8 +322,6 @@ class QobuzConnectCoordinator:
 
     async def on_ma_volume_event(self, player_id: str) -> None:
         """Translate MA's current player volume into a ``MaVolumeChanged`` event."""
-        if not self._controller_enabled:
-            return
         player = self._bridge.get_player(player_id)
         if player is None:
             return

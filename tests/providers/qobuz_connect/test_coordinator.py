@@ -116,7 +116,7 @@ def _refs(*ids: int) -> tuple[QueueTrackRef, ...]:
 
 
 def _coordinator(
-    *, controller_enabled: bool = True, bridge: _FakeBridge | None = None
+    *, bridge: _FakeBridge | None = None
 ) -> tuple[QobuzConnectCoordinator, _RecordingRunner, _FakeBridge]:
     runner = _RecordingRunner()
     bridge = bridge if bridge is not None else _FakeBridge()
@@ -124,7 +124,6 @@ def _coordinator(
         runner=runner,  # type: ignore[arg-type]
         bridge=bridge,  # type: ignore[arg-type]
         device_uuid=OUR_DEVICE_UUID,
-        controller_enabled=controller_enabled,
         now=lambda: 1,
     )
     return coord, runner, bridge
@@ -250,15 +249,6 @@ async def test_on_add_renderer_other_device_leaves_own_rid_none() -> None:
         RendererRecord(renderer_id=42, device_uuid=b"\x99" * 16, friendly_name="someone-else")
     )
     assert coord.state.own_rid is None
-
-
-async def test_controller_disabled_suppresses_ma_queue_push() -> None:
-    """With controller_enabled=False, on_ma_queue_event never submits — no PushAdd, no proposal."""
-    coord, runner, bridge = _coordinator(controller_enabled=False)
-    bridge.items = [{"track_id": "100"}, {"track_id": "101"}]
-    await coord.on_ma_queue_event("player")
-    assert runner.effects == []
-    assert coord.state.pending == ()
 
 
 # ---- proposal-timeout timer lifecycle -----------------------------------
@@ -533,15 +523,6 @@ async def test_on_ma_volume_event_dedups_unchanged_volume() -> None:
     volume_pushes = [e for e in runner.effects if isinstance(e, PushVolume)]
     assert len(volume_pushes) == 2
     assert volume_pushes[1].volume == 55
-
-
-async def test_controller_disabled_suppresses_ma_modes_push() -> None:
-    """With controller_enabled=False, on_ma_modes_event never submits — no PushLoop."""
-    coord, runner, bridge = _coordinator(controller_enabled=False)
-    bridge.queue = _FakeQueue(repeat="all")
-    await coord.on_ma_modes_event("player")
-    assert runner.effects == []
-    assert coord.state.loop is LoopMode.OFF
 
 
 async def test_ma_removal_is_detected_via_unresolvable_getter() -> None:
