@@ -11,7 +11,6 @@ from music_assistant_models.enums import PlaybackState as MAPlaybackState
 from music_assistant_models.media_items import Track
 
 from music_assistant.providers.qobuz_connect import (
-    CONF_ENABLE_CONTROLLER,
     CONF_HTTP_PORT,
     CONF_INITIAL_VOLUME,
     CONF_MAX_QUALITY,
@@ -103,7 +102,6 @@ def _make_provider(
         CONF_HTTP_PORT: 8695,
         CONF_MAX_QUALITY: "27",
         CONF_INITIAL_VOLUME: 25,
-        CONF_ENABLE_CONTROLLER: True,
     }
     config = MagicMock()
     config.instance_id = "qobuz_connect--test"

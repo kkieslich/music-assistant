@@ -145,13 +145,6 @@ class Origin(StrEnum):
     ACK = "ack"
 
 
-class SessionRole(StrEnum):
-    """Role a cloud websocket connection declares via its JOIN message."""
-
-    RENDERER = "renderer"
-    CONTROLLER = "controller"
-
-
 @dataclass(slots=True)
 class JWTConnectToken:
     """WebSocket JWT token received from the Qobuz app."""

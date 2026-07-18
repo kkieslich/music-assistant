@@ -5,14 +5,7 @@ from __future__ import annotations
 from music_assistant.providers.qobuz_connect.models import (
     QConnectMessageType,
     RendererRecord,
-    SessionRole,
 )
-
-
-def test_session_role_values() -> None:
-    """Both roles exist and are distinct string values."""
-    assert SessionRole.RENDERER.value == "renderer"
-    assert SessionRole.CONTROLLER.value == "controller"
 
 
 def test_controller_message_type_values_match_proto() -> None:

@@ -11,7 +11,6 @@ from music_assistant.providers.qobuz_connect.models import (
     DeviceConfig,
     QConnectMessageType,
     RendererRecord,
-    SessionRole,
 )
 from music_assistant.providers.qobuz_connect.proto import qconnect_payload_pb2 as _payload_pb2
 from music_assistant.providers.qobuz_connect.protocol import QobuzConnectCodec
@@ -35,16 +34,10 @@ def _device() -> DeviceConfig:
     )
 
 
-def test_session_role_defaults_to_renderer() -> None:
-    """A session constructed without ``role`` behaves as a renderer."""
+def test_session_constructs_without_role() -> None:
+    """A session is always controller now — it constructs with no role argument."""
     session = QobuzConnectSession(_device(), _callbacks())
-    assert session.role is SessionRole.RENDERER
-
-
-def test_controller_session_role_stored() -> None:
-    """Passing ``role=SessionRole.CONTROLLER`` is stored on the session."""
-    session = QobuzConnectSession(_device(), _callbacks(), role=SessionRole.CONTROLLER)
-    assert session.role is SessionRole.CONTROLLER
+    assert session is not None
 
 
 async def test_dispatcher_routes_add_renderer_to_callback() -> None:

@@ -69,7 +69,6 @@ from .models import (
     ConnectTokens,
     DeviceConfig,
     JWTConnectToken,
-    SessionRole,
 )
 from .outbound_reporter import OutboundReporter
 from .session import QobuzConnectSession, SessionCallbacks
@@ -90,7 +89,6 @@ CONF_PUBLISH_NAME = "publish_name"
 CONF_HTTP_PORT = "http_port"
 CONF_MAX_QUALITY = "max_quality"
 CONF_INITIAL_VOLUME = "initial_volume"
-CONF_ENABLE_CONTROLLER = "enable_controller"
 
 PLAYER_ID_AUTO = "__auto__"
 DEFAULT_INITIAL_VOLUME = 25
@@ -168,12 +166,6 @@ async def get_config_entries(
             default_value=DEFAULT_INITIAL_VOLUME,
             required=True,
         ),
-        ConfigEntry(
-            key=CONF_ENABLE_CONTROLLER,
-            type=ConfigEntryType.BOOLEAN,
-            default_value=True,
-            required=False,
-        ),
     )
 
 
@@ -211,7 +203,6 @@ class QobuzConnectProvider(PluginProvider):
         )
         self._discovery: QobuzConnectDiscovery | None = None
         self._session: QobuzConnectSession | None = None
-        self._enable_controller = bool(config.get_value(CONF_ENABLE_CONTROLLER))
         # Sync core: a pure reducer (reducer.py/sync_types.py) driving an
         # impure coordinator + effect runner. MABridge is the single seam to
         # MA; MetadataResolver and OutboundReporter take explicit getters for
@@ -256,7 +247,6 @@ class QobuzConnectProvider(PluginProvider):
             runner=self._effect_runner,
             bridge=self._bridge,
             device_uuid=uuid.UUID(self._device_uuid).bytes,
-            controller_enabled=self._enable_controller,
             recorder=self._flight_recorder,
             unresolvable_getter=lambda: self._metadata.unresolvable_track_ids,
         )
@@ -331,13 +321,11 @@ class QobuzConnectProvider(PluginProvider):
             self.mass.streams.bind_ip,
             self._http_port,
         )
-        # Controller mode connects to the cloud eagerly, self-minting the
-        # websocket token via qws/createToken. Waiting for the app's local
-        # handshake (the legacy renderer behavior) loses the FIRST handoff:
-        # the phone's SET_ACTIVE races our connect+join and the app bounces
-        # playback back when no renderer answers.
-        if self._enable_controller:
-            self.mass.create_task(self._setup_websocket(None))
+        # Connect to the cloud eagerly, self-minting the websocket token via
+        # qws/createToken. Waiting for the app's local handshake would lose the
+        # FIRST handoff: the phone's SET_ACTIVE races our connect+join and the
+        # app bounces playback back when no renderer answers.
+        self.mass.create_task(self._setup_websocket(None))
 
     async def unload(self, is_removed: bool = False) -> None:
         """Unload provider and stop network services."""
@@ -443,32 +431,26 @@ class QobuzConnectProvider(PluginProvider):
             if self._unloaded:
                 return
             if self._session is not None:
-                # Swapping tokens closes and reopens the socket — never do
-                # that to a healthy controller-role connection: the local
-                # handshake happens at the exact moment the phone hands off,
-                # and the cloud needs the connection up to route SET_ACTIVE.
-                # (The handshake token adds nothing there; we self-mint via
-                # qws/createToken.) Only feed tokens to a session that is
-                # still struggling to connect, or to a legacy renderer-role
-                # session, which needs the handshake session uuid to join.
-                if tokens is not None and not (
-                    self._enable_controller and self._session.is_connected
-                ):
+                # Swapping tokens closes and reopens the socket — never do that
+                # to a healthy connection: the local handshake happens at the
+                # exact moment the phone hands off, and the cloud needs the
+                # connection up to route SET_ACTIVE. (The handshake token adds
+                # nothing there; we self-mint via qws/createToken.) Only feed
+                # tokens to a session that is still struggling to connect.
+                if tokens is not None and not self._session.is_connected:
                     self._session.set_tokens(tokens)
                 await self._broadcast_current_volume()
                 await self._session.send_quality_reports(self._max_quality)
                 return
 
-            # Single dual-role socket, like the reference web client: joined
-            # via CtrlSrvrJoinSession it both reports renderer state and
-            # sends controller verbs, so there is no second connection to
-            # race against (renderer-role join is the legacy fallback when
-            # the controller feature is disabled).
+            # A single controller socket, like the reference web client: joined
+            # via CtrlSrvrJoinSession it both reports renderer state and sends
+            # controller verbs, so there is no second connection to race
+            # against.
             self._session = QobuzConnectSession(
                 self._device_config,
                 self._build_session_callbacks(),
                 token_refresher=self._refresh_ws_token,
-                role=SessionRole.CONTROLLER if self._enable_controller else SessionRole.RENDERER,
             )
             if tokens is not None:
                 self._session.set_tokens(tokens)
@@ -479,11 +461,7 @@ class QobuzConnectProvider(PluginProvider):
 
     def _build_session_callbacks(self) -> SessionCallbacks:
         """
-        Build the callback bundle shared by the renderer and controller sessions.
-
-        The cloud routes renderer-directed unicast frames to the most
-        recently joined connection with our deviceUuid, so both connections
-        must dispatch them into the same handlers.
+        Build the callback bundle for the controller session.
 
         Delegates translation of every cloud message into a reducer event to
         ``self._coordinator``, with two provider-level overrides that do
