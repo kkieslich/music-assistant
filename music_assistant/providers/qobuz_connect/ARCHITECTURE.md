@@ -99,7 +99,7 @@ Nothing outside the shell holds mutable sync state.
 | [`effect_runner.py`](effect_runner.py)                 | **Shell**: turns each `Effect` into a real `session.send_*` call or `ma_bridge` mutation; nothing else does I/O                  | ✅ (via bridge) | via session |
 | [`ma_bridge.py`](ma_bridge.py)                         | The one place the sync core touches Music Assistant — provider accessors + `mass.player_queues.*` / `mass.players.*`             | ✅         | ❌              |
 | [`metadata_resolver.py`](metadata_resolver.py)         | MA track-metadata lookups + fail-cache (used by `effect_runner` to resolve Qobuz ids → MA `Track`s)                              | via bridge | ❌              |
-| [`outbound_reporter.py`](outbound_reporter.py)         | Renderer→cloud emission: `report_state`, heartbeat, buffering reporter, wire-anchor logic (driven by the `ReportState` effect + heartbeat) | via host | ❌     |
+| [`outbound_reporter.py`](outbound_reporter.py)         | Renderer→cloud emission: `report_state`, heartbeat, wire-anchor logic (driven by the `ReportState` effect + heartbeat) | via host | ❌     |
 | [`__init__.py`](__init__.py)                           | `QobuzConnectProvider`: config, lifecycle, MA event subscription, wiring the shell together                                       | ✅         | ❌              |
 
 `discovery`, `protocol`, `inbound_dispatcher`, `models`, `sync_types` and

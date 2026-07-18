@@ -94,11 +94,7 @@ def test_app_origin_add_appends_and_resyncs() -> None:
     result = reduce(
         state,
         CloudTracksAdded(
-            now_ms=1,
-            version=QueueVersion(6, 1),
-            action_uuid=b"\x09" * 16,
-            tracks=_refs(2),
-            after_index=2,
+            now_ms=1, version=QueueVersion(6, 1), action_uuid=b"\x09" * 16, tracks=_refs(2)
         ),
     )
     assert result.state.cloud_version == QueueVersion(6, 1)

@@ -436,24 +436,6 @@ class QobuzConnectSession:
             )
         )
 
-    async def send_player_state(
-        self,
-        *,
-        playing_state: PlayingState,
-        position_ms: int,
-        queue_version: QueueVersion,
-        queue_item_id: int,
-    ) -> bool:
-        """Send controller player-state command."""
-        return await self.send_message(
-            self._codec.encode_player_state(
-                playing_state=playing_state,
-                position_ms=position_ms,
-                queue_version=queue_version,
-                queue_item_id=queue_item_id,
-            )
-        )
-
     async def send_set_active_renderer(self, renderer_id: int) -> bool:
         """Route cloud playback to ``renderer_id`` (controller role)."""
         return await self.send_message(self._codec.encode_set_active_renderer(renderer_id))

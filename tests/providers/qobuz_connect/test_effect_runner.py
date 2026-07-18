@@ -22,14 +22,12 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     MaSetShuffleFlag,
     MaSetVolume,
     PushAdd,
-    PushAutoplay,
     PushClear,
     PushLoad,
     PushLoop,
     PushPlayerState,
     PushReorder,
     PushSetActive,
-    PushShuffle,
     PushVolume,
     ReportState,
 )
@@ -318,22 +316,6 @@ async def test_push_loop_calls_session() -> None:
     runner = _runner(session, bridge)
     await runner.run(PushLoop(loop=LoopMode.REPEAT_ALL))
     assert session.calls == [("loop", LoopMode.REPEAT_ALL)]
-
-
-async def test_push_autoplay_is_a_noop() -> None:
-    """PushAutoplay is a documented no-op — no session verb exists for it."""
-    session, bridge = _FakeSession(), _FakeBridge()
-    runner = _runner(session, bridge)
-    await runner.run(PushAutoplay(autoplay=True))
-    assert session.calls == []
-
-
-async def test_push_shuffle_is_a_noop() -> None:
-    """PushShuffle is a documented no-op — the reducer never emits it today."""
-    session, bridge = _FakeSession(), _FakeBridge()
-    runner = _runner(session, bridge)
-    await runner.run(PushShuffle(shuffle=True, base_version=QueueVersion(1, 0)))
-    assert session.calls == []
 
 
 async def test_ask_snapshot_calls_session_with_version() -> None:

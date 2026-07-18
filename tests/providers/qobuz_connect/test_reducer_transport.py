@@ -115,7 +115,6 @@ def test_setstate_same_current_emits_no_audio_effect() -> None:
             playing=PlayingState.PLAYING,
             position_ms=1000,
             current_ref=_refs(0)[0],
-            next_ref=None,
         ),
     )
     assert not any(isinstance(e, MaPlayTrack) for e in result.effects)
@@ -132,7 +131,6 @@ def test_setstate_new_current_plays_that_track() -> None:
             playing=PlayingState.PLAYING,
             position_ms=0,
             current_ref=_refs(2)[0],
-            next_ref=None,
         ),
     )
     plays = [e for e in result.effects if isinstance(e, MaPlayTrack)]
@@ -152,7 +150,6 @@ def test_setstate_pause_toggle_does_not_restart() -> None:
             playing=PlayingState.PAUSED,
             position_ms=None,
             current_ref=_refs(0)[0],
-            next_ref=None,
         ),
     )
     assert any(isinstance(e, MaPause) for e in result.effects)
@@ -229,7 +226,6 @@ def test_heartbeat_position_zero_is_preserved() -> None:
             playing=PlayingState.PLAYING,
             position_ms=0,
             current_ref=_refs(0)[0],
-            next_ref=None,
         ),
     )
     assert result.state.position_ms == 0
@@ -267,7 +263,6 @@ def test_setstate_new_current_plays_qobuz_id() -> None:
             playing=PlayingState.PLAYING,
             position_ms=0,
             current_ref=QueueTrackRef(queue_item_id=2, track_id="900002"),
-            next_ref=None,
         ),
     )
     plays = [e for e in result.effects if isinstance(e, MaPlayTrack)]
@@ -287,7 +282,6 @@ def test_transport_sets_position_anchor() -> None:
             playing=PlayingState.PLAYING,
             position_ms=2000,
             current_ref=_refs(0)[0],
-            next_ref=None,
         ),
     )
     assert result.state.position_anchor_ms == 12345
@@ -452,7 +446,6 @@ def test_pause_captures_live_position() -> None:
             playing=PlayingState.PAUSED,
             position_ms=None,
             current_ref=None,
-            next_ref=None,
         ),
     )
     assert result.state.playing is PlayingState.PAUSED
@@ -569,7 +562,6 @@ def test_seek_ignores_stale_ma_position_until_converged() -> None:
             playing=PlayingState.PLAYING,
             position_ms=60000,
             current_ref=_refs(0)[0],
-            next_ref=None,
         ),
     )
     assert r1.state.position_ms == 60000  # commanded seek target
@@ -612,7 +604,6 @@ def test_skip_ignores_stale_ma_position_until_converged() -> None:
             playing=PlayingState.PLAYING,
             position_ms=0,
             current_ref=_refs(2)[0],
-            next_ref=None,
         ),
     )
     assert r1.state.current_id == 900002
@@ -671,7 +662,6 @@ def test_settling_times_out_and_adopts_ma() -> None:
             playing=PlayingState.PLAYING,
             position_ms=60000,
             current_ref=_refs(0)[0],
-            next_ref=None,
         ),
     )
     # Well past the settle timeout, still reporting a non-converging position.
@@ -711,7 +701,6 @@ def test_setstate_applies_even_when_version_is_stale() -> None:
             playing=PlayingState.PLAYING,
             position_ms=0,
             current_ref=QueueTrackRef(queue_item_id=1, track_id="402969598"),
-            next_ref=None,
         ),
     )
     plays = [e for e in result.effects if isinstance(e, MaPlayTrack)]

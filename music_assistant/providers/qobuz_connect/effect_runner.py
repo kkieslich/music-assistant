@@ -47,7 +47,6 @@ from .sync_types import (
     MaSetShuffleFlag,
     MaSetVolume,
     PushAdd,
-    PushAutoplay,
     PushClear,
     PushInsert,
     PushLoad,
@@ -58,7 +57,6 @@ from .sync_types import (
     PushRemove,
     PushReorder,
     PushSetActive,
-    PushShuffle,
     PushVolume,
     ReportState,
 )
@@ -187,16 +185,6 @@ class EffectRunner:
             )
         elif isinstance(effect, PushLoop):
             await self._session.send_set_loop_mode(effect.loop)
-        elif isinstance(effect, PushShuffle):
-            # The reducer never emits this today (shuffle only flows
-            # cloud->MA via MaSetShuffleFlag) and PushShuffle carries no
-            # action_uuid / current_queue_item_id, which
-            # session.send_set_shuffle_mode requires — no faithful mapping
-            # exists yet, so this is a documented no-op.
-            LOGGER.debug("PushShuffle has no wired session verb; dropping %r", effect)
-        elif isinstance(effect, PushAutoplay):
-            # No session.send_* verb exists for autoplay today.
-            LOGGER.debug("Autoplay push unsupported by the current session protocol: %r", effect)
         elif isinstance(effect, PushVolume):
             await self._session.send_volume_changed(effect.volume)
         elif isinstance(effect, PushMute):

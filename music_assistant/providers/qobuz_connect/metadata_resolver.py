@@ -21,8 +21,6 @@ from music_assistant_models.errors import MediaNotFoundError
 if TYPE_CHECKING:
     from music_assistant_models.media_items import Track
 
-    from .models import QueueTrackRef
-
 
 class MetadataResolver:
     """Resolves Qobuz track ids to MA ``Track`` objects, with a fail-cache."""
@@ -76,39 +74,3 @@ class MetadataResolver:
                 err,
             )
             return None
-
-    async def ensure_track_duration(self, item: QueueTrackRef) -> None:
-        """Resolve track metadata + write duration_ms into the mirror."""
-        ma_track = await self.get_track(item.track_id)
-        self._engine.qobuz_state.duration_ms = (ma_track.duration or 0) * 1000
-
-    async def try_ensure_track_duration(self, item: QueueTrackRef) -> bool:
-        """
-        Try to resolve track metadata for the mirror; cache failures.
-
-        :returns: ``True`` if the lookup succeeded and the mirror duration
-            was updated, ``False`` if the track was already known
-            unresolvable or the lookup raised.
-        """
-        if item.track_id in self._unresolvable_track_ids:
-            self._engine.qobuz_state.duration_ms = 0
-            return False
-        try:
-            await self.ensure_track_duration(item)
-        except MediaNotFoundError:
-            self._unresolvable_track_ids.add(item.track_id)
-            self._engine.qobuz_state.duration_ms = 0
-            self._engine.bridge.logger.warning(
-                "Ignoring unresolved Qobuz Connect cloud track %s",
-                item.track_id,
-            )
-            return False
-        except Exception as err:
-            self._engine.qobuz_state.duration_ms = 0
-            self._engine.bridge.logger.warning(
-                "Qobuz Connect track %s temporarily unavailable (%s); will retry",
-                item.track_id,
-                err,
-            )
-            return False
-        return True

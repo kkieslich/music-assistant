@@ -7,16 +7,13 @@ loops here drive it; it reads its state off a host that exposes a live
 ``QobuzMirror`` projection of the coordinator's ``CanonicalState`` (see
 ``_ReporterHost`` in ``__init__.py``), so it needs no engine of its own.
 
-The reporter owns three concerns:
+The reporter owns two concerns:
 
 1. **Renderer state composition.** Reads the ``QobuzMirror`` projection,
    decides what wire-level position / timestamp / buffer state to send,
    and emits a single ``RNDR_SRVR_STATE_UPDATED`` frame via the session.
 2. **Heartbeat task.** A 5-second loop that re-emits the canonical
    renderer state while active so the cloud doesn't time us out.
-3. **Buffering reporter task.** A 1-second loop that fires while
-   ``QobuzMirror.buffer_state == BUFFERING`` so the cloud sees the
-   frozen anchor refresh quickly during track-load latency.
 """
 
 from __future__ import annotations
@@ -32,19 +29,17 @@ from .models import BufferState, PlayingState
 LOGGER = logging.getLogger(__name__)
 
 STATE_REPORT_INTERVAL_S = 5.0
-BUFFERING_REPORT_INTERVAL_S = 1.0
 
 
 class OutboundReporter:
     """Owns all renderer→cloud state-update emission."""
 
-    __slots__ = ("_buffering_task", "_engine", "_heartbeat_task")
+    __slots__ = ("_engine", "_heartbeat_task")
 
     def __init__(self, engine: Any) -> None:
         """Bind the reporter to its host engine for state + bridge access."""
         self._engine = engine
         self._heartbeat_task: asyncio.Task[None] | None = None
-        self._buffering_task: asyncio.Task[None] | None = None
 
     # ---- lifecycle ------------------------------------------------------
 
@@ -54,34 +49,12 @@ class OutboundReporter:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def stop(self) -> None:
-        """Stop the heartbeat + any in-flight buffering reporter."""
+        """Stop the heartbeat loop."""
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._heartbeat_task
             self._heartbeat_task = None
-        self.cancel_buffering_reporter()
-
-    # ---- buffer-state transitions --------------------------------------
-
-    def set_buffering(self) -> None:
-        """Mark transport as buffering and start the short-interval reporter."""
-        self._engine.qobuz_state.buffer_state = BufferState.BUFFERING
-        if self._buffering_task is None or self._buffering_task.done():
-            self._buffering_task = asyncio.create_task(self._buffering_report_loop())
-
-    def set_buffer_ok(self) -> None:
-        """Mark transport as ready and cancel the buffering reporter."""
-        self._engine.qobuz_state.buffer_state = BufferState.OK
-        self.cancel_buffering_reporter()
-
-    def cancel_buffering_reporter(self) -> None:
-        """Cancel the buffering reporter — safe to call from inside the loop."""
-        task = self._buffering_task
-        if task is not None and not task.done():
-            if asyncio.current_task() is not task:
-                task.cancel()
-        self._buffering_task = None
 
     # ---- canonical state report ----------------------------------------
 
@@ -161,18 +134,6 @@ class OutboundReporter:
                 # 2026-07-08) — stay silent until (re)activated.
                 if not self._engine._is_active:
                     continue
-                with contextlib.suppress(Exception):
-                    await self.report_state()
-        except asyncio.CancelledError:
-            pass
-
-    async def _buffering_report_loop(self) -> None:
-        """Refresh the frozen anchor while we wait for MA audio to be ready."""
-        try:
-            while True:
-                if self._engine.qobuz_state.buffer_state != BufferState.BUFFERING:
-                    return
-                await asyncio.sleep(BUFFERING_REPORT_INTERVAL_S)
                 with contextlib.suppress(Exception):
                     await self.report_state()
         except asyncio.CancelledError:
