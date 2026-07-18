@@ -331,7 +331,7 @@ def _reduce_list_inbound(state: CanonicalState, event: Event) -> ReduceResult:
 def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
     """Route a transport/session-lane event to its handler."""
     if isinstance(event, CloudSetActive):
-        return _takeover(state) if event.active else _deactivate(state)
+        return _takeover(state, event.now_ms) if event.active else _deactivate(state)
     if isinstance(event, CloudSetState):
         return _reduce_set_state(state, event)
     if isinstance(event, CloudRendererStateUpdated):
@@ -557,21 +557,31 @@ def _apply_transport(
     return ReduceResult(state, ())
 
 
-def _takeover(state: CanonicalState) -> ReduceResult:
+def _takeover(state: CanonicalState, now_ms: int) -> ReduceResult:
     """Activate this renderer and adopt canonical current, playing it once if it's live."""
     active = dataclasses.replace(state, active=True)
     if state.current_id is not None and state.playing is PlayingState.PLAYING:
+        # A handoff from phone/web hands us a position anchored at
+        # position_anchor_ms; while PLAYING it has advanced since. Resume at the
+        # LIVE position (base + elapsed) or the takeover lands several seconds
+        # behind. Mirrors _apply_transport's pause-branch interpolation.
+        live_position_ms = state.position_ms + max(0, now_ms - state.position_anchor_ms)
         # Resync first so MA's queue is populated (a prior deactivate may have
         # released/cleared it) before the play fast-paths off that queue.
         resync = MaResyncQueue(
             track_ids=tuple(qid for t in state.tracks if (qid := _safe_qid(t)) is not None),
             current_track_id=state.current_id,
         )
-        play = MaPlayTrack(track_id=state.current_id, position_ms=state.position_ms)
+        play = MaPlayTrack(track_id=state.current_id, position_ms=live_position_ms)
         # Playing the adopted current restarts MA audio, so its position lags;
         # settle and mark BUFFERING until MA reports the handed-over position.
+        # Re-anchor the stored position to the same live value.
         new = dataclasses.replace(
-            active, settling_position=True, buffer_state=BufferState.BUFFERING
+            active,
+            position_ms=live_position_ms,
+            position_anchor_ms=now_ms,
+            settling_position=True,
+            buffer_state=BufferState.BUFFERING,
         )
         effects = _report_on_buffer_change(state.buffer_state, new.buffer_state, (resync, play))
         return ReduceResult(new, effects)
