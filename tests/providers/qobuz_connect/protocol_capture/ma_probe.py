@@ -52,7 +52,10 @@ _STREAM = re.compile(
     r"Start Streaming queue track: \S+://track/(?P<track>\d+) \((?P<title>.*)\) for queue"
 )
 _REPORT = re.compile(
-    r"Qobuz report state=(?P<state>\d+) buffer=\d+ wire_buffer=\d+ pos=(?P<pos>\d+)ms "
+    # The reporter log line dropped the separate ``buffer=`` field (the
+    # canonical buffer_state is now folded into wire_buffer); keep this in
+    # sync with OutboundReporter.report_state's debug line.
+    r"Qobuz report state=(?P<state>\d+) wire_buffer=\d+ pos=(?P<pos>\d+)ms "
     r"\(anchor ts=\d+\) item=(?P<slot>\d+):(?P<track>\d+) qv=(?P<qmaj>\d+)\.(?P<qmin>\d+)"
 )
 

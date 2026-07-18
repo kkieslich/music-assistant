@@ -44,8 +44,10 @@ ALBUM_URL = "https://play.qobuz.com/album/0724384260958"
 CONNECT_TARGET = "Local Dev"
 
 # The Connect target's silent MA player (BlackHole) — where MA renders audio
-# during integration runs so nothing is played out loud.
-BLACKHOLE_PLAYER_ID = "upb97b9910b8fe5ff0946cef06b0d44273"
+# during integration runs so nothing is played out loud. Must match
+# ma_probe._BLACKHOLE (MA's player-id scheme drifted from ``up<hex>`` to a
+# dashed uuid).
+BLACKHOLE_PLAYER_ID = "b97b9910-b8fe-5ff0-946c-ef06b0d44273"
 MA_WS_URL = "ws://localhost:8095/ws"
 
 
