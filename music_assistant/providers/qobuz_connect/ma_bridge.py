@@ -84,7 +84,11 @@ class MABridge:
 
     def queue_items(self, player_id: str) -> list[Any]:
         """Return the full ordered ``QueueItem`` list for ``player_id``."""
-        return cast("list[Any]", self._provider.mass.player_queues.items(player_id))
+        # items() defaults to limit=500; the sync core diffs MA's queue
+        # against the cloud's canonical list, so a truncated read on a large
+        # queue (>500 tracks) would be misread as a user edit and pushed
+        # back to the cloud as a truncating queue load.
+        return cast("list[Any]", self._provider.mass.player_queues.items(player_id, limit=100_000))
 
     async def play(self, player_id: str) -> None:
         """Resume playback on the target player."""
