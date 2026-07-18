@@ -120,7 +120,7 @@ class QobuzPage:
         loc = self.page.locator(".player__track-name").first
         if await loc.count() == 0:
             return ""
-        return (await loc.inner_text()).strip()
+        return str(await loc.inner_text()).strip()
 
     async def skip_next(self) -> None:
         """Skip to the next track."""
