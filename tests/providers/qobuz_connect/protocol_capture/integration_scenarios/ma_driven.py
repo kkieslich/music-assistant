@@ -9,12 +9,13 @@ Without a token each scenario records a clean SKIP.
 from __future__ import annotations
 
 from tests.providers.qobuz_connect.protocol_capture.integration_harness import (
+    BLACKHOLE_PLAYER_ID,
     IntegrationSession,
     ScenarioResult,
     ma_play_media,
     ma_player_command,
+    ma_query,
 )
-from tests.providers.qobuz_connect.protocol_capture.ma_probe import ProbeEvents
 
 ALBUM_B_IDS = set(range(3879017, 3879037))
 ALBUM_B_URI = "qobuz://album/0060694932902"
@@ -110,28 +111,37 @@ async def scenario_ma_pause(session: IntegrationSession) -> ScenarioResult:
 
 
 async def scenario_ma_queue_edit(session: IntegrationSession) -> ScenarioResult:
-    """Enqueuing a track on MA grows the cloud queue (proposal path)."""
+    """Enqueuing a track on MA grows MA's queue (proposal path)."""
     result = ScenarioResult(scenario="ma_queue_edit")
     await _reset_ma_inactive(session)
     if await ma_play_media(ALBUM_B_URI) == "no-token":
         result.check("skipped (no MA token)", True)
         return result
-    settle = session.wait_for_stream(session.ma.cursor(), timeout=25.0)
-    settle_last = settle.last_reduce()
-    base_tracks = settle_last.tracks if settle_last else 0
-    cursor = session.ma.cursor()
+    session.wait_for_stream(session.ma.cursor(), timeout=25.0)
+
+    async def _queue_len() -> int:
+        # Read MA's ACTUAL queue length rather than the canonical cloud
+        # track count from the reduce log: an MA-initiated edit while MA is
+        # inactive drives optimistic proposals that make the cloud count
+        # churn (load/reject/rebase) before it converges, so the reduce-log
+        # `tracks` is an unreliable baseline for "did MA's queue grow".
+        items = await ma_query(
+            "player_queues/items", {"queue_id": BLACKHOLE_PLAYER_ID, "limit": 500}
+        )
+        return len(items) if isinstance(items, list) else -1
+
+    base_len = await _queue_len()
     await ma_play_media(TRACK_B_URI, option="add")
-
-    def _grew(events: ProbeEvents) -> bool:
-        last = events.last_reduce()
-        return last is not None and last.tracks != base_tracks
-
-    ev = session.ma.wait_for_event(cursor, _grew, timeout=20.0)
-    last = ev.last_reduce()
+    grew = False
+    for _ in range(20):
+        await session.q.page.wait_for_timeout(1000)
+        if await _queue_len() > base_len:
+            grew = True
+            break
     result.check(
         "MA queue changed after MA-side enqueue",
-        bool(last and last.tracks != base_tracks),
-        detail=f"tracks={last.tracks if last else '?'} (was {base_tracks})",
+        grew,
+        detail=f"MA queue grew past {base_len} items? {grew}",
     )
     return result
 
