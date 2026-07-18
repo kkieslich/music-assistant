@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, cast
+from typing import Any
 
 from music_assistant_models.errors import MediaNotFoundError
 
 from music_assistant.providers.qobuz_connect.metadata_resolver import MetadataResolver
+
+_LOGGER = logging.getLogger("test.metadata_resolver")
 
 
 class _FakeQobuzProvider:
@@ -24,25 +26,8 @@ class _FakeQobuzProvider:
         raise self.error
 
 
-class _FakeHost:
-    """Duck-typed engine host exposing only what the resolver reads."""
-
-    def __init__(self, provider: _FakeQobuzProvider) -> None:
-        """Wrap the fake qobuz provider behind a bridge-shaped object."""
-        self.bridge = _FakeBridge(provider)
-
-
-class _FakeBridge:
-    """Bridge stub: qobuz provider + logger."""
-
-    def __init__(self, provider: _FakeQobuzProvider) -> None:
-        """Hold the fake provider and a real (silent) logger."""
-        self._provider = provider
-        self.logger = logging.getLogger("test.metadata_resolver")
-
-    def qobuz_music_provider(self) -> _FakeQobuzProvider:
-        """Return the fake qobuz provider."""
-        return self._provider
+def _resolver(provider: _FakeQobuzProvider) -> MetadataResolver:
+    return MetadataResolver(qobuz_provider_getter=lambda: provider, logger=_LOGGER)
 
 
 async def test_transient_errors_are_retried_not_blacklisted() -> None:
@@ -54,7 +39,7 @@ async def test_transient_errors_are_retried_not_blacklisted() -> None:
     mismatches with no recovery on a long-running server.
     """
     provider = _FakeQobuzProvider(RuntimeError("qobuz api 502"))
-    resolver = MetadataResolver(cast("Any", _FakeHost(provider)))
+    resolver = _resolver(provider)
 
     assert await resolver.get_track_or_none("123") is None
     assert await resolver.get_track_or_none("123") is None
@@ -66,7 +51,7 @@ async def test_transient_errors_are_retried_not_blacklisted() -> None:
 async def test_media_not_found_is_cached() -> None:
     """A definitive 404 keeps the fail-cache behavior: never re-fetch."""
     provider = _FakeQobuzProvider(MediaNotFoundError("gone"))
-    resolver = MetadataResolver(cast("Any", _FakeHost(provider)))
+    resolver = _resolver(provider)
 
     assert await resolver.get_track_or_none("456") is None
     assert await resolver.get_track_or_none("456") is None

@@ -19,7 +19,6 @@ from music_assistant.providers.qobuz_connect import (
     CONF_TARGET_PLAYER,
     PLAYER_ID_AUTO,
     QobuzConnectProvider,
-    _ReporterHost,
 )
 from music_assistant.providers.qobuz_connect import outbound_reporter as outbound_reporter_module
 from music_assistant.providers.qobuz_connect.coordinator import QobuzConnectCoordinator
@@ -251,14 +250,15 @@ async def test_cloud_effect_noops_when_no_session() -> None:
     await provider._effect_runner.run(ReportState())
 
 
-def test_reporter_host_projects_canonical_state_with_duration() -> None:
-    """_ReporterHost projects CanonicalState + a live MA duration into the QobuzMirror."""
-    current_queue_item = SimpleNamespace(duration=200)  # seconds
-    fake_queue = SimpleNamespace(current_item=current_queue_item)
-    fake_bridge = SimpleNamespace(
-        target_player_id=lambda: "player_1",
-        get_queue=lambda _pid: fake_queue,
-    )
+async def test_reporter_emits_canonical_state_with_live_duration() -> None:
+    """report_state derives the current item from CanonicalState and ships the live MA duration."""
+    sent: dict[str, Any] = {}
+
+    class _Session:
+        async def send_renderer_state(self, **kwargs: Any) -> bool:
+            sent.update(kwargs)
+            return True
+
     state = CanonicalState(
         cloud_version=QueueVersion(3, 2),
         tracks=(QueueTrackRef(queue_item_id=7, track_id="501"),),
@@ -267,72 +267,92 @@ def test_reporter_host_projects_canonical_state_with_duration() -> None:
         position_ms=1234,
         position_anchor_ms=9999,
     )
-    host = _ReporterHost(cast("Any", fake_bridge), lambda: state)
-
-    mirror = host.qobuz_state
-
-    assert mirror.current_item is not None
-    assert mirror.current_item.track_id == "501"
-    assert mirror.playing_state is PlayingState.PLAYING
-    assert mirror.position_ms == 1234
-    assert mirror.queue_version == QueueVersion(3, 2)
-    # duration is read live from MA's queue (seconds -> ms) rather than the
-    # hardcoded 0 CanonicalState carries.
-    assert mirror.duration_ms == 200_000
-
-
-def test_reporter_host_duration_falls_back_to_zero_without_queue() -> None:
-    """_ReporterHost falls back to duration_ms=0 when MA has no current queue item."""
-    fake_bridge = SimpleNamespace(
-        target_player_id=lambda: "player_1",
-        get_queue=lambda _pid: None,
-    )
-    state = CanonicalState(current_id=None)
-    host = _ReporterHost(cast("Any", fake_bridge), lambda: state)
-
-    assert host.qobuz_state.duration_ms == 0
-
-
-def test_reporter_host_is_active_reflects_canonical_state() -> None:
-    """_ReporterHost._is_active mirrors the projected CanonicalState.active flag."""
-    fake_bridge = SimpleNamespace(
-        target_player_id=lambda: "player_1",
-        get_queue=lambda _pid: None,
+    reporter = OutboundReporter(
+        session_getter=lambda: cast("Any", _Session()),
+        state_getter=lambda: state,
+        duration_getter=lambda: 200_000,
+        active_getter=lambda: True,
+        logger=outbound_reporter_module.LOGGER,
     )
 
-    active_host = _ReporterHost(cast("Any", fake_bridge), lambda: CanonicalState(active=True))
-    assert active_host._is_active is True
+    await reporter.report_state()
 
-    inactive_host = _ReporterHost(cast("Any", fake_bridge), lambda: CanonicalState(active=False))
-    assert inactive_host._is_active is False
+    assert sent["queue_item_id"] == 7
+    assert sent["playing_state"] is PlayingState.PLAYING
+    assert sent["position_ms"] == 1234
+    # PLAYING ships the raw anchor pair so the client interpolates exactly once.
+    assert sent["position_timestamp_ms"] == 9999
+    assert sent["queue_version"] == QueueVersion(3, 2)
+    assert sent["duration_ms"] == 200_000
 
 
-async def test_heartbeat_loop_survives_tick_against_real_reporter_host(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    The 5-second heartbeat loop survives a tick when reading ``_is_active`` off the real host.
+async def test_reporter_skips_when_no_current_item() -> None:
+    """report_state early-returns (no frame) when canonical has no current track."""
+    calls = 0
 
-    Regression guard: the loop reads ``self._engine._is_active`` outside its
-    exception suppression, so if ``_ReporterHost`` didn't expose ``_is_active``
-    the very first tick would raise ``AttributeError`` and silently kill the
-    heartbeat task (report_state() itself never touches it, so this path is
-    invisible to a plain report_state() call).
-    """
+    class _Session:
+        async def send_renderer_state(self, **_kwargs: Any) -> bool:
+            nonlocal calls
+            calls += 1
+            return True
+
+    reporter = OutboundReporter(
+        session_getter=lambda: cast("Any", _Session()),
+        state_getter=lambda: CanonicalState(current_id=None),
+        duration_getter=lambda: 0,
+        active_getter=lambda: True,
+        logger=outbound_reporter_module.LOGGER,
+    )
+
+    await reporter.report_state()
+    assert calls == 0
+
+
+def test_current_track_duration_ms_reads_live_ma_queue() -> None:
+    """The provider's duration getter reads the live MA queue item (seconds -> ms)."""
+    provider, mass = _make_provider()
+    mass.player_queues.get.return_value = SimpleNamespace(
+        current_item=SimpleNamespace(duration=200)
+    )
+    assert provider._current_track_duration_ms() == 200_000
+
+    mass.player_queues.get.return_value = None
+    assert provider._current_track_duration_ms() == 0
+
+
+def test_reporter_active_getter_requires_active_and_target_player() -> None:
+    """The heartbeat active-getter is (state.active AND a target player exists)."""
+    provider, mass = _make_provider()
+
+    provider._coordinator._state = CanonicalState(active=False)
+    assert provider._reporter._active_getter() is False
+
+    provider._coordinator._state = CanonicalState(active=True)
+    assert provider._reporter._active_getter() is True
+
+    # Target player vanished: even while active, the heartbeat must fall silent
+    # (a frozen canonical state otherwise reports stale PLAYING forever).
+    mass.players.all_players.return_value = []
+    mass.players.get_player.return_value = None
+    provider._pinned_target_id = None
+    assert provider._reporter._active_getter() is False
+
+
+async def test_heartbeat_loop_survives_tick(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The 5-second heartbeat loop survives a tick reading its active-getter + state."""
     monkeypatch.setattr(outbound_reporter_module, "STATE_REPORT_INTERVAL_S", 0.01)
-    # session is None so report_state() early-returns cleanly after the tick.
-    fake_bridge = SimpleNamespace(
-        session=None,
-        target_player_id=lambda: "player_1",
-        get_queue=lambda _pid: None,
+    # session_getter returns None so report_state() early-returns cleanly.
+    reporter = OutboundReporter(
+        session_getter=lambda: None,
+        state_getter=lambda: CanonicalState(active=True),
+        duration_getter=lambda: 0,
+        active_getter=lambda: True,
+        logger=outbound_reporter_module.LOGGER,
     )
-    host = _ReporterHost(cast("Any", fake_bridge), lambda: CanonicalState(active=True))
-    reporter = OutboundReporter(cast("Any", host))
 
     await reporter.start()
     try:
         await asyncio.sleep(0.05)
-        # Before the fix the task would be ``.done()`` with an AttributeError.
         assert reporter._heartbeat_task is not None
         assert not reporter._heartbeat_task.done()
     finally:
@@ -457,24 +477,6 @@ async def test_unload_blocks_late_websocket_setup_and_reaps_timers(
     assert not provider._coordinator._timers
     await provider._setup_websocket(None)
     assert provider._session is None
-
-
-def test_reporter_host_inactive_without_target_player() -> None:
-    """
-    The heartbeat must fall silent when the target player is gone.
-
-    With the player removed, canonical state froze at its last value and the
-    5s heartbeat kept reporting stale PLAYING forever — ghost, uncontrollable
-    playback in the Qobuz app.
-    """
-    state = CanonicalState(active=True)
-    bridge = SimpleNamespace(target_player_id=lambda: None)
-    host = _ReporterHost(cast("Any", bridge), lambda: state)
-    assert host._is_active is False
-
-    bridge_with_target = SimpleNamespace(target_player_id=lambda: "p1")
-    host2 = _ReporterHost(cast("Any", bridge_with_target), lambda: state)
-    assert host2._is_active is True
 
 
 def test_bridge_queue_items_reads_the_full_queue() -> None:

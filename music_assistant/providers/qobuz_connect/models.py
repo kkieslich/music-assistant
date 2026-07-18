@@ -13,8 +13,7 @@ Owns:
   ``QueueLoadAck``, ``QueueError``, ``QueueStateSnapshot``,
   ``QueueTracksAddedEvent``, ``QueueTracksInsertedEvent``,
   ``QueueTracksRemovedEvent``, ``QueueTracksReorderedEvent``,
-  ``QueueClearedEvent``, ``QobuzMirror`` (the legacy remote-state snapshot
-  the reporter host projects from ``CanonicalState``).
+  ``QueueClearedEvent``.
 
 Exposes:
 - All of the above as importable names.
@@ -23,9 +22,6 @@ Depends on:
 - Standard library only. **No MA imports, no protobuf imports.** This
   module is the lingua franca that the codec, transport, discovery and
   sync layers communicate with — it must stay framework-free.
-
-See :doc:`ARCHITECTURE` for how the reducer's ``CanonicalState`` relates to
-the legacy ``QobuzMirror`` projection used by the outbound reporter.
 """
 
 from __future__ import annotations
@@ -358,30 +354,3 @@ class QueueError:
     queue_version: QueueVersion | None = None
     code: str = ""
     message: str = ""
-
-
-@dataclass(slots=True)
-class QobuzMirror:
-    """Provider's local mirror of Qobuz cloud/app state."""
-
-    queue_version: QueueVersion = field(default_factory=QueueVersion)
-    current_item: QueueTrackRef | None = None
-    next_item: QueueTrackRef | None = None
-    playing_state: PlayingState = PlayingState.STOPPED
-    buffer_state: BufferState = BufferState.OK
-    position_ms: int = 0
-    position_timestamp_ms: int = 0
-    duration_ms: int = 0
-    # Populated from SRVR_CTRL_QUEUE_STATE snapshots + SRVR_CTRL_QUEUE_TRACKS_*
-    # delta messages. Phase B populates this; Phase C will use it to drive
-    # MA-side queue reconciliation.
-    tracks: list[QueueTrackRef] = field(default_factory=list)
-    loop_mode: LoopMode = LoopMode.OFF
-    shuffle_mode: bool = False
-    autoplay_mode: bool = False
-    # Index of the session's current track within ``tracks``. Fed by
-    # SRVR_CTRL_SESSION_STATE (trackIndex) and SRVR_CTRL_RENDERER_STATE_UPDATED
-    # (currentQueueIndex) — controller-joined connections never receive a
-    # renderer-directed SET_STATE with track refs, so this is how we know
-    # which track to take over on activation.
-    track_index: int = 0
