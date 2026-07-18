@@ -95,8 +95,10 @@ class Proposal:
     """
     Qobuz track ids to actually send on the wire for LOAD/ADD/INSERT — the
     full list for LOAD, the appended tail for ADD, the inserted ids for
-    INSERT; unused (empty) for REORDER/CLEAR/REMOVE, which translate to slot
-    ids at emit time.
+    INSERT. For REMOVE it carries the REMOVED qids (canonical minus the
+    surviving ``target_track_ids``), translated to cloud slot ids at emit
+    time. Unused (empty) for REORDER/CLEAR, which translate to slot ids at
+    emit time.
     """
 
 

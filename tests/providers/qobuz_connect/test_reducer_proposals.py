@@ -8,12 +8,14 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     CanonicalState,
     CloudQueueError,
     CloudTracksAdded,
+    CloudTracksRemoved,
     MaQueueChanged,
     MaResyncQueue,
     Proposal,
     ProposalKind,
     ProposalTimeout,
     PushAdd,
+    PushRemove,
     PushReorder,
 )
 
@@ -288,3 +290,82 @@ def test_confirm_with_duplicate_track_keeps_distinct_queue_item_ids() -> None:
     assert result.state.pending == ()
     item_ids = sorted(t.queue_item_id for t in result.state.tracks)
     assert item_ids == [0, 5], f"occurrences must keep distinct slots, got {item_ids}"
+
+
+def _remove_state() -> CanonicalState:
+    return CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0, 1, 2),
+        current_id=900000,
+        active=True,
+    )
+
+
+def test_remove_confirms_on_cloud_tracks_removed_echo() -> None:
+    """A REMOVE proposal folds into truth on the CloudTracksRemoved echo, no MA resync."""
+    r1 = reduce(
+        _remove_state(),
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xaa" * 16,
+            track_ids=(900000, 900002),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001, 900002}),
+        ),
+    )
+    assert r1.state.pending[0].kind is ProposalKind.REMOVE
+
+    r2 = reduce(
+        r1.state,
+        CloudTracksRemoved(
+            now_ms=2,
+            version=QueueVersion(6, 1),
+            action_uuid=b"\xaa" * 16,
+            queue_item_ids=(1,),
+        ),
+    )
+    assert r2.state.pending == ()
+    assert tuple(t.queue_item_id for t in r2.state.tracks) == (0, 2)
+    assert tuple(t.track_id for t in r2.state.tracks) == ("900000", "900002")
+    assert not any(isinstance(e, MaResyncQueue) for e in r2.effects)
+
+
+def test_remove_reject_rebases_once_then_converges() -> None:
+    """A version-stale rejection of a REMOVE rebases once (target kept), then converges MA."""
+    r1 = reduce(
+        _remove_state(),
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xaa" * 16,
+            track_ids=(900000, 900002),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001, 900002}),
+        ),
+    )
+    r2 = reduce(
+        r1.state,
+        CloudQueueError(
+            now_ms=2,
+            version=QueueVersion(7, 1),
+            action_uuid=b"\xaa" * 16,
+            code="1",
+            message="Queue version mismatch",
+        ),
+    )
+    assert len(r2.state.pending) == 1  # rebased, still pending
+    assert r2.state.pending[0].kind is ProposalKind.REMOVE
+    assert r2.state.pending[0].target_track_ids == (900000, 900002)  # kept as-is
+    assert any(isinstance(e, PushRemove) for e in r2.effects)  # re-pushed
+
+    r3 = reduce(
+        r2.state,
+        CloudQueueError(
+            now_ms=3,
+            version=QueueVersion(8, 1),
+            action_uuid=b"\xaa" * 16,
+            code="1",
+            message="Queue version mismatch",
+        ),
+    )
+    assert r3.state.pending == ()
+    assert any(isinstance(e, MaResyncQueue) for e in r3.effects)

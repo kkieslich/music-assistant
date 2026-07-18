@@ -909,6 +909,33 @@ def _rebase_push_payload(
     return rebased_target[len(canonical_ids) :]
 
 
+_SUBSEQ_DONE = object()
+
+
+def _removed_if_subsequence(
+    canonical_ids: tuple[int, ...], target_ids: tuple[int, ...]
+) -> tuple[int, ...] | None:
+    """
+    Return the ids removed to turn ``canonical_ids`` into ``target_ids``.
+
+    ``target_ids`` must be an order-preserving, multiset-aware subsequence of
+    ``canonical_ids`` (a pure removal, no reorder), else ``None``. Duplicates
+    are consumed first-match, so dropping one of two identical ids yields
+    exactly one removed id.
+    """
+    removed: list[int] = []
+    remaining = iter(target_ids)
+    expected: object = next(remaining, _SUBSEQ_DONE)
+    for qid in canonical_ids:
+        if qid == expected:
+            expected = next(remaining, _SUBSEQ_DONE)
+        else:
+            removed.append(qid)
+    if expected is not _SUBSEQ_DONE:
+        return None
+    return tuple(removed)
+
+
 def _diff_ma_list(state: CanonicalState, event: MaQueueChanged) -> Proposal | None:
     """
     Detect an MA-origin structural change and turn it into a proposal.
@@ -937,6 +964,13 @@ def _diff_ma_list(state: CanonicalState, event: MaQueueChanged) -> Proposal | No
         # Positional tail against the resolvable-filtered canonical prefix —
         # preserves duplicate ids, unlike a set-membership filter would.
         push_payload_ids = event.track_ids[len(canonical_ids) :]
+    elif (removed := _removed_if_subsequence(canonical_ids, event.track_ids)) is not None:
+        # A pure removal: the new list is an order-preserving subsequence of
+        # canonical. Carry the REMOVED qids in push_payload_ids (translated to
+        # cloud slot ids at emit time); target_track_ids stays the survivor
+        # list that the CloudTracksRemoved echo folds into canonical.
+        kind = ProposalKind.REMOVE
+        push_payload_ids = removed
     elif set(event.track_ids) == set(canonical_ids):
         kind = ProposalKind.REORDER
         push_payload_ids = ()  # translated to slot ids at emit time.
@@ -1005,16 +1039,17 @@ def _emit_push(state: CanonicalState, proposal: Proposal) -> Effect:
             insert_after=0,
         )
     if proposal.kind is ProposalKind.REMOVE:
-        # No diff path produces REMOVE proposals yet (_diff_ma_list yields
-        # LOAD for a same-set-minus-some-ids change); implemented
-        # defensively so _emit_push stays total over ProposalKind. The wire
-        # command speaks cloud queue_item_ids, not Qobuz track ids.
+        # push_payload_ids carries the REMOVED Qobuz ids (canonical minus the
+        # surviving target, computed at diff time). Translate those — NOT the
+        # survivors in target_track_ids — to cloud queue_item_ids; the wire
+        # remove command speaks slot ids. target_track_ids stays the survivor
+        # list that _confirm_proposal folds into canonical on the echo.
         return PushRemove(
             action_uuid=proposal.action_uuid,
             base_version=proposal.base_version,
             queue_item_ids=tuple(
                 item
-                for q in proposal.target_track_ids
+                for q in proposal.push_payload_ids
                 if (item := _item_id_for_qid(state, q)) is not None
             ),
         )
