@@ -3,16 +3,25 @@
 
 from __future__ import annotations
 
-from music_assistant.providers.qobuz_connect.models import QueueTrackRef, QueueVersion
-from music_assistant.providers.qobuz_connect.reducer import reduce
+from music_assistant.providers.qobuz_connect.models import (
+    PlayingState,
+    QueueTrackRef,
+    QueueVersion,
+)
+from music_assistant.providers.qobuz_connect.reducer import _GATED_LE, _GATED_LT, reduce
 from music_assistant.providers.qobuz_connect.sync_types import (
     AskSnapshot,
     CanonicalState,
+    CloudAutoplayTracksLoaded,
     CloudCleared,
+    CloudLoadAck,
     CloudSessionState,
+    CloudSetState,
     CloudSnapshot,
     CloudTracksAdded,
+    CloudTracksInserted,
     CloudTracksRemoved,
+    CloudTracksReordered,
     CloudVersionChanged,
     MaResyncQueue,
 )
@@ -86,6 +95,40 @@ def test_stale_version_is_ignored() -> None:
     result = reduce(state, CloudVersionChanged(now_ms=1, version=QueueVersion(5, 1)))
     assert result.state is state
     assert result.effects == ()
+
+
+def test_non_gated_versioned_event_passes_through_at_stale_version() -> None:
+    """A versioned event outside the gated tuples (CloudSetState) is never stale-gated."""
+    state = CanonicalState(cloud_version=QueueVersion(9, 1), tracks=_refs(0, 1), active=True)
+    # A CloudSetState carrying an *older* queue_version must still be applied:
+    # transport intent is orthogonal to queue-list staleness.
+    result = reduce(
+        state,
+        CloudSetState(
+            now_ms=1,
+            version=QueueVersion(5, 1),
+            playing=PlayingState.PLAYING,
+            position_ms=0,
+            current_ref=_refs(1)[0],
+        ),
+    )
+    assert result.state is not state or result.effects != ()
+
+
+def test_gated_tuples_cover_exactly_the_list_lane_and_session_state() -> None:
+    """The version gate is opt-in: the gated tuples are exactly list-lane + session-state."""
+    assert set(_GATED_LT) == {CloudSnapshot}
+    assert set(_GATED_LE) == {
+        CloudVersionChanged,
+        CloudTracksAdded,
+        CloudTracksInserted,
+        CloudTracksRemoved,
+        CloudTracksReordered,
+        CloudCleared,
+        CloudAutoplayTracksLoaded,
+        CloudLoadAck,
+        CloudSessionState,
+    }
 
 
 def test_app_origin_add_appends_and_resyncs() -> None:
