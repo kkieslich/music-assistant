@@ -151,34 +151,56 @@ ConfirmEvent = (
     | CloudLoadAck
 )
 
+# ---- version gate: per-lane opt-in --------------------------------------
+#
+# Only the event types listed below are dropped when their queue_version is
+# stale. This is opt-in by construction: a future event type that happens to
+# carry a `version` field is NOT gated unless it is explicitly added here, so
+# the next transport/control event is safe by default.
+
+# A CloudSnapshot is the authoritative full-queue answer to our own
+# AskSnapshot, so an *equal* version still applies (CloudSessionState /
+# CloudVersionChanged pre-advance cloud_version to the version the snapshot
+# then reports); reject only if the snapshot is *strictly* older.
+_GATED_LT = (CloudSnapshot,)
+
+# The queue-list lane plus session-state: an event at a version <= the one we
+# already hold is a stale replay and must be dropped. CloudSessionState stays
+# gated here — the reconnect path still works because Disconnected resets
+# cloud_version, so a recreated session's lower version is never stale-gated.
+_GATED_LE = (
+    CloudVersionChanged,
+    CloudTracksAdded,
+    CloudTracksInserted,
+    CloudTracksRemoved,
+    CloudTracksReordered,
+    CloudCleared,
+    CloudAutoplayTracksLoaded,
+    CloudLoadAck,
+    CloudSessionState,
+)
+
+# Deliberately absent from both tuples, even though each carries a `version`:
+#
+# - CloudQueueError: a rejection must always reach its matching proposal (the
+#   coordinator falls back to version=cloud_version when the wire error carries
+#   none, which `<=` would always swallow).
+# - CloudSetState: the live "which track is playing / play / pause / skip"
+#   command. Its queue_version can lag our cloud_version (the app advances the
+#   queue while we hold an older snapshot), but the transport intent is always
+#   current and orthogonal to queue-list staleness. Gating it froze MA on the
+#   wrong track and made phone skips no-ops (live 2026-07-09). It is idempotent
+#   (``_apply_transport`` only acts on a real change) and also re-asks for a
+#   fresh snapshot when its version advances.
+
 
 def reduce(state: CanonicalState, event: Event) -> ReduceResult:
     """Compute the next canonical state and the effects an event produces."""
-    version = getattr(event, "version", None)
-    # Some events are control/transport, not queue-list state, and must NOT be
-    # dropped by the queue-version-stale gate:
-    #
-    # - CloudQueueError: a rejection must always reach its matching proposal
-    #   (the coordinator falls back to version=cloud_version when the wire
-    #   error carries none, which `<=` would always swallow).
-    # - CloudSetState: the live "which track is playing / play / pause / skip"
-    #   command. Its queue_version can lag our cloud_version (the app advances
-    #   the queue while we hold an older snapshot), but the transport intent is
-    #   always current and orthogonal to queue-list staleness. Gating it froze
-    #   MA on the wrong track and made phone skips no-ops (live 2026-07-09). It
-    #   is idempotent (``_apply_transport`` only acts on a real change) and also
-    #   re-asks for a fresh snapshot when its version advances.
-    if version is not None and not isinstance(event, (CloudQueueError, CloudSetState)):
-        # A snapshot is the authoritative full-queue answer to our own
-        # AskSnapshot: apply it at the *equal* version (CloudSessionState /
-        # CloudVersionChanged pre-advance cloud_version to the version the
-        # snapshot then reports), rejecting only if *strictly* older.
-        stale = (
-            _version_lt(version, state.cloud_version)
-            if isinstance(event, CloudSnapshot)
-            else _version_le(version, state.cloud_version)
-        )
-        if stale:
+    if isinstance(event, _GATED_LT):
+        if _version_lt(event.version, state.cloud_version):
+            return ReduceResult(state, ())
+    elif isinstance(event, _GATED_LE):
+        if _version_le(event.version, state.cloud_version):
             return ReduceResult(state, ())
     if isinstance(event, MaQueueChanged):
         return _reduce_ma_queue_changed(state, event)
