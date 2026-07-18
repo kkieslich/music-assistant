@@ -69,10 +69,11 @@ actually fetches the audio.
 
 4.  Steady state: bidirectional message loop
     ├─ session.py decodes outer envelopes via QobuzConnectCodec.decode_frame
-    ├─ batched inner messages parsed → typed events fired via callbacks
-    ├─ coordinator.py translates each callback into a pure Event, runs it
-    │  through reducer.reduce() under a lock, and awaits the resulting
-    │  effects on effect_runner (in order) before the next event
+    ├─ inbound_dispatcher routes each inner message; the codec parses it
+    │  straight into a sync_types Event
+    ├─ coordinator.submit() injects shell-only context, runs it through
+    │  reducer.reduce() under a lock, and awaits the resulting effects on
+    │  effect_runner (in order) before the next event
     └─ effect_runner emits state reports back via outbound_reporter /
        session on a 5s heartbeat plus ad-hoc after every command
 ```
@@ -89,8 +90,8 @@ Nothing outside the shell holds mutable sync state.
 | [`discovery.py`](discovery.py)                         | mDNS service + local HTTP handshake endpoints                                                                                     | ❌         | ❌              |
 | [`protocol.py`](protocol.py)                           | Outer-frame codec + protobuf encode/decode                                                                                        | ❌         | ✅              |
 | [`session.py`](session.py)                             | WebSocket lifecycle, token refresh, JOIN role, `send_*` verbs, hand-off to dispatcher                                             | ❌         | via proto      |
-| [`inbound_dispatcher.py`](inbound_dispatcher.py)       | Routing table: decoded inner message → typed callback                                                                             | ❌         | via proto      |
-| [`models.py`](models.py)                               | DTOs + enums shared across all of the above (parsed cloud events, `QueueTrackRef`, `QueueVersion`, quality maps, `QobuzMirror`)   | ❌         | enum refs only |
+| [`inbound_dispatcher.py`](inbound_dispatcher.py)       | Routing table: decoded inner message → codec-built `sync_types` Event → `coordinator.submit`                                       | ❌         | via proto      |
+| [`models.py`](models.py)                               | Enums + wire value types shared across all of the above (`QueueTrackRef`, `QueueVersion`, quality maps, tokens)                    | ❌         | enum refs only |
 | [`sync_types.py`](sync_types.py)                       | **Pure** value types: `CanonicalState`, the `Event` union (cloud + MA + timer), the `Effect` union (`Push*`/`Ma*`/`ReportState`), `Proposal`  | ❌         | ❌              |
 | [`reducer.py`](reducer.py)                             | **Pure** `reduce(state, event) -> (state, effects)`: version gate, proposal confirm/reject/timeout, the four lanes               | ❌         | ❌              |
 | [`coordinator.py`](coordinator.py)                     | **Shell**: owns the single `CanonicalState`; serializes inbound (cloud callbacks + MA `on_ma_*`) into `Event`s through `reduce` under a lock; runs the proposal-timeout timer | ✅ (via bridge) | via session |
@@ -283,10 +284,14 @@ the source:
 
 ## Inbound messages (Qobuz → this provider)
 
-All inbound traffic is one of these QConnect inner message types, decoded
-and dispatched in [`session.py`](session.py), translated into a pure
-`Event` by [`coordinator.py`](coordinator.py), and reduced in
-[`reducer.py`](reducer.py). The reducer routes each event to one of four
+All inbound traffic is one of these QConnect inner message types. The codec
+(`protocol.py`) parses each frame straight into a `sync_types` `Event`; the
+[`inbound_dispatcher.py`](inbound_dispatcher.py) routes it to
+`coordinator.submit()`, which injects the little shell-only context an event
+can't carry (own-renderer verdict, snapshot track pointer, error version
+fallback) before reducing it in [`reducer.py`](reducer.py). SET_ACTIVE and the
+quality tap stay provider hooks (they broadcast/persist before submitting).
+The reducer routes each event to one of four
 lanes: **list** (queue snapshot/add/insert/remove/reorder/clear + load
 acks/version), **transport/session** (set-state, set-active, session-state,
 renderer registry), **modes** (loop/shuffle/autoplay), and **side-channels**
@@ -295,10 +300,10 @@ renderer registry), **modes** (loop/shuffle/autoplay), and **side-channels**
 | Type ID | Message                              | Decoder (`protocol.py`)       | Event (`sync_types.py`)              | Lane      |
 |--------:|--------------------------------------|-------------------------------|--------------------------------------|-----------|
 |      41 | `SRVR_RNDR_SET_STATE`                | `parse_set_state`             | `CloudSetState`                      | transport |
-|      42 | `SRVR_RNDR_SET_VOLUME`               | (inline in session.py)        | `CloudVolume` / `CloudVolumeDelta`   | side      |
-|      43 | `SRVR_RNDR_SET_ACTIVE`               | (inline in session.py)        | `CloudSetActive`                     | transport |
-|      44 | `SRVR_RNDR_SET_MAX_AUDIO_QUALITY`    | (inline in session.py)        | `_on_quality_change` in `__init__.py`| (provider)|
-|      77 | `CTRL_SRVR_ASK_FOR_RENDERER_STATE`   | (no payload)                  | `CloudStateRequest` → `ReportState`  | transport |
+|      42 | `SRVR_RNDR_SET_VOLUME`               | `parse_set_volume`            | `CloudVolume` / `CloudVolumeDelta`   | side      |
+|      43 | `SRVR_RNDR_SET_ACTIVE`               | (inline bool → `on_set_active`)| `CloudSetActive`                    | transport |
+|      44 | `SRVR_RNDR_SET_MAX_AUDIO_QUALITY`    | (inline int → `on_quality`)   | `_on_quality_change` in `__init__.py`| (provider)|
+|      77 | `CTRL_SRVR_ASK_FOR_RENDERER_STATE`   | `parse_state_request`         | `CloudStateRequest` → `ReportState`  | transport |
 |      88 | `SRVR_CTRL_QUEUE_ERROR_MESSAGE`      | `parse_queue_error`           | `CloudQueueError` (proposal reject)  | list      |
 |      91 | `SRVR_CTRL_QUEUE_TRACKS_LOADED`      | `parse_queue_load_ack`        | `CloudLoadAck` (proposal confirm)    | list      |
 |     103 | `SRVR_CTRL_AUTOPLAY_TRACKS_LOADED`   | `parse_autoplay_load_ack`     | `CloudAutoplayTracksLoaded`          | list      |
@@ -508,9 +513,10 @@ runner passes those straight through, while add / insert / load verbs send
 ### The impure shell
 
 - [`coordinator.py`](coordinator.py) owns the single `CanonicalState`. Its
-  `build_session_callbacks()` turns the session's parsed DTOs into `Event`s,
-  and its `on_ma_*` entry points do the same for MA's event bus. Every event
-  is fed through `reduce` under an `asyncio.Lock` and *fully* applied — state
+  `submit()` is the intake for codec-built cloud `Event`s (injecting shell-only
+  context first), and its `on_ma_*` entry points build `Event`s for MA's event
+  bus. Every event is fed through `reduce` under an `asyncio.Lock` and *fully*
+  applied — state
   stored, every effect awaited in order — before the next event starts. That
   linear ordering is what makes the version-gated decisions correct: nothing
   ever observes a half-applied state. It also runs the proposal-timeout timer

@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-from music_assistant.providers.qobuz_connect.models import (
-    QConnectMessageType,
-    RendererRecord,
-)
+from music_assistant.providers.qobuz_connect.models import QConnectMessageType
 
 
 def test_controller_message_type_values_match_proto() -> None:
@@ -19,11 +16,3 @@ def test_controller_message_type_values_match_proto() -> None:
     assert QConnectMessageType.SRVR_CTRL_UPDATE_RENDERER == 84  # type: ignore[comparison-overlap]
     assert QConnectMessageType.SRVR_CTRL_REMOVE_RENDERER == 85  # type: ignore[comparison-overlap]
     assert QConnectMessageType.SRVR_CTRL_ACTIVE_RENDERER_CHANGED == 86  # type: ignore[comparison-overlap]
-
-
-def test_renderer_record_defaults() -> None:
-    """RendererRecord holds id + uuid; friendly name is optional."""
-    record = RendererRecord(renderer_id=3, device_uuid=b"\x01" * 16)
-    assert record.renderer_id == 3
-    assert record.device_uuid == b"\x01" * 16
-    assert record.friendly_name == ""

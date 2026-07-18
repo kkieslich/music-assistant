@@ -25,14 +25,14 @@ from music_assistant.providers.qobuz_connect.effect_runner import EffectRunner
 from music_assistant.providers.qobuz_connect.models import (
     BufferState,
     PlayingState,
-    QueueStateSnapshot,
     QueueTrackRef,
     QueueVersion,
-    SetStateEvent,
 )
 from music_assistant.providers.qobuz_connect.outbound_reporter import OutboundReporter
 from music_assistant.providers.qobuz_connect.sync_types import (
     CanonicalState,
+    CloudSetState,
+    CloudSnapshot,
     PushVolume,
     ReportState,
 )
@@ -122,15 +122,11 @@ def test_setup_constructs_coordinator_and_effect_runner() -> None:
 
 
 def test_build_session_callbacks_delegates_to_coordinator() -> None:
-    """Most callbacks are the coordinator's own translators; on_set_active/on_quality are overridden."""
+    """Events flow through the coordinator's submit; on_set_active/on_quality are overridden."""
     provider, _mass = _make_provider()
     callbacks = provider._build_session_callbacks()
 
-    assert callbacks.on_set_state == provider._coordinator._on_set_state
-    assert callbacks.on_queue_state == provider._coordinator._on_queue_state
-    assert callbacks.on_volume == provider._coordinator._on_volume
-    assert callbacks.on_volume_delta == provider._coordinator._on_volume_delta
-    assert callbacks.on_add_renderer == provider._coordinator._on_add_renderer
+    assert callbacks.submit == provider._coordinator.submit
     assert callbacks.on_disconnected == provider._coordinator._on_disconnected
 
     # Provider-level overrides that do strictly more than the reducer.
@@ -143,20 +139,26 @@ async def test_snapshot_then_activate_reaches_ma_play() -> None:
     provider, mass = _make_provider()
     callbacks = provider._build_session_callbacks()
 
-    await callbacks.on_queue_state(
-        QueueStateSnapshot(
-            queue_version=QueueVersion(1, 0),
-            action_uuid=b"\x00" * 16,
-            tracks=[QueueTrackRef(queue_item_id=1, track_id="501")],
+    await callbacks.submit(
+        CloudSnapshot(
+            now_ms=1,
+            version=QueueVersion(1, 0),
+            tracks=(QueueTrackRef(queue_item_id=1, track_id="501"),),
+            autoplay_tracks=(),
+            shuffle=False,
+            autoplay=False,
+            track_index=0,
         )
     )
     assert provider._coordinator.state.current_id == 501
 
-    await callbacks.on_set_state(
-        SetStateEvent(
-            playing_state=PlayingState.PLAYING,
+    await callbacks.submit(
+        CloudSetState(
+            now_ms=2,
+            version=None,
+            playing=PlayingState.PLAYING,
             position_ms=0,
-            current_item=QueueTrackRef(queue_item_id=1, track_id="501"),
+            current_ref=QueueTrackRef(queue_item_id=1, track_id="501"),
         )
     )
     assert provider._coordinator.state.playing is PlayingState.PLAYING

@@ -10,16 +10,14 @@ from music_assistant.providers.qobuz_connect.coordinator import QobuzConnectCoor
 from music_assistant.providers.qobuz_connect.models import (
     LoopMode,
     PlayingState,
-    QueueError,
-    QueueStateSnapshot,
     QueueTrackRef,
     QueueVersion,
-    RendererRecord,
-    RendererStateUpdate,
-    SessionStateEvent,
-    SetStateEvent,
 )
 from music_assistant.providers.qobuz_connect.sync_types import (
+    CloudAddRenderer,
+    CloudQueueError,
+    CloudRendererStateUpdated,
+    CloudSessionState,
     CloudSetActive,
     CloudSetState,
     CloudSnapshot,
@@ -229,25 +227,17 @@ async def test_concurrent_submits_serialize_without_losing_a_proposal() -> None:
     assert {p.action_uuid for p in coord.state.pending} == {b"\xaa" * 16, b"\xbb" * 16}
 
 
-async def test_on_add_renderer_own_device_sets_own_rid() -> None:
-    """on_add_renderer resolves own-ness against the coordinator's device_uuid."""
+async def test_submit_add_renderer_own_device_sets_own_rid() -> None:
+    """Submit resolves own-ness against the coordinator's device_uuid (is_own injection)."""
     coord, _runner, _bridge = _coordinator()
-    callbacks = coord.build_session_callbacks()
-    assert callbacks.on_add_renderer is not None
-    await callbacks.on_add_renderer(
-        RendererRecord(renderer_id=42, device_uuid=OUR_DEVICE_UUID, friendly_name="us")
-    )
+    await coord.submit(CloudAddRenderer(now_ms=1, renderer_id=42, device_uuid=OUR_DEVICE_UUID))
     assert coord.state.own_rid == 42
 
 
-async def test_on_add_renderer_other_device_leaves_own_rid_none() -> None:
-    """on_add_renderer does not adopt own_rid for a renderer with a different device_uuid."""
+async def test_submit_add_renderer_other_device_leaves_own_rid_none() -> None:
+    """Submit does not adopt own_rid for a renderer with a different device_uuid."""
     coord, _runner, _bridge = _coordinator()
-    callbacks = coord.build_session_callbacks()
-    assert callbacks.on_add_renderer is not None
-    await callbacks.on_add_renderer(
-        RendererRecord(renderer_id=42, device_uuid=b"\x99" * 16, friendly_name="someone-else")
-    )
+    await coord.submit(CloudAddRenderer(now_ms=1, renderer_id=42, device_uuid=b"\x99" * 16))
     assert coord.state.own_rid is None
 
 
@@ -346,10 +336,10 @@ async def test_timer_fires_and_converges(monkeypatch: pytest.MonkeyPatch) -> Non
 # ---- build_session_callbacks() translation paths -------------------------
 
 
-async def test_on_set_state_translates() -> None:
-    """The real ``on_set_state`` callback translates a SetStateEvent into CloudSetState."""
+async def test_submit_set_state_reduces_to_play() -> None:
+    """A submitted CloudSetState reaches the reducer and plays the new current track."""
     coord, runner, _bridge = _coordinator()
-    await coord._submit(
+    await coord.submit(
         CloudSnapshot(
             now_ms=1,
             version=QueueVersion(5, 1),
@@ -360,14 +350,13 @@ async def test_on_set_state_translates() -> None:
             track_index=1,
         )
     )
-    callbacks = coord.build_session_callbacks()
-    await callbacks.on_set_state(
-        SetStateEvent(
-            playing_state=PlayingState.PLAYING,
+    await coord.submit(
+        CloudSetState(
+            now_ms=2,
+            version=None,
+            playing=PlayingState.PLAYING,
             position_ms=1234,
-            queue_version=None,
-            current_item=_refs(1)[0],
-            next_item=None,
+            current_ref=_refs(1)[0],
         )
     )
     assert coord.state.playing is PlayingState.PLAYING
@@ -377,51 +366,48 @@ async def test_on_set_state_translates() -> None:
     )
 
 
-async def test_on_queue_state_uses_remembered_track_index() -> None:
-    """on_queue_state falls back to the track_index remembered from the last SESSION_STATE."""
+async def test_submit_snapshot_uses_remembered_track_index() -> None:
+    """Submit stamps a snapshot with the track_index remembered from the last SESSION_STATE."""
     coord, _runner, _bridge = _coordinator()
-    callbacks = coord.build_session_callbacks()
-    await callbacks.on_session_state(
-        SessionStateEvent(
-            session_uuid=b"\x02" * 16,
-            session_id=1,
-            queue_version=QueueVersion(1, 0),
-            track_index=3,
-        )
-    )
-    tracks = list(_refs(0, 1, 2, 3))
-    await callbacks.on_queue_state(
-        QueueStateSnapshot(
-            queue_version=QueueVersion(2, 0),
-            action_uuid=b"\x03" * 16,
+    await coord.submit(CloudSessionState(now_ms=1, version=QueueVersion(1, 0), track_index=3))
+    tracks = _refs(0, 1, 2, 3)
+    await coord.submit(
+        CloudSnapshot(
+            now_ms=2,
+            version=QueueVersion(2, 0),
             tracks=tracks,
-            shuffle_mode=False,
-            autoplay_mode=False,
-            autoplay_tracks=[],
+            autoplay_tracks=(),
+            shuffle=False,
+            autoplay=False,
+            # Codec always builds snapshots with track_index=0; the coordinator
+            # injects the remembered value.
+            track_index=0,
         )
     )
     # track_index=3 is one-indexed, so the remembered pointer resolves to
-    # tracks[2] — proving on_queue_state actually consumed the value
-    # on_session_state stashed, rather than defaulting to 0.
+    # tracks[2] — proving submit injected the value SESSION_STATE stashed.
     assert coord.state.current_id == int(tracks[2].track_id)
 
 
-async def test_on_queue_error_falls_back_to_cloud_version() -> None:
+async def test_submit_queue_error_without_version_falls_back_to_cloud_version() -> None:
     """
-    A QueueError with no queue_version still rebases the matching proposal.
+    A CloudQueueError with the (0,0) default version rebases the matching proposal.
 
-    The fallback value the coordinator supplies equals ``state.cloud_version``
-    exactly (``CloudQueueError.version`` is non-optional). A rejection is a
-    control event exempted from the reducer's top-of-``reduce()`` version-stale
-    gate, so it still reaches ``_reject_proposal`` and rebases immediately
-    rather than waiting on the ProposalTimeout safety net.
+    The codec builds a version-less wire error as ``QueueVersion()``; submit
+    injects ``state.cloud_version`` so the rejection still rebases against the
+    version we hold rather than resetting it to (0,0).
     """
     coord, runner, bridge = _coordinator()
     proposal = await _seed_and_propose(coord, bridge)
 
-    callbacks = coord.build_session_callbacks()
-    await callbacks.on_queue_error(
-        QueueError(action_uuid=proposal.action_uuid, queue_version=None, code="1", message="failed")
+    await coord.submit(
+        CloudQueueError(
+            now_ms=1,
+            version=QueueVersion(),
+            action_uuid=proposal.action_uuid,
+            code="1",
+            message="failed",
+        )
     )
 
     assert len(coord.state.pending) == 1  # rebased, still pending
@@ -430,10 +416,10 @@ async def test_on_queue_error_falls_back_to_cloud_version() -> None:
     assert any(isinstance(e, PushAdd) for e in runner.effects)  # re-pushed
 
 
-async def test_on_renderer_state_updated_maps_current_queue_index() -> None:
-    """on_renderer_state_updated maps current_queue_index onto current_id while inactive."""
+async def test_submit_renderer_state_updated_maps_current_index() -> None:
+    """A submitted CloudRendererStateUpdated maps current_index onto current_id while inactive."""
     coord, _runner, _bridge = _coordinator()
-    await coord._submit(
+    await coord.submit(
         CloudSnapshot(
             now_ms=1,
             version=QueueVersion(5, 1),
@@ -445,10 +431,10 @@ async def test_on_renderer_state_updated_maps_current_queue_index() -> None:
         )
     )
     assert coord.state.active is False
-    callbacks = coord.build_session_callbacks()
-    assert callbacks.on_renderer_state_updated is not None
-    await callbacks.on_renderer_state_updated(
-        RendererStateUpdate(renderer_id=7, current_queue_index=2)
+    await coord.submit(
+        CloudRendererStateUpdated(
+            now_ms=2, renderer_id=7, playing=None, position_ms=None, current_index=2
+        )
     )
     assert coord.state.current_id == int(_refs(0, 1, 2)[2].track_id)
 
