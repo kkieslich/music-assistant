@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from .models import LoopMode, PlayingState, QueueTrackRef, QueueVersion
+from .models import BufferState, LoopMode, PlayingState, QueueTrackRef, QueueVersion
 
 # ---- canonical state ----
 
@@ -42,6 +42,14 @@ class CanonicalState:
     reports back). While settling, the transport lane holds the commanded
     target instead of adopting MA's stale report, so the app's slider doesn't
     jump. Cleared once MA converges to the target or the settle window expires.
+    """
+    buffer_state: BufferState = BufferState.OK
+    """
+    Protocol-native transition signal reported on the wire. Set to BUFFERING
+    exactly where ``settling_position`` is set (cloud-commanded track change,
+    seek, resume, takeover play, load-ack switch) and back to OK where settling
+    clears; the app freezes its position interpolation while it reads BUFFERING,
+    which is what actually hides MA's ~1s stale-position lag from the user.
     """
     loop: LoopMode = LoopMode.OFF
     autoplay: bool = False

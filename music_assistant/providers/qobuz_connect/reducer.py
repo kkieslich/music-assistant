@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 
-from .models import PlayingState, QueueTrackRef, QueueVersion
+from .models import BufferState, PlayingState, QueueTrackRef, QueueVersion
 from .sync_types import (
     AskSnapshot,
     CanonicalState,
@@ -100,6 +100,12 @@ _POSITION_CONVERGE_MS = 2000
 # Hard cap on how long the transport lane holds the commanded target while
 # MA catches up. Bounds suppression so a genuinely divergent MA can never
 # freeze the reported position indefinitely.
+#
+# follow-up: now that BUFFERING is reported on the wire (Task 4), the app
+# freezes its own interpolation during a transition, so this settling window
+# may be shrinkable once BUFFERING is validated live. Do not shrink it here
+# until then — the settling guard still protects canonical state from
+# adopting MA's stale positions independently of what the app displays.
 _POSITION_SETTLE_TIMEOUT_MS = 5000
 
 # Events handled by the modes lane (loop/autoplay/shuffle flags).
@@ -452,6 +458,18 @@ def _reduce_set_state(state: CanonicalState, event: CloudSetState) -> ReduceResu
     return ReduceResult(asked, result.effects + ask_effects)
 
 
+def _report_on_buffer_change(
+    old: BufferState, new: BufferState, effects: tuple[Effect, ...]
+) -> tuple[Effect, ...]:
+    """
+    Append a ``ReportState`` when ``buffer_state`` transitions.
+
+    A BUFFERING/OK transition must reach the app immediately (freeze/unfreeze
+    its position interpolation) rather than waiting for the next heartbeat.
+    """
+    return (*effects, ReportState()) if old != new else effects
+
+
 def _apply_transport(
     state: CanonicalState,
     *,
@@ -482,8 +500,14 @@ def _apply_transport(
             position_ms=position_ms or 0,
             position_anchor_ms=now_ms,
             settling_position=True,
+            buffer_state=BufferState.BUFFERING,
         )
-        return ReduceResult(new, (MaPlayTrack(track_id=current_id, position_ms=position_ms or 0),))
+        effects = _report_on_buffer_change(
+            state.buffer_state,
+            new.buffer_state,
+            (MaPlayTrack(track_id=current_id, position_ms=position_ms or 0),),
+        )
+        return ReduceResult(new, effects)
     if playing is not None and playing != state.playing:
         # Capture the live interpolated position when toggling play/pause. During
         # PLAYING the reporter interpolates position from (position_ms, anchor),
@@ -495,22 +519,34 @@ def _apply_transport(
         if state.playing is PlayingState.PLAYING:
             live_position_ms = state.position_ms + max(0, now_ms - state.position_anchor_ms)
         # A resume restarts the flow stream, so MA's position lags on the way
-        # back to PLAYING (same as a seek/track-change); settle it. A pause has
-        # no such lag — its position was just frozen above.
+        # back to PLAYING (same as a seek/track-change); settle it and mark
+        # BUFFERING. A pause has no such lag — its position was just frozen
+        # above and buffer clears back to OK.
+        resuming = playing is PlayingState.PLAYING
+        buffer_state = BufferState.BUFFERING if resuming else BufferState.OK
         new = dataclasses.replace(
             state,
             playing=playing,
             position_ms=live_position_ms,
             position_anchor_ms=now_ms,
-            settling_position=playing is PlayingState.PLAYING,
+            settling_position=resuming,
+            buffer_state=buffer_state,
         )
         effect = MaPause() if playing is PlayingState.PAUSED else MaResume()
-        return ReduceResult(new, (effect,))
+        effects = _report_on_buffer_change(state.buffer_state, buffer_state, (effect,))
+        return ReduceResult(new, effects)
     if position_ms is not None and abs(position_ms - state.position_ms) > _SEEK_THRESHOLD_MS:
         new = dataclasses.replace(
-            state, position_ms=position_ms, position_anchor_ms=now_ms, settling_position=True
+            state,
+            position_ms=position_ms,
+            position_anchor_ms=now_ms,
+            settling_position=True,
+            buffer_state=BufferState.BUFFERING,
         )
-        return ReduceResult(new, (MaSeek(position_ms),))
+        effects = _report_on_buffer_change(
+            state.buffer_state, new.buffer_state, (MaSeek(position_ms),)
+        )
+        return ReduceResult(new, effects)
     # Position/heartbeat only: no MA effect, ever. Only re-anchor when a
     # position was actually reported — a bare heartbeat with no position
     # carries no fresh interpolation point.
@@ -533,8 +569,12 @@ def _takeover(state: CanonicalState) -> ReduceResult:
         )
         play = MaPlayTrack(track_id=state.current_id, position_ms=state.position_ms)
         # Playing the adopted current restarts MA audio, so its position lags;
-        # settle until MA reports the handed-over position.
-        return ReduceResult(dataclasses.replace(active, settling_position=True), (resync, play))
+        # settle and mark BUFFERING until MA reports the handed-over position.
+        new = dataclasses.replace(
+            active, settling_position=True, buffer_state=BufferState.BUFFERING
+        )
+        effects = _report_on_buffer_change(state.buffer_state, new.buffer_state, (resync, play))
+        return ReduceResult(new, effects)
     return ReduceResult(active, (ReportState(),))
 
 
@@ -586,6 +626,10 @@ def _ma_transport(state: CanonicalState, event: MaTransportChanged) -> ReduceRes
         if not converged and not timed_out:
             return ReduceResult(state, (ReportState(),))
     current_id = event.current_track_id if event.current_track_id is not None else state.current_id
+    # Buffer tracks settling: BUFFERING while a transition is still settling
+    # (transient stop mid-transition), back to OK once MA has converged/timed
+    # out. This ReduceResult already emits ReportState, so the transition
+    # reaches the app immediately.
     new = dataclasses.replace(
         state,
         playing=playing,
@@ -593,6 +637,7 @@ def _ma_transport(state: CanonicalState, event: MaTransportChanged) -> ReduceRes
         position_ms=position_ms,
         position_anchor_ms=position_anchor_ms,
         settling_position=settling,
+        buffer_state=BufferState.BUFFERING if settling else BufferState.OK,
     )
     # MA is the RENDERER: it reports its live state via rndrSrvrStateUpdated
     # (the ReportState effect), NOT ctrlSrvrSetPlayerState. The latter is a
@@ -653,11 +698,16 @@ def _reduce_load_ack(state: CanonicalState, event: CloudLoadAck) -> ReduceResult
     ):
         play = MaPlayTrack(track_id=new_current, position_ms=0)
         # The loaded track starts at 0 and MA's position lags the restart;
-        # anchor position to 0 and settle so the app doesn't briefly show the
-        # new track at the old track's position. _with_resync reads only
-        # tracks/current/active, so result.effects is unchanged by this.
-        settling = dataclasses.replace(new, position_ms=0, settling_position=True)
-        return ReduceResult(settling, (*result.effects, play))
+        # anchor position to 0, settle, and mark BUFFERING so the app doesn't
+        # briefly show the new track at the old track's position. _with_resync
+        # reads only tracks/current/active, so result.effects is unchanged.
+        settling = dataclasses.replace(
+            new, position_ms=0, settling_position=True, buffer_state=BufferState.BUFFERING
+        )
+        effects = _report_on_buffer_change(
+            state.buffer_state, settling.buffer_state, (*result.effects, play)
+        )
+        return ReduceResult(settling, effects)
     return result
 
 

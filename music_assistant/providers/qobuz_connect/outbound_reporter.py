@@ -104,7 +104,7 @@ class OutboundReporter:
         if current_item is None:
             return
         wire_position_ms, wire_timestamp_ms = self._wire_anchor(state)
-        wire_buffer_state = BufferState.OK
+        wire_buffer_state = self._wire_buffer_state(state)
         self._logger.debug(
             "Qobuz report state=%s wire_buffer=%s pos=%sms (anchor ts=%s) item=%s:%s qv=%s.%s",
             state.playing,
@@ -138,14 +138,31 @@ class OutboundReporter:
         """
         Return ``(position_ms, timestamp_ms)`` the Qobuz client should use.
 
-        For PLAYING we ship the raw anchor pair so the client interpolates
-        exactly once — sending an already-interpolated value with the original
-        anchor would let the client interpolate on top of that, doubling the
-        drift. For non-PLAYING we ship a frozen snapshot (``timestamp = now``).
+        While BUFFERING we ship a frozen snapshot (``timestamp = now``) so the
+        client holds the position steady across MA's ~1s transition lag. For
+        PLAYING (non-buffering) we ship the raw anchor pair so the client
+        interpolates exactly once — sending an already-interpolated value with
+        the original anchor would let the client interpolate on top of that,
+        doubling the drift. For non-PLAYING we ship a frozen snapshot.
         """
+        if state.buffer_state == BufferState.BUFFERING:
+            return state.position_ms, int(time.time() * 1000)
         if state.playing == PlayingState.PLAYING:
             return state.position_ms, state.position_anchor_ms or int(time.time() * 1000)
         return state.position_ms, int(time.time() * 1000)
+
+    def _wire_buffer_state(self, state: CanonicalState) -> BufferState:
+        """
+        Compute the buffer state exposed to the Qobuz client.
+
+        Only surfaced while PLAYING: the reference web client reports
+        BUFFERING in ``RNDR_SRVR_STATE_UPDATED`` while playing across a
+        skip/seek transition (verified against the protocol captures), and OK
+        otherwise (a paused renderer never reports BUFFERING).
+        """
+        if state.playing == PlayingState.PLAYING and state.buffer_state == BufferState.BUFFERING:
+            return BufferState.BUFFERING
+        return BufferState.OK
 
     # ---- background tasks ----------------------------------------------
 

@@ -24,6 +24,7 @@ from music_assistant.providers.qobuz_connect import outbound_reporter as outboun
 from music_assistant.providers.qobuz_connect.coordinator import QobuzConnectCoordinator
 from music_assistant.providers.qobuz_connect.effect_runner import EffectRunner
 from music_assistant.providers.qobuz_connect.models import (
+    BufferState,
     PlayingState,
     QueueStateSnapshot,
     QueueTrackRef,
@@ -284,6 +285,40 @@ async def test_reporter_emits_canonical_state_with_live_duration() -> None:
     assert sent["position_timestamp_ms"] == 9999
     assert sent["queue_version"] == QueueVersion(3, 2)
     assert sent["duration_ms"] == 200_000
+
+
+async def test_reporter_ships_buffering_with_frozen_anchor() -> None:
+    """A BUFFERING canonical state reaches the wire as BUFFERING with a frozen (now) anchor."""
+    sent: dict[str, Any] = {}
+
+    class _Session:
+        async def send_renderer_state(self, **kwargs: Any) -> bool:
+            sent.update(kwargs)
+            return True
+
+    state = CanonicalState(
+        cloud_version=QueueVersion(3, 2),
+        tracks=(QueueTrackRef(queue_item_id=7, track_id="501"),),
+        current_id=501,
+        playing=PlayingState.PLAYING,
+        position_ms=1234,
+        position_anchor_ms=9999,
+        buffer_state=BufferState.BUFFERING,
+    )
+    reporter = OutboundReporter(
+        session_getter=lambda: cast("Any", _Session()),
+        state_getter=lambda: state,
+        duration_getter=lambda: 200_000,
+        active_getter=lambda: True,
+        logger=outbound_reporter_module.LOGGER,
+    )
+
+    await reporter.report_state()
+
+    assert sent["buffer_state"] is BufferState.BUFFERING
+    assert sent["position_ms"] == 1234
+    # BUFFERING ships a frozen anchor (timestamp = now), not the raw anchor_ms.
+    assert sent["position_timestamp_ms"] != 9999
 
 
 async def test_reporter_skips_when_no_current_item() -> None:

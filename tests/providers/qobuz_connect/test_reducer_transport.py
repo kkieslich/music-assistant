@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 from music_assistant.providers.qobuz_connect.models import (
+    BufferState,
     PlayingState,
     QueueTrackRef,
     QueueVersion,
@@ -21,8 +24,11 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     Disconnected,
     MaPause,
     MaPlayTrack,
+    MaResume,
     MaResyncQueue,
+    MaSeek,
     MaTransportChanged,
+    ReportState,
 )
 
 
@@ -167,13 +173,16 @@ def test_setactive_takeover_plays_current_when_playing() -> None:
     )
     result = reduce(state, CloudSetActive(now_ms=1, active=True))
     assert result.state.active is True
-    assert len(result.effects) == 2
-    resync, play = result.effects
+    # Takeover play restarts audio, so the transition is marked BUFFERING and
+    # a ReportState is emitted alongside the resync + play.
+    assert result.state.buffer_state is BufferState.BUFFERING
+    resync, play, report = result.effects
     assert isinstance(resync, MaResyncQueue)
     assert resync.track_ids == (900000, 900001, 900002)
     assert resync.current_track_id == 900001
     assert isinstance(play, MaPlayTrack)
     assert play.track_id == 900001
+    assert isinstance(report, ReportState)
 
 
 def test_setactive_takeover_paused_does_not_play() -> None:
@@ -735,3 +744,129 @@ def test_disconnect_resets_cloud_version_so_a_session_reset_is_not_stale() -> No
     asks = [e for e in rejoined.effects if isinstance(e, AskSnapshot)]
     assert asks == [AskSnapshot(version=QueueVersion(2, 1))]
     assert rejoined.state.cloud_version == QueueVersion(2, 1)
+
+
+# ---- Task 4: protocol-native BufferState transitions --------------------
+
+
+def test_cloud_track_change_marks_buffering_and_reports() -> None:
+    """A cloud-commanded track change sets BUFFERING and emits an immediate ReportState."""
+    result = reduce(
+        _playing_state(),
+        CloudSetState(
+            now_ms=1,
+            version=None,
+            playing=PlayingState.PLAYING,
+            position_ms=0,
+            current_ref=_refs(2)[0],
+        ),
+    )
+    assert result.state.buffer_state is BufferState.BUFFERING
+    assert any(isinstance(e, MaPlayTrack) for e in result.effects)
+    assert any(isinstance(e, ReportState) for e in result.effects)
+
+
+def test_cloud_seek_marks_buffering_and_reports() -> None:
+    """A cloud seek sets BUFFERING and emits an immediate ReportState alongside MaSeek."""
+    result = reduce(
+        _playing_state(),
+        CloudSetState(
+            now_ms=1,
+            version=None,
+            playing=PlayingState.PLAYING,
+            position_ms=60000,
+            current_ref=_refs(0)[0],
+        ),
+    )
+    assert result.state.buffer_state is BufferState.BUFFERING
+    assert any(isinstance(e, MaSeek) for e in result.effects)
+    assert any(isinstance(e, ReportState) for e in result.effects)
+
+
+def test_resume_marks_buffering_pause_clears_it() -> None:
+    """Resume sets BUFFERING (stream restarts); pause clears it back to OK (no lag)."""
+    paused = dataclasses.replace(
+        _playing_state(), playing=PlayingState.PAUSED, buffer_state=BufferState.OK
+    )
+    resumed = reduce(
+        paused,
+        CloudSetState(
+            now_ms=1,
+            version=None,
+            playing=PlayingState.PLAYING,
+            position_ms=None,
+            current_ref=_refs(0)[0],
+        ),
+    )
+    assert resumed.state.buffer_state is BufferState.BUFFERING
+    assert any(isinstance(e, MaResume) for e in resumed.effects)
+    assert any(isinstance(e, ReportState) for e in resumed.effects)
+
+    paused_again = reduce(
+        resumed.state,
+        CloudSetState(
+            now_ms=2,
+            version=None,
+            playing=PlayingState.PAUSED,
+            position_ms=None,
+            current_ref=_refs(0)[0],
+        ),
+    )
+    assert paused_again.state.buffer_state is BufferState.OK
+    assert any(isinstance(e, MaPause) for e in paused_again.effects)
+    assert any(isinstance(e, ReportState) for e in paused_again.effects)
+
+
+def test_buffering_clears_when_ma_position_converges() -> None:
+    """BUFFERING clears to OK once MA's reported position converges to the seek target."""
+    seeked = reduce(
+        _playing_state(),
+        CloudSetState(
+            now_ms=1000,
+            version=None,
+            playing=PlayingState.PLAYING,
+            position_ms=60000,
+            current_ref=_refs(0)[0],
+        ),
+    )
+    assert seeked.state.buffer_state is BufferState.BUFFERING
+    # Still lagging: stays BUFFERING (held), ReportState keeps the app frozen.
+    lagging = reduce(
+        seeked.state,
+        MaTransportChanged(
+            now_ms=1500, playing=PlayingState.PLAYING, current_track_id=900000, position_ms=30000
+        ),
+    )
+    assert lagging.state.buffer_state is BufferState.BUFFERING
+    # Converged: buffer clears to OK.
+    converged = reduce(
+        lagging.state,
+        MaTransportChanged(
+            now_ms=2500, playing=PlayingState.PLAYING, current_track_id=900000, position_ms=60050
+        ),
+    )
+    assert converged.state.buffer_state is BufferState.OK
+
+
+def test_buffering_clears_on_settle_timeout() -> None:
+    """BUFFERING clears to OK when the settle window times out even without convergence."""
+    seeked = reduce(
+        _playing_state(),
+        CloudSetState(
+            now_ms=1000,
+            version=None,
+            playing=PlayingState.PLAYING,
+            position_ms=60000,
+            current_ref=_refs(0)[0],
+        ),
+    )
+    timed_out = reduce(
+        seeked.state,
+        MaTransportChanged(
+            now_ms=1000 + 5001,
+            playing=PlayingState.PLAYING,
+            current_track_id=900000,
+            position_ms=30000,
+        ),
+    )
+    assert timed_out.state.buffer_state is BufferState.OK
