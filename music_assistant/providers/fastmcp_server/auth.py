@@ -66,7 +66,7 @@ def _audience_matches(aud: str | list[str] | None, expected: str) -> bool:
     return expected in aud
 
 
-class MASTokenVerifier(TokenVerifier):
+class MASTokenVerifier(TokenVerifier):  # type: ignore[misc]
     """Verify Bearer tokens against ``mass.webserver.auth``."""
 
     def __init__(

@@ -177,6 +177,13 @@ warn_unused_ignores = true
 follow_imports = "skip"
 module = ["plexapi", "plexapi.*"]
 
+# fastmcp's tool() decorator is untyped from mypy's perspective, so every
+# @sub.tool(...) registration trips untyped-decorator; the handlers themselves
+# stay fully checked.
+[[tool.mypy.overrides]]
+disable_error_code = ["untyped-decorator"]
+module = "music_assistant.providers.fastmcp_server.*"
+
 [tool.ruff.format]
 # Force Linux/macOS line endings
 line-ending = "lf"

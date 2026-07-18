@@ -204,7 +204,7 @@ class ClapIndex:
         return Path(self._mass.storage_path) / f"{self._filename_stem}_keys.json"
 
     def _load_sync(self) -> None:
-        from usearch.index import (  # type: ignore[attr-defined]  # noqa: PLC0415
+        from usearch.index import (  # noqa: PLC0415
             Index,
             MetricKind,
             ScalarKind,
