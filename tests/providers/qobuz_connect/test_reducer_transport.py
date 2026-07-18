@@ -870,3 +870,24 @@ def test_buffering_clears_on_settle_timeout() -> None:
         ),
     )
     assert timed_out.state.buffer_state is BufferState.OK
+
+
+def test_takeover_resumes_at_live_position_while_playing() -> None:
+    """A handoff while PLAYING resumes at position_ms + elapsed-since-anchor, not the stale base."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0, 1, 2),
+        current_id=900001,
+        playing=PlayingState.PLAYING,
+        position_ms=30000,
+        position_anchor_ms=1000,
+        active=False,
+    )
+    result = reduce(state, CloudSetActive(now_ms=4000, active=True))
+    # 30000 base + (4000 - 1000) elapsed = 33000
+    plays = [e for e in result.effects if isinstance(e, MaPlayTrack)]
+    assert len(plays) == 1
+    assert plays[0].position_ms == 33000
+    # stored position is re-anchored to the same live value.
+    assert result.state.position_ms == 33000
+    assert result.state.position_anchor_ms == 4000
