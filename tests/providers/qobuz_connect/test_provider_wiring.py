@@ -475,3 +475,18 @@ def test_reporter_host_inactive_without_target_player() -> None:
     bridge_with_target = SimpleNamespace(target_player_id=lambda: "p1")
     host2 = _ReporterHost(cast("Any", bridge_with_target), lambda: state)
     assert host2._is_active is True
+
+
+def test_bridge_queue_items_reads_the_full_queue() -> None:
+    """
+    The bridge must never see a truncated MA queue.
+
+    ``player_queues.items()`` defaults to ``limit=500``; a cloud queue larger
+    than that (observed live: 1834 tracks) would read back truncated, making
+    the differ believe the user replaced the queue with its first 500 tracks
+    — and push a LOAD that truncates the real cloud queue in the app.
+    """
+    provider, mass = _make_provider()
+    provider._bridge.queue_items("p1")
+    _args, kwargs = mass.player_queues.items.call_args
+    assert kwargs.get("limit", 500) >= 10_000
