@@ -45,6 +45,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
@@ -59,6 +60,7 @@ from music_assistant.providers.qobuz import CONF_QUALITY as QOBUZ_CONF_QUALITY
 from .coordinator import QobuzConnectCoordinator
 from .discovery import QobuzConnectDiscovery
 from .effect_runner import EffectRunner
+from .flight_recorder import FlightRecorder
 from .ma_bridge import MABridge
 from .metadata_resolver import MetadataResolver
 from .models import (
@@ -238,25 +240,45 @@ class QobuzConnectProvider(PluginProvider):
             reporter=self._reporter,
             own_rid_getter=lambda: self._coordinator.state.own_rid,
         )
-        self._coordinator = QobuzConnectCoordinator(
+        # Persistent diagnostics: bounded in-memory ring of reducer steps +
+        # WARNING/ERROR logs, dumped to <storage_path>/qobuz_connect/<instance>
+        # on errors and on a rolling interval, so instability seen on a
+        # headless server can be diagnosed after the fact.
+        self._flight_recorder = FlightRecorder(
+            Path(self.mass.storage_path) / "qobuz_connect" / self.instance_id,
+            state_getter=lambda: self._coordinator.state,
+        )
+        self._coordinator: QobuzConnectCoordinator = QobuzConnectCoordinator(
             runner=self._effect_runner,
             bridge=self._bridge,
             device_uuid=uuid.UUID(self._device_uuid).bytes,
             controller_enabled=self._enable_controller,
+            recorder=self._flight_recorder,
+            unresolvable_getter=lambda: self._metadata.unresolvable_track_ids,
         )
         self._ws_setup_lock = asyncio.Lock()
+        self._unloaded = False
         self._unsubscribe_queue_events: Callable[[], None] | None = None
         self._unsubscribe_queue_items_events: Callable[[], None] | None = None
         self._unsubscribe_player_events: Callable[[], None] | None = None
-        # Last value we pushed to the Qobuz cloud, so a MA ``PLAYER_UPDATED``
-        # event for an unchanged volume/mute doesn't trigger duplicate sends.
-        self._last_sent_volume: int | None = None
+        # Last mute state we pushed to the Qobuz cloud, so an unchanged value
+        # doesn't trigger duplicate sends (volume dedup lives in the
+        # coordinator).
         self._last_sent_muted: bool | None = None
+        # Auto-mode target resolution: the player picked at session start is
+        # pinned while the Connect session is active (see
+        # ``get_target_player_id``); warn-once bookkeeping for a vanished
+        # pinned player, since target resolution runs on every MA event.
+        self._pinned_target_id: str | None = None
+        self._warned_missing_target: str | None = None
 
     async def loaded_in_mass(self) -> None:
         """Start Qobuz Connect discovery after provider load."""
         logging.getLogger("websockets.client").setLevel(logging.WARNING)
         logging.getLogger("websockets.protocol").setLevel(logging.WARNING)
+        # Started first so it captures anything that goes wrong in the rest
+        # of the load sequence (discovery port conflicts, mDNS failures, ...).
+        await self._flight_recorder.start(extra_logger=self.logger)
         await self._reporter.start()
         self._unsubscribe_queue_events = self.mass.subscribe(
             self._on_ma_queue_event,
@@ -285,8 +307,20 @@ class QobuzConnectProvider(PluginProvider):
             device=self._device_config,
             on_connect=self._on_app_connected,
             quality_getter=lambda: self._max_quality,
+            zeroconf=self._shared_zeroconf(),
         )
-        await self._discovery.start()
+        try:
+            await self._discovery.start()
+        except Exception:
+            # loaded_in_mass runs in a fire-and-forget task whose exception
+            # MA only logs at DEBUG — surface the failure (port conflict,
+            # mDNS error) at ERROR so it's visible and flight-recorded.
+            self.logger.exception(
+                "Qobuz Connect discovery failed to start — the device will not be "
+                "reachable (is port %s already in use, e.g. by another instance?)",
+                self._http_port,
+            )
+            raise
         self.logger.info(
             "Qobuz Connect target '%s' listening on %s:%s",
             self._publish_name,
@@ -303,6 +337,10 @@ class QobuzConnectProvider(PluginProvider):
 
     async def unload(self, is_removed: bool = False) -> None:
         """Unload provider and stop network services."""
+        # Flag first: any in-flight handshake/_setup_websocket task checks it
+        # under the setup lock and bails instead of spawning a zombie session
+        # that would fight the next provider instance for the cloud session.
+        self._unloaded = True
         if self._unsubscribe_queue_events is not None:
             self._unsubscribe_queue_events()
             self._unsubscribe_queue_events = None
@@ -313,10 +351,16 @@ class QobuzConnectProvider(PluginProvider):
             self._unsubscribe_player_events()
             self._unsubscribe_player_events = None
         await self._reporter.stop()
-        if self._session:
-            await self._session.stop()
+        self._coordinator.close()
+        async with self._ws_setup_lock:
+            if self._session:
+                await self._session.stop()
+                self._session = None
         if self._discovery:
             await self._discovery.stop()
+            self._discovery = None
+        # Last, so the final rolling dump includes any shutdown warnings.
+        await self._flight_recorder.stop()
 
     async def update_config(self, config: ProviderConfig, changed_keys: set[str]) -> None:
         """Handle dynamic provider config updates."""
@@ -336,17 +380,38 @@ class QobuzConnectProvider(PluginProvider):
         """Resolve configured target player."""
         if self._target_player_id != PLAYER_ID_AUTO:
             if self.mass.players.get_player(self._target_player_id):
+                self._warned_missing_target = None
                 return self._target_player_id
-            self.logger.warning(
-                "Configured target player no longer exists: %s", self._target_player_id
-            )
+            # Warn once per disappearance: this resolver runs on every MA
+            # event of every player, so an unconditional warning flooded the
+            # log for as long as the player stayed gone.
+            if self._warned_missing_target != self._target_player_id:
+                self._warned_missing_target = self._target_player_id
+                self.logger.warning(
+                    "Configured target player no longer exists: %s", self._target_player_id
+                )
             return None
 
+        # While the Connect session is ACTIVE the resolved target is pinned:
+        # re-resolving "any PLAYING player, else first" on every event meant a
+        # pause from the app (target no longer PLAYING) or another player
+        # starting playback silently redirected commands and state sync to a
+        # different player mid-session. Only a vanished pin re-resolves.
+        pinned = self._pinned_target_id
+        if (
+            pinned is not None
+            and self._coordinator.state.active
+            and self.mass.players.get_player(pinned)
+        ):
+            return pinned
+
         players = list(self.mass.players.all_players(False, False))
-        for player in players:
-            if player.state.playback_state == MAPlaybackState.PLAYING:
-                return player.player_id
-        return players[0].player_id if players else None
+        resolved = next(
+            (p.player_id for p in players if p.state.playback_state == MAPlaybackState.PLAYING),
+            players[0].player_id if players else None,
+        )
+        self._pinned_target_id = resolved
+        return resolved
 
     def get_qobuz_provider(self) -> QobuzProvider:
         """Return the configured Music Assistant Qobuz music provider."""
@@ -355,13 +420,24 @@ class QobuzConnectProvider(PluginProvider):
             raise InvalidDataError("The Qobuz music provider must be configured first")
         return cast("QobuzProvider", provider)
 
+    def _shared_zeroconf(self) -> Any | None:
+        """Return MA's shared ``Zeroconf`` instance, or ``None`` if unavailable."""
+        try:
+            return self.mass.discovery.aiozc.zeroconf
+        except AttributeError:
+            return None
+
     def _on_app_connected(self, tokens: ConnectTokens) -> None:
         """Handle Qobuz app connection callback."""
+        if self._unloaded:
+            return
         self.mass.create_task(self._setup_websocket(tokens))
 
     async def _setup_websocket(self, tokens: ConnectTokens | None) -> None:
         """Set up Qobuz Connect WebSocket command handling."""
         async with self._ws_setup_lock:
+            if self._unloaded:
+                return
             if self._session is not None:
                 # Swapping tokens closes and reopens the socket — never do
                 # that to a healthy controller-role connection: the local
@@ -433,8 +509,14 @@ class QobuzConnectProvider(PluginProvider):
         self.logger.info("Qobuz Connect quality changed: %s -> %s", self._max_quality, quality)
         self._max_quality = quality
         self._device_config.max_quality = quality
-        await self._update_connect_quality_config(quality)
-        await self._update_qobuz_stream_quality(quality)
+        # This runs as a session dispatcher callback: persistence failures
+        # (qobuz provider briefly absent, config write error) must not
+        # propagate into the receive loop and cost the connection.
+        try:
+            await self._update_connect_quality_config(quality)
+            await self._update_qobuz_stream_quality(quality)
+        except Exception as err:
+            self.logger.warning("Failed to persist Qobuz Connect quality change: %s", err)
         if self._session:
             await self._session.send_quality_reports(quality)
 
@@ -548,7 +630,6 @@ class QobuzConnectProvider(PluginProvider):
                 volume = player.group_volume
             muted = player.group_volume_muted
         await self._session.send_volume_changed(volume)
-        self._last_sent_volume = volume
         if muted is not None and muted != self._last_sent_muted:
             await self._session.send_volume_muted(muted)
             self._last_sent_muted = muted
@@ -706,8 +787,11 @@ class _ReporterHost:
 
     @property
     def _is_active(self) -> bool:
-        """Whether the cloud currently considers us the active renderer."""
-        return self._state_getter().active
+        """Whether the heartbeat should report: active AND a target player exists."""
+        # Without the target-player check, a removed/vanished player froze
+        # canonical state at its last value and the heartbeat kept reporting
+        # stale PLAYING forever — ghost playback in the Qobuz app.
+        return self._state_getter().active and self.bridge.target_player_id() is not None
 
     def _current_duration_ms(self) -> int:
         """

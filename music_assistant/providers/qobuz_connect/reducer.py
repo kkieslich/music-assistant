@@ -352,9 +352,17 @@ def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
         return ReduceResult(state, ())
     if isinstance(event, Disconnected):
         # Reset the ask-dedup so a reconnect re-seeds a fresh snapshot rather
-        # than trusting a possibly-stale last_asked_version.
+        # than trusting a possibly-stale last_asked_version. cloud_version is
+        # reset too: queue_version numbering is session-scoped, so a recreated
+        # cloud session can legitimately restart LOWER — holding the old
+        # version would stale-gate every post-reconnect event and leave the
+        # provider deaf until restart.
         new = dataclasses.replace(
-            state, active=False, pending=(), last_asked_version=QueueVersion()
+            state,
+            active=False,
+            pending=(),
+            last_asked_version=QueueVersion(),
+            cloud_version=QueueVersion(),
         )
         return ReduceResult(new, ())
     if isinstance(event, CloudLoadAck):
@@ -741,11 +749,25 @@ def _confirm_proposal(
     # every proposal kind. Where the echo itself carries real refs (adds/
     # inserts/load-acks assign real queue_item_ids cloud-side), prefer those
     # over the existing-canonical fallback, and finally a placeholder ref for
-    # a Qobuz id neither source has yet resolved a queue_item_id for.
-    by_qid = {qid: t for t in getattr(event, "tracks", ()) if (qid := _safe_qid(t)) is not None}
-    fallback = {qid: t for t in state.tracks if (qid := _safe_qid(t)) is not None}
+    # a Qobuz id neither source has yet resolved a queue_item_id for. Refs
+    # are pooled per qid and consumed once per occurrence, so a queue holding
+    # the same track twice keeps two DISTINCT queue_item_ids instead of
+    # collapsing onto the first match (which broke later slot-keyed
+    # reorder/remove translation for duplicates).
+    pools: dict[int, list[QueueTrackRef]] = {}
+    for ref in getattr(event, "tracks", ()):
+        if (qid := _safe_qid(ref)) is not None:
+            pools.setdefault(qid, []).append(ref)
+    for ref in state.tracks:
+        if (qid := _safe_qid(ref)) is None:
+            continue
+        pool = pools.setdefault(qid, [])
+        if all(pooled.queue_item_id != ref.queue_item_id for pooled in pool):
+            pool.append(ref)
     tracks = tuple(
-        by_qid.get(qid, fallback.get(qid, QueueTrackRef(queue_item_id=0, track_id=str(qid))))
+        found.pop(0)
+        if (found := pools.get(qid))
+        else QueueTrackRef(queue_item_id=0, track_id=str(qid))
         for qid in proposal.target_track_ids
     )
     pending = tuple(p for p in state.pending if p is not proposal)

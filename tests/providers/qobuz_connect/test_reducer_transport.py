@@ -720,3 +720,29 @@ def test_setstate_applies_even_when_version_is_stale() -> None:
     assert result.state.current_id == 402969598
     # and it re-asks for the queue it doesn't hold yet
     assert any(isinstance(e, AskSnapshot) for e in result.effects)
+
+
+def test_disconnect_resets_cloud_version_so_a_session_reset_is_not_stale() -> None:
+    """
+    A reconnect must accept a session whose queue_version restarted lower.
+
+    queue_version.major is a small session-scoped counter (21/60/84 in the
+    captures); when the cloud recreates the session it can hand out a LOWER
+    major than the one we last held. Keeping the old cloud_version across a
+    disconnect made every post-reconnect event "stale" — the provider went
+    permanently deaf until restart.
+    """
+    state = CanonicalState(
+        cloud_version=QueueVersion(84, 1),
+        tracks=_refs(0, 1),
+        last_asked_version=QueueVersion(84, 1),
+    )
+    dropped = reduce(state, Disconnected(now_ms=1))
+    assert dropped.state.cloud_version == QueueVersion(0, 0)
+
+    rejoined = reduce(
+        dropped.state, CloudSessionState(now_ms=2, version=QueueVersion(2, 1), track_index=1)
+    )
+    asks = [e for e in rejoined.effects if isinstance(e, AskSnapshot)]
+    assert asks == [AskSnapshot(version=QueueVersion(2, 1))]
+    assert rejoined.state.cloud_version == QueueVersion(2, 1)

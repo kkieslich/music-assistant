@@ -57,14 +57,24 @@ class QobuzConnectDiscovery:
         device: DeviceConfig,
         on_connect: Callable[[ConnectTokens], None],
         quality_getter: Callable[[], int],
+        zeroconf: Zeroconf | None = None,
     ) -> None:
-        """Initialize discovery service."""
+        """
+        Initialize discovery service.
+
+        :param device: The advertised Qobuz Connect device config.
+        :param on_connect: Callback fired with the tokens from an app handshake.
+        :param quality_getter: Returns the currently configured max quality id.
+        :param zeroconf: Optional shared ``Zeroconf`` instance to register on
+            (not closed on stop); when ``None`` a private one is created.
+        """
         self.device = device
         self.on_connect = on_connect
         self.quality_getter = quality_getter
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
+        self._shared_zeroconf = zeroconf
         self._zeroconf: Zeroconf | None = None
         self._service_info: ServiceInfo | None = None
         self._current_session_id = ""
@@ -166,13 +176,24 @@ class QobuzConnectDiscovery:
                 "device_uuid": self.device.uuid,
             },
         )
-        zeroconf = self._zeroconf = Zeroconf()
+        loop = asyncio.get_event_loop()
+        # Prefer MA's shared Zeroconf; constructing a private one does
+        # blocking socket setup, so it must happen off the event loop.
+        zeroconf: Zeroconf | None = self._shared_zeroconf
+        if zeroconf is None:
+            zeroconf = await loop.run_in_executor(None, Zeroconf)
+        self._zeroconf = zeroconf
         service_info = self._service_info
         assert service_info is not None
-        loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(None, zeroconf.register_service, service_info)
-        except Exception:
+        except Exception as err:
+            # Surface the original failure before the fallback: if the retry
+            # fails for a different reason, the root cause used to be lost.
+            LOGGER.warning(
+                "Qobuz Connect mDNS registration failed (%s); retrying with cooperating responders",
+                err,
+            )
             await loop.run_in_executor(
                 None,
                 lambda: zeroconf.register_service(
@@ -185,7 +206,9 @@ class QobuzConnectDiscovery:
         if self._zeroconf and self._service_info:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._zeroconf.unregister_service, self._service_info)
-            await loop.run_in_executor(None, self._zeroconf.close)
+            # A shared instance belongs to MA — only close a private one.
+            if self._zeroconf is not self._shared_zeroconf:
+                await loop.run_in_executor(None, self._zeroconf.close)
 
     @staticmethod
     def _get_local_ip() -> str | None:

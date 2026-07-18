@@ -24,10 +24,12 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     CloudSetState,
     CloudSnapshot,
     CloudTracksAdded,
+    Disconnected,
     MaPlayTrack,
     MaQueueChanged,
     MaResyncQueue,
     PushAdd,
+    PushLoad,
     PushLoop,
     PushMute,
     PushPlayerState,
@@ -543,3 +545,101 @@ async def test_controller_disabled_suppresses_ma_modes_push() -> None:
     await coord.on_ma_modes_event("player")
     assert runner.effects == []
     assert coord.state.loop is LoopMode.OFF
+
+
+async def test_ma_removal_is_detected_via_unresolvable_getter() -> None:
+    """
+    Removing a track in MA must reach the cloud as a queue change.
+
+    ``resolvable`` used to be computed from the CURRENT MA queue contents, so
+    a user-removed track was filtered out of the canonical side of the diff
+    and the removal was invisible — the cloud kept the track and the next
+    resync re-added it to MA. Resolvability must come from the metadata
+    fail-cache instead: everything not known-unresolvable counts.
+    """
+    runner = _RecordingRunner()
+    bridge = _FakeBridge()
+    coord = QobuzConnectCoordinator(
+        runner=runner,  # type: ignore[arg-type]
+        bridge=bridge,  # type: ignore[arg-type]
+        device_uuid=OUR_DEVICE_UUID,
+        unresolvable_getter=lambda: frozenset(),
+    )
+    await coord._submit(
+        CloudSnapshot(
+            now_ms=1,
+            version=QueueVersion(5, 1),
+            tracks=_refs(0, 1, 2),
+            autoplay_tracks=(),
+            shuffle=False,
+            autoplay=False,
+            track_index=1,
+        )
+    )
+    await coord._submit(CloudSetActive(now_ms=2, active=True))
+    runner.effects.clear()
+    # User removed the middle track in MA's UI.
+    bridge.items = [{"track_id": "100"}, {"track_id": "102"}]
+    await coord.on_ma_queue_event("player_1")
+    assert any(isinstance(e, PushLoad) for e in runner.effects), runner.effects
+
+
+async def test_ma_removal_of_unresolvable_track_is_not_a_change() -> None:
+    """A track MA could never materialize disappearing from MA is not a user removal."""
+    runner = _RecordingRunner()
+    bridge = _FakeBridge()
+    coord = QobuzConnectCoordinator(
+        runner=runner,  # type: ignore[arg-type]
+        bridge=bridge,  # type: ignore[arg-type]
+        device_uuid=OUR_DEVICE_UUID,
+        unresolvable_getter=lambda: frozenset({"101"}),
+    )
+    await coord._submit(
+        CloudSnapshot(
+            now_ms=1,
+            version=QueueVersion(5, 1),
+            tracks=_refs(0, 1, 2),
+            autoplay_tracks=(),
+            shuffle=False,
+            autoplay=False,
+            track_index=1,
+        )
+    )
+    await coord._submit(CloudSetActive(now_ms=2, active=True))
+    runner.effects.clear()
+    bridge.items = [{"track_id": "100"}, {"track_id": "102"}]
+    await coord.on_ma_queue_event("player_1")
+    assert not [e for e in runner.effects if isinstance(e, PushLoad)]
+    assert coord.state.pending == ()
+
+
+async def test_volume_dedup_resets_on_disconnect() -> None:
+    """After a reconnect the cloud has forgotten our volume — resend the same level."""
+    bridge = _FakeBridge()
+    bridge.player = _FakePlayer(volume_level=50, volume_muted=False)
+    coord, runner, _bridge = _coordinator(bridge=bridge)
+    await coord.on_ma_volume_event("player_1")
+    await coord._submit(Disconnected(now_ms=1))
+    await coord.on_ma_volume_event("player_1")
+    pushes = [e for e in runner.effects if isinstance(e, PushVolume)]
+    assert len(pushes) == 2, runner.effects
+
+
+async def test_close_cancels_proposal_timers_and_blocks_new_ones() -> None:
+    """close() reaps every timer and prevents post-unload timeout submissions."""
+    runner = _RecordingRunner()
+    bridge = _FakeBridge()
+    coord = QobuzConnectCoordinator(
+        runner=runner,  # type: ignore[arg-type]
+        bridge=bridge,  # type: ignore[arg-type]
+        device_uuid=OUR_DEVICE_UUID,
+    )
+    bridge.items = [{"track_id": "100"}]
+    await coord.on_ma_queue_event("player_1")
+    assert coord._timers
+    coord.close()
+    assert not coord._timers
+    # A late timer callback after close must not spawn a submit task.
+    coord._fire_proposal_timeout(b"\x00" * 16)
+    await asyncio.sleep(0)
+    assert not coord._timers

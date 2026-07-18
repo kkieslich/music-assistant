@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, cast
+
+from music_assistant_models.media_items import Track
 
 from music_assistant.providers.qobuz_connect.effect_runner import EffectRunner
 from music_assistant.providers.qobuz_connect.models import LoopMode, PlayingState, QueueVersion
@@ -481,3 +484,49 @@ async def test_ma_effects_noop_when_no_target_player() -> None:
     for effect in effects:
         await runner.run(effect)
     assert bridge.calls == []
+
+
+class _SlowCountingMetadata:
+    """Resolves real ``Track``s with a small delay, tracking peak concurrency."""
+
+    def __init__(self) -> None:
+        """Start the in-flight counters."""
+        self.inflight = 0
+        self.max_inflight = 0
+        self.requested: list[str] = []
+
+    async def get_track_or_none(self, track_id: str) -> Any:
+        """Resolve after a short delay, recording concurrent usage."""
+        self.requested.append(track_id)
+        self.inflight += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        await asyncio.sleep(0.02)
+        self.inflight -= 1
+        return Track(
+            item_id=track_id,
+            provider="qobuz",
+            name=f"Track {track_id}",
+            provider_mappings=set(),
+            duration=200,
+        )
+
+
+async def test_resync_resolves_missing_tracks_concurrently() -> None:
+    """
+    Filling a large queue must not serialize one metadata fetch per track.
+
+    Resync runs while the coordinator lock is held; sequential per-track
+    HTTP lookups stalled ALL event intake (app commands included) for the
+    whole resolution of a big queue.
+    """
+    session = _FakeSession()
+    bridge = _FakeBridge()
+    metadata = _SlowCountingMetadata()
+    runner = _runner(session, bridge, metadata=cast("Any", metadata))
+    track_ids = tuple(range(700, 708))
+
+    await runner.run(MaResyncQueue(track_ids=track_ids, current_track_id=700))
+
+    assert metadata.max_inflight >= 2, "metadata resolution ran strictly serially"
+    _, (_pid, items) = next(c for c in bridge.calls if c[0] == "update_items")
+    assert [item.media_item.item_id for item in items] == [str(i) for i in track_ids]

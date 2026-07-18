@@ -89,3 +89,25 @@ async def test_dispatcher_routes_active_renderer_changed() -> None:
     msg.srvrCtrlActiveRendererChanged.rendererId = 4
     await dispatcher.dispatch(msg)
     assert received == [4]
+
+
+async def test_dispatch_contains_handler_exceptions() -> None:
+    """
+    A raising callback must not propagate out of dispatch().
+
+    dispatch() runs inline in the session's receive loop; before containment
+    any translator/reducer bug recycled the entire websocket, turning a
+    single bad message into reconnect churn.
+    """
+    codec = QobuzConnectCodec(b"\x01" * 16)
+
+    async def _boom(_active: bool) -> None:
+        raise RuntimeError("handler bug")
+
+    callbacks = _callbacks(on_set_active=_boom)
+    dispatcher = InboundDispatcher(codec, callbacks)
+    msg = payload_pb2.QConnectMessage()
+    msg.messageType = QConnectMessageType.SRVR_RNDR_SET_ACTIVE
+    msg.srvrRndrSetActive.active = True
+
+    await dispatcher.dispatch(msg)  # must not raise

@@ -85,6 +85,10 @@ REJOIN_MIN_INTERVAL = 5.0
 # ("Message too old", observed live 2026-07-08) and the rejection can drop
 # the connection — queued frames past this age are discarded, not flushed.
 PENDING_MAX_AGE = 2.0
+# Hard cap on frames queued while disconnected. Only the last ~2s survive the
+# reconnect flush anyway, so anything beyond a small window is pure memory
+# growth during an extended outage (heartbeats queue one frame per interval).
+MAX_PENDING_MESSAGES = 50
 # Message-level errors that reject a single *report* on semantic grounds
 # (stale current-track anchor, reporting while not the active renderer).
 # These do NOT mean the cloud deregistered us — re-joining would just churn
@@ -223,6 +227,11 @@ class QobuzConnectSession:
             and self._ws
             and (previous_token != self._ws_token or previous_session_uuid != self._session_uuid)
         ):
+            # Cancel a still-pending close from a previous handshake before
+            # dropping our only strong reference to it (asyncio tasks are
+            # weak-ref'd; an orphaned task can be GC'd mid-close).
+            if self._token_refresh_close_task and not self._token_refresh_close_task.done():
+                self._token_refresh_close_task.cancel()
             self._token_refresh_close_task = asyncio.create_task(self._close_for_token_refresh())
 
     async def start(self) -> None:
@@ -524,6 +533,8 @@ class QobuzConnectSession:
             except Exception:
                 LOGGER.exception("Failed to send Qobuz websocket message")
         self._pending_messages.append((time.monotonic(), data))
+        if len(self._pending_messages) > MAX_PENDING_MESSAGES:
+            del self._pending_messages[:-MAX_PENDING_MESSAGES]
         return False
 
     async def _connection_loop(self) -> None:
@@ -658,6 +669,11 @@ class QobuzConnectSession:
                 )
             ):
                 return True
+            # Snapshot + clear BEFORE the (possibly slow) refresh attempt so
+            # a set_tokens() landing mid-refresh is never lost — it bumps the
+            # version and re-sets the event, both of which we check below.
+            token_version = self._token_version
+            self._token_update_event.clear()
             # The app only hands us a short-lived token during the local
             # handshake. Once it expires we mint a fresh one ourselves via the
             # native Qobuz login instead of waiting for the app — otherwise the
@@ -665,12 +681,14 @@ class QobuzConnectSession:
             # can never be regained.
             if self._token_refresher is not None:
                 refreshed = await self._token_refresher()
-                if refreshed and refreshed.is_valid():
+                # A minted token that is itself already inside the expiry
+                # buffer (short-lived mint, clock skew) counts as a FAILED
+                # refresh: adopting-and-retrying used to hot-loop createToken
+                # with zero delay. Fall through to the bounded wait instead.
+                if refreshed and refreshed.is_valid() and not _token_expiring(refreshed, buffer_s):
                     self._ws_token = refreshed
                     self._token_version += 1
                     continue
-            token_version = self._token_version
-            self._token_update_event.clear()
             if self._token_version != token_version:
                 continue
             # Bound the wait so a failed self-refresh is retried, and so a new

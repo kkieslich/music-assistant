@@ -353,3 +353,125 @@ async def test_ma_events_ignore_non_target_player() -> None:
     provider._coordinator.on_ma_modes_event.assert_not_awaited()
     provider._coordinator.on_ma_queue_event.assert_not_awaited()
     provider._coordinator.on_ma_volume_event.assert_not_awaited()
+
+
+def test_auto_target_stays_pinned_while_session_active() -> None:
+    """
+    While the Connect session is active, the auto target must not retarget.
+
+    ``__auto__`` used to re-resolve "any PLAYING player, else players[0]" on
+    every event and effect — so pausing from the app (target no longer
+    PLAYING) or another player starting playback silently redirected
+    commands and state sync to a different player mid-session.
+    """
+    playing = _fake_player("p1")
+    playing.state.playback_state = MAPlaybackState.PLAYING
+    other = _fake_player("p2")
+    provider, mass = _make_provider(target_player=playing)
+    players = {"p1": playing, "p2": other}
+    mass.players.all_players.return_value = [playing, other]
+    mass.players.get_player.side_effect = lambda pid: players.get(pid)
+
+    assert provider.get_target_player_id() == "p1"
+    provider._coordinator._state = CanonicalState(active=True)
+
+    # The app pauses (target no longer PLAYING) and another player starts.
+    playing.state.playback_state = MAPlaybackState.PAUSED
+    other.state.playback_state = MAPlaybackState.PLAYING
+    assert provider.get_target_player_id() == "p1"
+
+
+def test_auto_target_repins_when_pinned_player_disappears() -> None:
+    """A vanished pinned player falls back to a fresh resolution."""
+    playing = _fake_player("p1")
+    playing.state.playback_state = MAPlaybackState.PLAYING
+    other = _fake_player("p2")
+    provider, mass = _make_provider(target_player=playing)
+    players = {"p1": playing, "p2": other}
+    mass.players.all_players.return_value = [playing, other]
+    mass.players.get_player.side_effect = lambda pid: players.get(pid)
+
+    assert provider.get_target_player_id() == "p1"
+    provider._coordinator._state = CanonicalState(active=True)
+
+    del players["p1"]
+    mass.players.all_players.return_value = [other]
+    assert provider.get_target_player_id() == "p2"
+
+
+def test_missing_configured_player_warns_once() -> None:
+    """
+    A vanished pinned player must not warn on every event of every player.
+
+    The subscriptions are unfiltered, so this warning used to fire several
+    times per second for days — a log flood that buried real errors.
+    """
+    provider, mass = _make_provider()
+    provider._target_player_id = "gone"
+    mass.players.get_player.side_effect = lambda _pid: None
+    provider.logger = MagicMock()
+
+    assert provider.get_target_player_id() is None
+    assert provider.get_target_player_id() is None
+    assert provider.logger.warning.call_count == 1
+
+
+async def test_quality_change_survives_missing_qobuz_provider() -> None:
+    """
+    A quality tap in the app must not tear down the websocket.
+
+    ``_on_quality_change`` is a session dispatcher callback; its unguarded
+    ``get_qobuz_provider()`` raised ``InvalidDataError`` whenever the native
+    qobuz provider was briefly absent, and the exception recycled the whole
+    connection.
+    """
+    provider, mass = _make_provider()
+    mass.get_provider.side_effect = lambda _domain: None
+    mass.config.save_provider_config = AsyncMock()
+    provider.logger = MagicMock()
+
+    await provider._on_quality_change(6)  # must not raise
+
+    assert provider._max_quality == 6
+
+
+async def test_unload_blocks_late_websocket_setup_and_reaps_timers(
+    tmp_path: Any,
+) -> None:
+    """After unload, an in-flight handshake must not spawn a zombie session."""
+    provider, mass = _make_provider()
+    mass.storage_path = str(tmp_path)
+    provider._flight_recorder._base_dir = tmp_path / "diag"
+    bridge_items = [{"track_id": "100"}]
+    provider._coordinator._bridge = SimpleNamespace(  # type: ignore[assignment]
+        queue_items=lambda _pid: bridge_items,
+        qobuz_track_id_for=lambda item: item["track_id"],
+        get_queue=lambda _pid: None,
+        get_player=lambda _pid: None,
+    )
+    await provider._coordinator.on_ma_queue_event("p1")
+    assert provider._coordinator._timers
+
+    await provider.unload()
+
+    assert not provider._coordinator._timers
+    await provider._setup_websocket(None)
+    assert provider._session is None
+
+
+def test_reporter_host_inactive_without_target_player() -> None:
+    """
+    The heartbeat must fall silent when the target player is gone.
+
+    With the player removed, canonical state froze at its last value and the
+    5s heartbeat kept reporting stale PLAYING forever — ghost, uncontrollable
+    playback in the Qobuz app.
+    """
+    state = CanonicalState(active=True)
+    bridge = SimpleNamespace(target_player_id=lambda: None)
+    host = _ReporterHost(cast("Any", bridge), lambda: state)
+    assert host._is_active is False
+
+    bridge_with_target = SimpleNamespace(target_player_id=lambda: "p1")
+    host2 = _ReporterHost(cast("Any", bridge_with_target), lambda: state)
+    assert host2._is_active is True
