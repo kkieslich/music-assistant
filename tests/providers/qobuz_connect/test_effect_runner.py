@@ -111,6 +111,16 @@ class _FakeBridge:
         """Return the fake item's Qobuz track id."""
         return cast("str | None", item.get("track_id")) if isinstance(item, dict) else None
 
+    def qobuz_track_ids_for(self, item: Any) -> tuple[str, ...]:
+        """Return all fake Qobuz aliases for the item."""
+        if not isinstance(item, dict):
+            return ()
+        aliases = item.get("track_ids")
+        if aliases is not None:
+            return tuple(str(track_id) for track_id in aliases)
+        track_id = item.get("track_id")
+        return () if track_id is None else (str(track_id),)
+
     async def pause(self, pid: str) -> None:
         """Record a pause call."""
         self.calls.append(("pause", pid))
@@ -253,13 +263,19 @@ async def test_push_add_builds_refs_from_qobuz_ids() -> None:
     session, bridge = _FakeSession(), _FakeBridge()
     runner = _runner(session, bridge)
     await runner.run(
-        PushAdd(action_uuid=b"\x04" * 16, base_version=QueueVersion(2, 0), track_ids=(555, 666))
+        PushAdd(
+            action_uuid=b"\x04" * 16,
+            base_version=QueueVersion(2, 0),
+            track_ids=(555, 666),
+            context_uuid=b"\x06" * 16,
+        )
     )
     kind, kw = session.calls[0]
     assert kind == "add"
     refs = kw["tracks"]
     assert [r.track_id for r in refs] == ["555", "666"]
     assert all(r.queue_item_id == 0 for r in refs)
+    assert kw["context_uuid"] == b"\x06" * 16
 
 
 async def test_push_reorder_passes_slot_ids_through() -> None:
@@ -375,6 +391,19 @@ async def test_ma_play_track_fast_path_uses_play_index() -> None:
     assert ("play_index", ("player", 1), {"seek_position": 5}) in bridge.calls
 
 
+async def test_ma_play_track_fast_path_recognizes_provider_mapping_alias() -> None:
+    """MaPlayTrack preserves the queue when any provider mapping matches the cloud id."""
+    session, bridge, metadata = _FakeSession(), _FakeBridge(), _FakeMetadata()
+    bridge.queue_items_result = [{"track_id": "3972279", "track_ids": ("3972279", "3879020")}]
+    runner = _runner(session, bridge, metadata=metadata)
+
+    await runner.run(MaPlayTrack(track_id=3879020, position_ms=0))
+
+    assert ("play_index", ("player", 0), {"seek_position": 0}) in bridge.calls
+    assert metadata.requested == []
+    assert not any(call[0] == "play_media" for call in bridge.calls)
+
+
 async def test_ma_play_track_falls_back_to_play_media() -> None:
     """MaPlayTrack resolves via metadata and replaces the queue when not already loaded."""
     session, bridge, metadata = _FakeSession(), _FakeBridge(), _FakeMetadata()
@@ -405,6 +434,23 @@ async def test_ma_resync_queue_reuses_existing_items_and_sets_current_index() ->
     assert (pid, index) == ("player", 1)
     _, (_pid, items) = next(c for c in bridge.calls if c[0] == "update_items")
     assert items == [item_b, item_a]
+    assert metadata.requested == []
+
+
+async def test_ma_resync_queue_reuses_alias_once() -> None:
+    """MaResyncQueue matches an alternate provider id without duplicating one MA item."""
+    session, bridge, metadata = _FakeSession(), _FakeBridge(), _FakeMetadata()
+    aliased_item = {
+        "track_id": "3972279",
+        "track_ids": ("3972279", "3879020"),
+    }
+    bridge.queue_items_result = [aliased_item]
+    runner = _runner(session, bridge, metadata=metadata)
+
+    await runner.run(MaResyncQueue(track_ids=(3879020,), current_track_id=3879020))
+
+    _, (_pid, items) = next(call for call in bridge.calls if call[0] == "update_items")
+    assert items == [aliased_item]
     assert metadata.requested == []
 
 

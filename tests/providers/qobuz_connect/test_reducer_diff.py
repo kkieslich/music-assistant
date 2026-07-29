@@ -8,7 +8,7 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     CanonicalState,
     MaQueueChanged,
     ProposalKind,
-    PushAdd,
+    PushLoad,
     PushRemove,
     PushReorder,
 )
@@ -215,13 +215,12 @@ def test_genuine_new_load_detected() -> None:
     assert result.state.pending[0].kind is ProposalKind.LOAD
 
 
-def test_append_pushes_only_the_appended_tail() -> None:
+def test_append_uses_full_load_with_current_index() -> None:
     """
-    ADD proposal targets the full list, but the PushAdd payload is tail-only.
+    ADD proposal uses a full load because the cloud add verb needs a web-session slot.
 
-    The cloud's add command APPENDS its payload to the existing cloud queue,
-    so pushing the full resolved list would duplicate the tracks the cloud
-    already has (the latent bug this test pins).
+    MA only has Qobuz catalog ids, which the real cloud silently ignores in
+    CTRL_SRVR_QUEUE_ADD_TRACKS. A full load accepts those ids directly.
     """
     state = CanonicalState(
         cloud_version=QueueVersion(5, 1), tracks=_refs(0, 1), current_id=900000, active=True
@@ -242,8 +241,9 @@ def test_append_pushes_only_the_appended_tail() -> None:
     assert proposal.target_track_ids == (900000, 900001, 900002)
     assert len(result.effects) == 1
     push = result.effects[0]
-    assert isinstance(push, PushAdd)
-    assert push.track_ids == (900002,)
+    assert isinstance(push, PushLoad)
+    assert push.track_ids == (900000, 900001, 900002)
+    assert push.current_index == 0
 
 
 def test_add_tail_preserves_duplicate_track() -> None:
@@ -273,8 +273,8 @@ def test_add_tail_preserves_duplicate_track() -> None:
     assert proposal.target_track_ids == (900000, 900001, 900000)
     assert len(result.effects) == 1
     push = result.effects[0]
-    assert isinstance(push, PushAdd)
-    assert push.track_ids == (900000,)
+    assert isinstance(push, PushLoad)
+    assert push.track_ids == (900000, 900001, 900000)
 
 
 def test_empty_ma_list_with_nonempty_canonical_is_clear() -> None:

@@ -74,6 +74,13 @@ class MABridge:
         """Extract the Qobuz track id from an MA queue item, if present."""
         return cast("str | None", self._provider.get_qobuz_track_id_from_queue_item(queue_item))
 
+    def qobuz_track_ids_for(self, queue_item: Any) -> tuple[str, ...]:
+        """Extract every Qobuz track id mapped to an MA queue item."""
+        return cast(
+            "tuple[str, ...]",
+            self._provider.get_qobuz_track_ids_from_queue_item(queue_item),
+        )
+
     # ---- MA player-queue operations -------------------------------------
 
     def get_queue(self, player_id: str | None) -> Any | None:

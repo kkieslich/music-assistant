@@ -178,6 +178,38 @@ def test_parse_add_and_remove_renderer_and_active_changed() -> None:
     assert changed_event.renderer_id == 4
 
 
+def test_encode_controller_max_quality_command() -> None:
+    """Controller quality commands identify the renderer and carry the protocol enum."""
+    inner = _first_inner_message(_codec().encode_ctrl_set_max_quality(13, 6))
+
+    assert inner.messageType == 74
+    assert inner.ctrlSrvrSetMaxAudioQuality.rendererId == 13
+    assert inner.ctrlSrvrSetMaxAudioQuality.maxAudioQuality == 2
+
+
+def test_server_quality_broadcast_schema_matches_current_web_client() -> None:
+    """Quality broadcasts identify their renderer before the quality fields."""
+    maximum = payload_pb2.SrvrCtrlMaxAudioQualityChanged()
+    maximum.ParseFromString(bytes((8, 13, 16, 2, 24, 1)))
+    assert maximum.rendererId == 13
+    assert maximum.maxAudioQuality == 2
+    assert maximum.networkType == 1
+
+    file_quality = payload_pb2.SrvrCtrlFileAudioQualityChanged()
+    file_quality.rendererId = 13
+    file_quality.sampling_rate = 44_100
+    file_quality.bit_depth = 24
+    file_quality.nb_channels = 2
+    file_quality.audio_quality = 3
+    assert {field.name: field.number for field in file_quality.DESCRIPTOR.fields} == {
+        "rendererId": 1,
+        "sampling_rate": 2,
+        "bit_depth": 3,
+        "nb_channels": 4,
+        "audio_quality": 5,
+    }
+
+
 def test_parse_renderer_state_updated() -> None:
     """The type-82 broadcast decodes into a CloudRendererStateUpdated with presence-aware fields."""
     codec = _codec()

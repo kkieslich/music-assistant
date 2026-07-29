@@ -460,6 +460,34 @@ class QobuzConnectProvider(PluginProvider):
             )
         return cast("QobuzProvider", provider)
 
+    def get_qobuz_track_id_from_queue_item(self, queue_item: Any) -> str | None:
+        """Extract a Qobuz provider track id from an MA QueueItem."""
+        track_ids = self.get_qobuz_track_ids_from_queue_item(queue_item)
+        return track_ids[0] if track_ids else None
+
+    def get_qobuz_track_ids_from_queue_item(self, queue_item: Any) -> tuple[str, ...]:
+        """Extract every Qobuz provider track id from an MA QueueItem."""
+        media_item = getattr(queue_item, "media_item", None)
+        if media_item is None or getattr(media_item, "media_type", None) is None:
+            return ()
+        media_type = getattr(media_item.media_type, "value", media_item.media_type)
+        if media_type != "track":
+            return ()
+
+        track_ids: list[str] = []
+        provider = getattr(media_item, "provider", None)
+        if provider in (self._qobuz_provider_id, "qobuz"):
+            track_ids.append(str(media_item.item_id))
+
+        for mapping in getattr(media_item, "provider_mappings", ()) or ():
+            provider_domain = getattr(mapping, "provider_domain", None)
+            provider_instance = getattr(mapping, "provider_instance", None)
+            if provider_domain == "qobuz" or provider_instance == self._qobuz_provider_id:
+                mapping_id = str(mapping.item_id)
+                if mapping_id not in track_ids:
+                    track_ids.append(mapping_id)
+        return tuple(track_ids)
+
     def _resolve_max_quality(self, configured_quality: int) -> int:
         """Resolve the auto setting against the native Qobuz provider."""
         if configured_quality != AUTO_QUALITY:
@@ -770,27 +798,6 @@ class QobuzConnectProvider(PluginProvider):
             return
         await self._coordinator.on_ma_volume_event(player_id)
 
-    def get_qobuz_track_id_from_queue_item(self, queue_item: Any) -> str | None:
-        """Extract a Qobuz provider track id from an MA QueueItem."""
-        media_item = getattr(queue_item, "media_item", None)
-        if media_item is None or getattr(media_item, "media_type", None) is None:
-            return None
-        media_type = getattr(media_item.media_type, "value", media_item.media_type)
-        if media_type != "track":
-            return None
-
-        qobuz_provider = self.get_qobuz_provider()
-        provider = getattr(media_item, "provider", None)
-        if provider in (qobuz_provider.instance_id, "qobuz"):
-            return str(media_item.item_id)
-
-        for mapping in getattr(media_item, "provider_mappings", ()) or ():
-            provider_domain = getattr(mapping, "provider_domain", None)
-            provider_instance = getattr(mapping, "provider_instance", None)
-            if provider_domain == "qobuz" or provider_instance == qobuz_provider.instance_id:
-                return str(mapping.item_id)
-        return None
-
 
 class _LiveSessionProxy:
     """
@@ -830,10 +837,7 @@ class _LiveSessionProxy:
 
 async def _suggest_http_port(mass: MusicAssistant, instance_id: str | None) -> int:
     """Return the first default HTTP port not used by another Connect instance."""
-    configs = await mass.config.get_provider_configs(
-        provider_domain="qobuz_connect",
-        include_values=True,
-    )
+    configs = await mass.config.get_provider_configs(provider_domain="qobuz_connect")
     used_ports = {
         int(cast("int | str", port))
         for config in configs

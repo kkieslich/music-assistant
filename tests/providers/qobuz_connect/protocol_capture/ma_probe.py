@@ -37,6 +37,8 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 # NOTE: MA's player-id scheme drifted from the old ``up<hex>`` form to a
 # dashed uuid; keep this in sync with what ``Local Audio Out`` registers.
 _BLACKHOLE = "b97b9910-b8fe-5ff0-946c-ef06b0d44273"
+MANAGED_CONNECT_TARGET = "Local Dev Hardening prnMvCkz"
+_MANAGED_CONNECT_PORT = 8695
 
 # Strip terminal colour codes MA emits so the regexes match cleanly.
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -58,6 +60,11 @@ _REPORT = re.compile(
     r"Qobuz report state=(?P<state>\d+) wire_buffer=\d+ pos=(?P<pos>\d+)ms "
     r"\(anchor ts=\d+\) item=(?P<slot>\d+):(?P<track>\d+) qv=(?P<qmaj>\d+)\.(?P<qmin>\d+)"
 )
+_FILE_QUALITY = re.compile(
+    r"Qobuz file quality report quality=(?P<quality>\d+) "
+    r"sample_rate=(?P<rate>\d+) bit_depth=(?P<depth>\d+) channels=(?P<channels>\d+)"
+)
+_MAX_QUALITY = re.compile(r"Qobuz maximum quality report quality=(?P<quality>\d+)")
 
 
 @dataclass(slots=True)
@@ -97,12 +104,25 @@ class Report:
 
 
 @dataclass(slots=True)
+class QualityReport:
+    """One exact file-quality or configured-maximum report sent to Qobuz."""
+
+    kind: str
+    quality: int
+    sample_rate: int | None
+    bit_depth: int | None
+    channels: int | None
+    raw: str
+
+
+@dataclass(slots=True)
 class ProbeEvents:
     """All parsed events from a slice of the MA log, in file order."""
 
     reduces: list[ReduceTrace] = field(default_factory=list)
     streams: list[StreamStart] = field(default_factory=list)
     reports: list[Report] = field(default_factory=list)
+    qualities: list[QualityReport] = field(default_factory=list)
     lines: list[str] = field(default_factory=list)
 
     def effects(self) -> list[str]:
@@ -117,7 +137,7 @@ class ProbeEvents:
         return self.reduces[-1] if self.reduces else None
 
 
-def _parse_line(line: str) -> ReduceTrace | StreamStart | Report | None:
+def _parse_line(line: str) -> ReduceTrace | StreamStart | Report | QualityReport | None:
     clean = _ANSI.sub("", line)
     if (m := _REDUCE.search(clean)) is not None:
         return ReduceTrace(
@@ -142,6 +162,24 @@ def _parse_line(line: str) -> ReduceTrace | StreamStart | Report | None:
             queue_version=(int(m["qmaj"]), int(m["qmin"])),
             raw=clean.rstrip(),
         )
+    if (m := _FILE_QUALITY.search(clean)) is not None:
+        return QualityReport(
+            kind="file",
+            quality=int(m["quality"]),
+            sample_rate=int(m["rate"]),
+            bit_depth=int(m["depth"]),
+            channels=int(m["channels"]),
+            raw=clean.rstrip(),
+        )
+    if (m := _MAX_QUALITY.search(clean)) is not None:
+        return QualityReport(
+            kind="maximum",
+            quality=int(m["quality"]),
+            sample_rate=None,
+            bit_depth=None,
+            channels=None,
+            raw=clean.rstrip(),
+        )
     return None
 
 
@@ -161,7 +199,7 @@ class MAProbe:
         self.data_dir = data_dir
         self.cache_dir = cache_dir
         self._proc: subprocess.Popen[bytes] | None = None
-        self._saved_target: str | None = None
+        self._saved_connect_values: dict[str, object] | None = None
 
     def start(self, *, connect_timeout: float = 90.0) -> None:
         """Launch MA (Connect target pinned to BlackHole) and block until it connects."""
@@ -221,6 +259,8 @@ class MAProbe:
                 events.streams.append(parsed)
             elif isinstance(parsed, Report):
                 events.reports.append(parsed)
+            elif isinstance(parsed, QualityReport):
+                events.qualities.append(parsed)
         return events
 
     def wait_for(self, needle: str, *, timeout: float = 30.0, cursor: int = 0) -> bool:
@@ -269,19 +309,34 @@ class MAProbe:
     def _pin_target(self, player_id: str) -> None:
         settings = self.data_dir / "settings.json"
         data = json.loads(settings.read_text())
+        qobuz_instance = next(
+            (
+                key
+                for key, value in data.get("providers", {}).items()
+                if isinstance(value, dict) and value.get("domain") == "qobuz"
+            ),
+            None,
+        )
+        if qobuz_instance is None:
+            raise RuntimeError("Managed integration data has no native Qobuz provider")
         for value in data.get("providers", {}).values():
             if isinstance(value, dict) and value.get("domain") == "qobuz_connect":
-                self._saved_target = value["values"].get("target_player")
+                self._saved_connect_values = dict(value["values"])
                 value["values"]["target_player"] = player_id
+                value["values"]["publish_name"] = MANAGED_CONNECT_TARGET
+                value["values"]["http_port"] = _MANAGED_CONNECT_PORT
+                value["values"]["qobuz_provider"] = qobuz_instance
+                value["values"].setdefault("max_quality", "27")
+                value["values"].setdefault("initial_volume", 25)
         settings.write_text(json.dumps(data, indent=1))
 
     def _restore_target(self) -> None:
-        if self._saved_target is None:
+        if self._saved_connect_values is None:
             return
         settings = self.data_dir / "settings.json"
         data = json.loads(settings.read_text())
         for value in data.get("providers", {}).values():
             if isinstance(value, dict) and value.get("domain") == "qobuz_connect":
-                value["values"]["target_player"] = self._saved_target
+                value["values"] = self._saved_connect_values
         settings.write_text(json.dumps(data, indent=1))
-        self._saved_target = None
+        self._saved_connect_values = None

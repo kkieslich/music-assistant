@@ -278,6 +278,16 @@ class QobuzConnectCodec:
         msg.ctrlSrvrAskForQueueState.CopyFrom(ask)
         return self._encode_batch(msg)
 
+    def encode_ctrl_set_max_quality(self, renderer_id: int, quality: int) -> bytes:
+        """Encode a controller request to change a renderer's maximum quality."""
+        command = payload_pb2.CtrlSrvrSetMaxAudioQuality()
+        command.rendererId = renderer_id
+        command.maxAudioQuality = QUALITY_TO_PROTOCOL.get(quality, 4)
+        msg = payload_pb2.QConnectMessage()
+        msg.messageType = QConnectMessageType.CTRL_SRVR_SET_MAX_AUDIO_QUALITY
+        msg.ctrlSrvrSetMaxAudioQuality.CopyFrom(command)
+        return self._encode_batch(msg)
+
     def encode_set_loop_mode(self, mode: LoopMode) -> bytes:
         """Encode ``CTRL_SRVR_SET_LOOP_MODE`` — tell the cloud our loop preference."""
         loop = payload_pb2.CtrlSrvrSetLoopMode()

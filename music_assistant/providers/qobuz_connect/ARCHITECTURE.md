@@ -168,19 +168,19 @@ and `docs/superpowers/specs/2026-07-07-qobuz-connect-controller-design.md`
 
 The controller verbs are `Push*` **effects** the reducer emits; the shell
 turns them into `session.send_*` calls via `effect_runner`. Every verb goes
-out on the shared socket. MA-origin queue edits (`PushLoad` / `PushAdd` /
-`PushInsert` / `PushRemove` / `PushReorder` / `PushClear`) and
-`PushSetActive` are wired end-to-end today; `PushPlayerState` /
-`PushVolume` / `PushMute` have `send_*` support but the reducer has no
-callsite emitting them yet:
+out on the shared socket. MA-origin replacements and additions use
+`PushLoad`; removals, reorders, clears, active-renderer selection, volume,
+and mute are wired end-to-end. `PushAdd` / `PushInsert` remain protocol
+primitives but are not used for production MA-origin edits because their
+track reference is a controller-session-local slot unavailable to MA:
 
 | Verb                          | Effect            | Wire message                                                        |
 |--------------------------------|-------------------|-----------------------------------------------------------------------|
 | Pause / resume                 | `PushPlayerState` | `CTRL_SRVR_SET_PLAYER_STATE{playingState}` (no callsite yet)          |
 | Seek                           | `PushPlayerState` | `CTRL_SRVR_SET_PLAYER_STATE{currentPosition}` (no callsite yet)       |
 | Skip / play specific item      | `PushPlayerState` | `CTRL_SRVR_SET_PLAYER_STATE{playingState, currentPosition: 0, currentQueueItem}` |
-| Volume                         | `PushVolume`      | `CTRL_SRVR_SET_VOLUME{rendererId, volume}` (no callsite yet)          |
-| Mute                           | `PushMute`        | `CTRL_SRVR_MUTE_VOLUME{rendererId, value}` (no callsite yet)          |
+| Volume                         | `PushVolume`      | `CTRL_SRVR_SET_VOLUME{rendererId, volume}`                            |
+| Mute                           | `PushMute`        | `CTRL_SRVR_MUTE_VOLUME{rendererId, value}`                            |
 | Become the active renderer     | `PushSetActive`   | `CTRL_SRVR_SET_ACTIVE_RENDERER{rendererId}`                           |
 | Queue replacement (MA-origin)  | `PushLoad`        | `CTRL_SRVR_QUEUE_LOAD_TRACKS` — packed little-endian uint32 track ids in the (misnamed) `sessionUuid` field, plus a mandatory fresh 16-byte `contextUuid` and explicitly-present `shufflePivotQueueItemId=0` / `shuffleMode=false`; the active renderer keeps rendering and switches to the new queue |
 
@@ -387,16 +387,16 @@ by `session.py` / the provider.
 |       2 | `SUBSCRIBE` (outer envelope)             | `encode_subscribe`                       | `session.start()` after AUTHENTICATE (renderer: session-uuid channel; controller: empty)  |
 |      23 | `RNDR_SRVR_STATE_UPDATED`                | `encode_renderer_state`                  | `ReportState` effect / `outbound_reporter` heartbeat (5s + after every command, 1s during buffering) |
 |      25 | `RNDR_SRVR_VOLUME_CHANGED`               | `encode_volume_changed`                  | `PushVolume` effect; `_broadcast_current_volume` on connect/activate                       |
-|      26 | `RNDR_SRVR_FILE_AUDIO_QUALITY_CHANGED`   | `encode_file_audio_quality_changed`      | `QualityReporter` after MA resolves current stream details                                  |
+|      26 | `RNDR_SRVR_FILE_AUDIO_QUALITY_CHANGED`   | `encode_file_audio_quality_changed`      | `QualityReporter` after MA resolves the current stream's actual sample rate / bit depth     |
 |      27 | `RNDR_SRVR_DEVICE_AUDIO_QUALITY_CHANGED` | `encode_device_audio_quality_changed`    | omitted until the renderer output format is known                                           |
-|      28 | `RNDR_SRVR_MAX_AUDIO_QUALITY_CHANGED`    | `encode_max_audio_quality_changed`       | `QualityReporter` after connect / quality change                                            |
+|      28 | `RNDR_SRVR_MAX_AUDIO_QUALITY_CHANGED`    | `encode_max_audio_quality_changed`       | `QualityReporter` after connect / configured-ceiling change                                 |
 |      61 | `CTRL_SRVR_JOIN_SESSION`                 | `encode_ctrl_join_session`               | `session.start()` in controller role, joining with the device deviceUuid                   |
 |      62 | `CTRL_SRVR_SET_PLAYER_STATE` (partial)   | `encode_ctrl_set_player_state`           | `PushPlayerState` effect via `session.send_ctrl_player_state` (no reducer callsite yet)    |
 |      63 | `CTRL_SRVR_SET_ACTIVE_RENDERER`          | `encode_set_active_renderer`             | `PushSetActive` effect before an MA-origin load if we aren't the active renderer            |
-|      64 | `CTRL_SRVR_SET_VOLUME`                   | `encode_ctrl_set_volume`                 | `PushVolume` effect (no reducer callsite yet)                                              |
+|      64 | `CTRL_SRVR_SET_VOLUME`                   | `encode_ctrl_set_volume`                 | `PushVolume` effect from MA-side player volume changes                                    |
 |      66 | `CTRL_SRVR_QUEUE_LOAD_TRACKS`            | `encode_queue_load_tracks`               | `PushLoad` effect via `session.send_queue_load_tracks`; MA-origin loads are skipped (one warning per outage) while the controller socket is down |
-|      73 | `CTRL_SRVR_MUTE_VOLUME`                  | `encode_ctrl_mute_volume`                | `PushMute` effect (no reducer callsite yet)                                                |
-|       — | `CTRL_SRVR_QUEUE_ADD/INSERT/REMOVE/REORDER/CLEAR_TRACKS` | (per-verb encoders)       | `PushAdd` / `PushInsert` / `PushRemove` / `PushReorder` / `PushClear` effects              |
+|      73 | `CTRL_SRVR_MUTE_VOLUME`                  | `encode_ctrl_mute_volume`                | `PushMute` effect from MA-side player mute changes                                        |
+|       — | `CTRL_SRVR_QUEUE_ADD/INSERT/REMOVE/REORDER/CLEAR_TRACKS` | (per-verb encoders)       | Remove/reorder/clear are production effects; add/insert are retained protocol primitives because their controller-local slots cannot be derived from MA catalog IDs |
 
 ## The sync core
 
@@ -431,8 +431,9 @@ lanes:
   MA-origin transport edits. Owns `current_id`, `playing`, `position_ms`,
   `active`.
 - **modes** — loop / shuffle / autoplay flags.
-- **side-channels** — volume / mute / quality; ungated fire-and-forget, since
-  `CanonicalState` carries no volume/mute/quality fields.
+- **side-channels** — relative/absolute volume and mute become explicit,
+  target-bound MA effects. Quality configuration is persisted by the provider;
+  current file quality is reported separately from that configured ceiling.
 
 ### Canonical state
 
@@ -480,14 +481,19 @@ matching `Push*` effect to send it to the cloud. Then one of:
 - **confirm** — the cloud echoes the edit (`CloudLoadAck` /
   `CloudTracksAdded` / …) carrying the same `action_uuid`; the proposal is
   dropped and the echo's new `cloud_version` becomes canonical.
-- **reject → rebase** — the cloud rejects it (`CloudQueueError` with the
-  `action_uuid`); the proposal is dropped and the reducer converges MA back
-  to canonical truth (`MaResyncQueue`).
+- **reject → rebase/retry** — the cloud rejects it (`CloudQueueError` with the
+  `action_uuid`); the reducer preserves the proposal's original intent,
+  rebases it on the authoritative cloud version, and retries with a fresh
+  16-byte action UUID. LOAD, ADD, INSERT, REMOVE, and REORDER retain their
+  occurrence-aware payloads, including duplicate track occurrences.
 - **timeout** — no echo arrives in time; the coordinator's proposal-timeout
   timer fires a `ProposalTimeout`, the reducer drops the stale proposal and
   resyncs. This is the lost-echo safety net.
 
-The `base_version` on each proposal is why concurrent edits stay correct:
+The proposal also stores a fresh 16-byte queue-context UUID and the complete
+operation payload, so a retry cannot turn a LOAD into an empty load or a
+REMOVE into the survivor list. The `base_version` on each proposal is why
+concurrent edits stay correct:
 the translation runs against the *pre-append* state, so an append comes out
 as only the newly added tail rather than the whole list.
 
@@ -503,12 +509,16 @@ echo our own load, without the audio hiccuping.
 
 ### Track identity
 
-A track's identity is its **Qobuz track id** (`current_id`, the diff match
-key, the `Push*` payloads). The cloud slot id (`queue_item_id`) is only
-meaningful on the wire: it arrives on cloud queue deltas and is required by
-the remove / reorder verbs (which address existing slots), so the effect
-runner passes those straight through, while add / insert / load verbs send
-`queue_item_id=0` and let the cloud assign + echo the real slot.
+A track occurrence is identified by its **Qobuz track id plus ordered
+occurrence** during diff/retry reconciliation; duplicate IDs are consumed
+left-to-right rather than collapsed into sets. The cloud slot id
+(`queue_item_id`) is only meaningful on the wire: it arrives on cloud queue
+deltas and is required by remove / reorder verbs, which the effect runner
+passes through. Live captures also proved that add / insert references are
+controller-session-local slots rather than catalog Qobuz IDs; sending
+catalog IDs with `queue_item_id=0` is silently ignored. MA-origin additions
+therefore send an authoritative full load, whose packed payload does use
+catalog Qobuz IDs and preserves duplicates.
 
 ### The impure shell
 
@@ -530,6 +540,41 @@ runner passes those straight through, while add / insert / load verbs send
   `Ma*` effects resolve Qobuz ids to MA `Track`s via
   [`metadata_resolver.py`](metadata_resolver.py) and drive the player queue
   through [`ma_bridge.py`](ma_bridge.py).
+
+Queue materialization is generation-tagged. Metadata resolution happens
+outside the reducer transition, and the result is applied only if the
+canonical queue generation still matches. A transient or partial lookup
+failure never commits a shortened queue; an authoritative empty snapshot
+does clear the Qobuz portion. Main-queue and autoplay occurrences are
+materialized as one ordered view, while current-item lookup retains which
+portion owns the occurrence.
+
+Renderer-state reports are ownership-gated. MA-origin playback first asks the
+cloud to activate this receiver and reports only after the cloud confirms its
+renderer ID as active. Release targets the exact MA player captured during
+activation, so a later automatic-target resolution cannot stop another
+player. Disconnect resets renderer IDs, ownership, queue version, and pending
+proposals.
+
+## Quality model
+
+Qobuz Connect carries three different quality concepts:
+
+- the configured maximum is only a selection ceiling;
+- file quality is the actual current `StreamDetails.audio_format`;
+- device quality is the actual renderer output format.
+
+The provider reports the maximum on connect/config changes and reports file
+sample rate, bit depth, channel count, and tier only when MA has real stream
+details. It does not fabricate device quality from the ceiling. A quality
+command persists both this Connect instance and its explicitly selected
+native Qobuz provider independently.
+
+The current web protocol's controller quality command is
+`{rendererId: field 1, maxAudioQuality: field 2}`. Server quality broadcasts
+likewise put `rendererId` first. The committed `.proto` definitions and
+generated Python module must be regenerated together when these layouts
+change.
 
 ## Glossary
 

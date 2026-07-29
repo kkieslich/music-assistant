@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any
 
 from .audio_probe import AudioProbe
 from .harness import AUTH_DIR, _open_client
-from .ma_probe import MAProbe, ProbeEvents
+from .ma_probe import MANAGED_CONNECT_TARGET, MAProbe, ProbeEvents
 
 if TYPE_CHECKING:
     from playwright.async_api import Browser, Playwright
@@ -43,7 +43,7 @@ LOGGER = logging.getLogger(__name__)
 
 # Daft Punk — Discovery. Stable album; 16 tracks, ids 1065476..1065491.
 ALBUM_URL = "https://play.qobuz.com/album/0724384260958"
-CONNECT_TARGET = "Local Dev"
+CONNECT_TARGET = MANAGED_CONNECT_TARGET
 
 # The Connect target's silent MA player (BlackHole) — where MA renders audio
 # during integration runs so nothing is played out loud. Must match
@@ -153,7 +153,7 @@ class SafetyPreflight:
             if isinstance(provider, dict)
             and provider.get("domain") == "qobuz_connect"
             and isinstance(provider.get("values"), dict)
-            and provider["values"].get("publish_name") == self._connect_target
+            and _provider_config_value(provider, "publish_name") == self._connect_target
         ]
         if len(matching_providers) != 1:
             failures.append(
@@ -161,7 +161,7 @@ class SafetyPreflight:
             )
         else:
             provider = matching_providers[0]
-            target = provider["values"].get("target_player")
+            target = _provider_config_value(provider, "target_player")
             if target != BLACKHOLE_PLAYER_ID:
                 failures.append(
                     f"Qobuz Connect target player is {target!r}, expected BlackHole "
@@ -221,13 +221,15 @@ class SafetyPreflight:
             for label, qobuz in cloud_clients:
                 await qobuz.select_local_output(expected_name="Web Player Chrome")
                 selected = await qobuz.selected_output_name()
-                if selected != "Web Player Chrome":
+                if not await qobuz.is_local_output_selected():
                     failures.append(
                         f"Client {label} browser-local output selection did not stick: "
                         f"selected={selected!r}"
                     )
                 else:
-                    checks.append(f"client {label} browser-local output=Web Player Chrome")
+                    checks.append(
+                        f"client {label} browser-local output=default-audio-output ({selected})"
+                    )
         return PreflightResult(checks=tuple(checks), failures=tuple(failures))
 
 
@@ -264,6 +266,11 @@ class IntegrationSession:
         """Return the independent second Qobuz cloud observer."""
         return self.observer.qobuz if self.observer is not None else None
 
+    @property
+    def connect_target(self) -> str:
+        """Return the exact managed Connect receiver name."""
+        return CONNECT_TARGET
+
     async def reset_to_clean_state(self) -> None:
         """
         Return control to the web client and start a known queue.
@@ -276,6 +283,14 @@ class IntegrationSession:
         deterministic starting point, free of cross-run pollution.
         """
         await self.ensure_safe_for_playback()
+        stop_error = await _ma_send("player_queues/stop", {"queue_id": BLACKHOLE_PLAYER_ID})
+        clear_error = await _ma_send("player_queues/clear", {"queue_id": BLACKHOLE_PLAYER_ID})
+        if stop_error or clear_error:
+            raise RuntimeError(
+                f"Could not reset BlackHole: stop={stop_error!r} clear={clear_error!r}"
+            )
+        if self.q2 is not None:
+            await self.q2.select_local_output(expected_name="Web Player Chrome")
         await self.q.select_local_output(expected_name="Web Player Chrome")
         await asyncio.sleep(3)
         await self.q.play_album_by_url(ALBUM_URL)
@@ -285,6 +300,8 @@ class IntegrationSession:
         """Hand playback off to the MA renderer (``Local Dev``)."""
         await self.ensure_safe_for_playback()
         await self.q.select_connect_target(CONNECT_TARGET)
+        if self.q2 is not None:
+            await self.q2.select_connect_target(CONNECT_TARGET)
 
     async def ensure_safe_for_playback(self) -> None:
         """Abort unless the managed receiver is pinned to the silent BlackHole player."""
@@ -298,10 +315,10 @@ class IntegrationSession:
         LOGGER.info("Live playback safety preflight passed: %s", ", ".join(result.checks))
         self._safe_for_playback = True
 
-    async def cleanup_playback(self) -> None:
-        """Stop the verified BlackHole queue and return control to browser-local output."""
+    async def cleanup_playback(self) -> bool:
+        """Stop BlackHole and return whether browser-local cleanup was fully verified."""
         if not self._safe_for_playback:
-            return
+            return True
         stop_error = await _ma_send("player_queues/stop", {"queue_id": BLACKHOLE_PLAYER_ID})
         clear_error = await _ma_send("player_queues/clear", {"queue_id": BLACKHOLE_PLAYER_ID})
         if stop_error or clear_error:
@@ -310,11 +327,43 @@ class IntegrationSession:
                 stop_error,
                 clear_error,
             )
-        await self.q.select_local_output(expected_name="Web Player Chrome")
+        try:
+            await self.q.select_local_output(expected_name="Web Player Chrome")
+            if self.q2 is not None:
+                await self.q2.select_local_output(expected_name="Web Player Chrome")
+        except Exception:
+            LOGGER.warning(
+                "Direct browser-local cleanup failed; retrying after reload", exc_info=True
+            )
+            try:
+                await self.q.open()
+                await self.q.select_local_output(expected_name="Web Player Chrome")
+                if self.q2 is not None:
+                    await self.q2.open()
+                    await self.q2.select_local_output(expected_name="Web Player Chrome")
+            except Exception:
+                LOGGER.exception(
+                    "Browser-local cleanup could not be verified; BlackHole was still stopped"
+                )
+                return False
+        return stop_error is None and clear_error is None
 
     def observe(self, cursor: int) -> ProbeEvents:
         """Parse MA log events written since ``cursor``."""
         return self.ma.events_since(cursor)
+
+    def write_evidence(self, scenario: str) -> tuple[Path, Path]:
+        """Persist both clients' websocket evidence for one live scenario."""
+        output_dir = Path(__file__).resolve().parent / ".runs"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        paths = (
+            output_dir / f"live_{scenario}__client_a.json",
+            output_dir / f"live_{scenario}__client_b.json",
+        )
+        self.client.recorder.write(paths[0])
+        if self.observer is not None:
+            self.observer.recorder.write(paths[1])
+        return paths
 
     def wait_for_stream(self, cursor: int, *, timeout: float = 25.0) -> ProbeEvents:
         """Wait until MA logs at least one StreamStart after ``cursor``."""
@@ -378,6 +427,8 @@ class IntegrationSession:
 
         Polls to tolerate brief cloud/browser update races.
         """
+        if self.q2 is not None and await self.q2.selected_output_name() != CONNECT_TARGET:
+            await self.q2.select_connect_target(CONNECT_TARGET)
         deadline = time.monotonic() + timeout
         app_a_id = ""
         app_b_id = ""
@@ -443,6 +494,17 @@ def _resolve_ma_token() -> str | None:
     if token_file.exists():
         return token_file.read_text().strip() or None
     return None
+
+
+def _provider_config_value(provider: dict[str, object], key: str) -> object:
+    """Read a value from either raw config values or expanded ConfigEntry objects."""
+    values = provider.get("values")
+    if not isinstance(values, dict):
+        return None
+    value = values.get(key)
+    if isinstance(value, dict) and "value" in value:
+        return value["value"]
+    return value
 
 
 async def _ma_call(command: str, args: dict[str, object]) -> tuple[str | None, object]:
@@ -546,7 +608,7 @@ async def open_session(
     from playwright.async_api import async_playwright  # noqa: PLC0415
 
     pw = await async_playwright().start()
-    browser = await pw.chromium.launch(headless=True)
+    browser = await pw.chromium.launch(headless=True, args=["--mute-audio"])
     client, observer = await asyncio.gather(
         _open_client(
             browser,

@@ -136,6 +136,34 @@ class QobuzPage:
             return ""
         return str(track_ids[current_index])
 
+    async def displayed_audio_quality(self) -> str:
+        """Return the exact current-file quality text shown in the player bar."""
+        quality = self.page.locator(".player__settings-quality-text").first
+        if await quality.count() == 0:
+            return ""
+        text = str(await quality.inner_text()).replace("\xa0", " ")
+        return " ".join(text.split())
+
+    async def send_qconnect_frame(self, frame: bytes) -> None:
+        """Send one encoded frame over this authenticated client's live Qobuz socket."""
+        sent = await self.page.evaluate(
+            """
+            (data) => {
+                const sockets = (window.__qobuzTrackedSockets ?? [])
+                    .filter((socket) =>
+                        socket.readyState === WebSocket.OPEN &&
+                        socket.url.includes("qobuz.com/ws")
+                    );
+                if (!sockets.length) return false;
+                sockets[sockets.length - 1].send(Uint8Array.from(data));
+                return true;
+            }
+            """,
+            list(frame),
+        )
+        if not sent:
+            raise RuntimeError("No authenticated Qobuz WebSocket is open in the client")
+
     async def queue_track_ids(self) -> tuple[str, ...]:
         """Return the Web Client's cloud queue as exact Qobuz track IDs."""
         track_ids = (await self._player_snapshot()).get("trackIds", [])
@@ -491,7 +519,14 @@ class QobuzPage:
         popover = self.page.locator("#player-popover-devices")
         if await popover.count() and await popover.first.is_visible():
             return
-        await self.page.locator(".pct-audio-output-button").first.click()
+        button = self.page.locator(".pct-audio-output-button").first
+        try:
+            await button.wait_for(state="visible", timeout=3_000)
+        except Exception:
+            LOGGER.warning("[%s] player controls missing; reloading Qobuz", self.label)
+            await self.open()
+            await button.wait_for(state="visible", timeout=15_000)
+        await button.click(timeout=5_000)
 
     async def select_connect_target(self, name: str) -> None:
         """
@@ -516,6 +551,15 @@ class QobuzPage:
                 f"matches={len(matches)}, outputs={await self.network_output_names()!r}"
             )
         await items.nth(matches[0]).click()
+        deadline = asyncio.get_running_loop().time() + 10
+        while asyncio.get_running_loop().time() < deadline:
+            await self.page.wait_for_timeout(250)
+            if await self.selected_output_name() == name:
+                return
+        raise RuntimeError(
+            f"Qobuz did not confirm Connect target {name!r}; "
+            f"selected={await self.selected_output_name()!r}"
+        )
 
     async def network_output_names(self) -> tuple[str, ...]:
         """Return exact visible names from the network-output picker."""
@@ -532,6 +576,26 @@ class QobuzPage:
         selected = self.page.locator(".AudioOutputSelected__content__main__name").first
         return str(await selected.inner_text()).strip()
 
+    async def is_local_output_selected(self) -> bool:
+        """Return whether Qobuz's stable direct-browser output ID is current."""
+        return bool(
+            await self.page.evaluate(
+                """
+                () => Object.keys(localStorage)
+                    .filter((key) => key.startsWith("player-"))
+                    .map((key) => {
+                        try {
+                            return JSON.parse(localStorage.getItem(key))
+                                ?.audioOutputs?.data?.current;
+                        } catch {
+                            return null;
+                        }
+                    })
+                    .includes("default-audio-output")
+                """
+            )
+        )
+
     async def select_local_output(self, expected_name: str = "Web Player Chrome") -> None:
         """
         Route playback back to this browser's local audio output.
@@ -542,14 +606,17 @@ class QobuzPage:
         clean-state reset for handoff scenarios.
         """
         await self.open_connect_picker()
-        await self.page.locator(".DirectAudioOutputListItem").first.click()
+        direct_output = self.page.locator(".DirectAudioOutputListItem").first
+        await direct_output.wait_for(state="attached", timeout=5_000)
+        await direct_output.evaluate("(element) => element.click()")
         deadline = asyncio.get_running_loop().time() + 8
         while asyncio.get_running_loop().time() < deadline:
             await self.page.wait_for_timeout(250)
-            if await self.selected_output_name() == expected_name:
+            if await self.is_local_output_selected():
                 return
         raise RuntimeError(
-            f"Browser-local output did not become {expected_name!r}; "
+            f"Browser-local output did not become {expected_name!r} "
+            "(stable id='default-audio-output'); "
             f"selected={await self.selected_output_name()!r}"
         )
 

@@ -105,6 +105,12 @@ class _FakeBridge:
         """Return the fake item's Qobuz track id."""
         return item.get("track_id") if isinstance(item, dict) else None
 
+    def qobuz_track_ids_for(self, item: Any) -> tuple[str, ...]:
+        """Return every fake Qobuz alias for an item."""
+        if not isinstance(item, dict):
+            return ()
+        return tuple(item.get("track_ids", (item.get("track_id"),)))
+
     def get_queue(self, player_id: str) -> _FakeQueue | None:
         """Return the fixed fake queue."""
         return self.queue
@@ -130,6 +136,27 @@ def _coordinator(
         now=lambda: 1,
     )
     return coord, runner, bridge
+
+
+async def test_ma_events_prefer_alias_matching_canonical_track() -> None:
+    """A library item with replacement and original mappings must not clear Connect."""
+    coord, runner, bridge = _coordinator()
+    item = {"track_id": "3972279", "track_ids": ("3972279", "3879020")}
+    bridge.items = [item]
+    bridge.queue = _FakeQueue(current_item=item, state="playing", elapsed=1.0)
+    coord._state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=(QueueTrackRef(queue_item_id=3, track_id="3879020"),),
+        current_id=3879020,
+        playing=PlayingState.PLAYING,
+        active=True,
+    )
+
+    await coord.on_ma_queue_event("player")
+    await coord.on_ma_transport_event("player")
+
+    assert [type(effect) for effect in runner.effects] == [ReportState]
+    assert coord._state.current_id == 3879020
 
 
 async def test_snapshot_then_activate_takes_over() -> None:
@@ -236,7 +263,7 @@ async def test_new_queue_generation_reduces_while_resync_is_in_flight() -> None:
 
 
 async def test_ma_append_pushes_add_and_cloud_echo_confirms() -> None:
-    """An MA-origin append emits PushAdd; the matching cloud echo clears the pending proposal."""
+    """An MA-origin append reloads the queue; the matching cloud echo confirms it."""
     coord, runner, bridge = _coordinator()
     await coord._submit(
         CloudSnapshot(
@@ -251,7 +278,7 @@ async def test_ma_append_pushes_add_and_cloud_echo_confirms() -> None:
     )
     bridge.items = [{"track_id": "100"}, {"track_id": "101"}]
     await coord.on_ma_queue_event("player")
-    assert any(isinstance(e, PushAdd) for e in runner.effects)
+    assert any(isinstance(e, PushLoad) for e in runner.effects)
     pending_before = coord.state.pending
     assert len(pending_before) == 1
     proposal = pending_before[0]
@@ -492,7 +519,7 @@ async def test_submit_queue_error_without_version_falls_back_to_cloud_version() 
     assert len(coord.state.pending) == 1  # rebased, still pending
     assert coord.state.pending[0].retries_left == proposal.retries_left - 1
     assert coord.state.cloud_version == QueueVersion(5, 1)
-    assert any(isinstance(e, PushAdd) for e in runner.effects)  # re-pushed
+    assert any(isinstance(e, PushLoad) for e in runner.effects)  # re-pushed
 
 
 async def test_submit_renderer_state_updated_maps_current_index() -> None:

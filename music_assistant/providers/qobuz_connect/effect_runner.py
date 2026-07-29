@@ -8,10 +8,10 @@ values turn into real ``session.send_*`` calls or ``ma_bridge`` mutations.
 
 ID semantics matter here and are **not** re-translated by this module:
 
-- ``PushLoad``/``PushAdd``/``PushInsert`` track ids are Qobuz track ids
-  (``int``) — the cloud add/insert verbs want ``QueueTrackRef``s, so this
-  module wraps each id with ``queue_item_id=0`` (the cloud assigns the real
-  slot id and echoes it back on the list lane).
+- ``PushLoad`` track ids are Qobuz catalog ids. ``PushAdd``/``PushInsert``
+  support remains for protocol experiments, but production MA-origin adds use
+  ``PushLoad`` because the live add/insert verbs identify tracks with
+  controller-session-local slots that MA does not possess.
 - ``PushRemove``/``PushReorder``/``PushPlayerState`` ids are already cloud
   slot ids (``int``) and pass straight through.
 - ``MaPlayTrack``/``MaResyncQueue`` ids are Qobuz track ids and drive MA
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -153,6 +154,7 @@ class EffectRunner:
                 action_uuid=effect.action_uuid,
                 tracks=_refs(effect.track_ids),
                 queue_version=effect.base_version,
+                context_uuid=effect.context_uuid,
             )
         elif isinstance(effect, PushInsert):
             await self._session.send_queue_insert_tracks(
@@ -160,6 +162,7 @@ class EffectRunner:
                 tracks=_refs(effect.track_ids),
                 insert_after=effect.insert_after,
                 queue_version=effect.base_version,
+                context_uuid=effect.context_uuid,
             )
         elif isinstance(effect, PushRemove):
             await self._session.send_queue_remove_tracks(
@@ -287,32 +290,38 @@ class EffectRunner:
         only for tracks MA doesn't have yet, then commits the whole list via one
         ``update_items``. Non-Qobuz MA queue items (e.g. a local/Spotify track a user
         manually queued during an active Connect session) are preserved, appended after
-        the reconciled Qobuz block. This is the safe subset of full reconciliation;
-        deferred: chunked metadata resolution and duplicate-count bucketing for
-        repeated tracks.
+        the reconciled Qobuz block. Repeated tracks and alternate provider mappings are
+        matched without reusing an MA queue item. Chunked metadata resolution remains
+        deferred.
         """
         pid = self._target_player_id("MaResyncQueue")
         if pid is None or self._metadata is None:
             return
-        ma_by_track_id: dict[str, list[Any]] = {}
+        ma_by_track_id: dict[str, deque[Any]] = {}
         non_qobuz_items: list[Any] = []
         for item in self._bridge.queue_items(pid):
-            track_id = self._bridge.qobuz_track_id_for(item)
-            if track_id is not None:
-                ma_by_track_id.setdefault(track_id, []).append(item)
-            else:
+            track_ids = self._qobuz_track_ids_for(item)
+            if not track_ids:
                 non_qobuz_items.append(item)
+                continue
+            for track_id in track_ids:
+                ma_by_track_id.setdefault(track_id, deque()).append(item)
 
         # First pass reuses existing MA items in order; unknown tracks get a
         # placeholder slot and are resolved concurrently below.
         slots: list[Any | None] = []
         missing: list[tuple[int, str]] = []
+        reused_item_ids: set[int] = set()
         for qid in effect.track_ids:
             track_id_str = str(qid)
             pool = ma_by_track_id.get(track_id_str)
-            item = pool.pop(0) if pool else None
+            while pool and id(pool[0]) in reused_item_ids:
+                pool.popleft()
+            item = pool.popleft() if pool else None
             if item is None:
                 missing.append((len(slots), track_id_str))
+            else:
+                reused_item_ids.add(id(item))
             slots.append(item)
 
         if missing:
@@ -370,9 +379,17 @@ class EffectRunner:
     def _find_ma_queue_index(self, player_id: str, track_id: str) -> int | None:
         """Return the MA queue index already holding Qobuz track ``track_id``, if any."""
         for idx, item in enumerate(self._bridge.queue_items(player_id)):
-            if self._bridge.qobuz_track_id_for(item) == track_id:
+            if track_id in self._qobuz_track_ids_for(item):
                 return idx
         return None
+
+    def _qobuz_track_ids_for(self, item: Any) -> tuple[str, ...]:
+        """Return every Qobuz catalog id mapped to an MA queue item."""
+        getter = getattr(self._bridge, "qobuz_track_ids_for", None)
+        if getter is not None:
+            return tuple(str(track_id) for track_id in getter(item) if track_id is not None)
+        track_id = self._bridge.qobuz_track_id_for(item)
+        return () if track_id is None else (str(track_id),)
 
     def _target_player_id(self, effect_name: str) -> str | None:
         """Resolve the MA target player id, logging and returning ``None`` if unset."""

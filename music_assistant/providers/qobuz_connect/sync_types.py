@@ -464,6 +464,7 @@ class PushAdd:
     action_uuid: bytes
     base_version: QueueVersion
     track_ids: tuple[int, ...]
+    context_uuid: bytes
 
 
 @dataclass(slots=True, frozen=True)
@@ -474,6 +475,7 @@ class PushInsert:
     base_version: QueueVersion
     track_ids: tuple[int, ...]
     insert_after: int
+    context_uuid: bytes
 
 
 @dataclass(slots=True, frozen=True)

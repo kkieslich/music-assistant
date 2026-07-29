@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import pytest
 
+from music_assistant.providers.qobuz_connect.models import QConnectMessageType
 from tests.providers.qobuz_connect.protocol_capture.integration_harness import (
     BLACKHOLE_PLAYER_ID,
     IntegrationSession,
@@ -15,6 +16,7 @@ from tests.providers.qobuz_connect.protocol_capture.integration_harness import (
     ScenarioStatus,
 )
 from tests.providers.qobuz_connect.protocol_capture.qobuz_page import QobuzPage
+from tests.providers.qobuz_connect.protocol_capture.ws_recorder import WsRecorder
 
 
 class FakeQobuzPage:
@@ -37,6 +39,10 @@ class FakeQobuzPage:
     async def selected_output_name(self) -> str:
         """Return the active output."""
         return self.selected
+
+    async def is_local_output_selected(self) -> bool:
+        """Return whether the fake browser-local output is selected."""
+        return self.selected in {"Web Player Chrome", "Standardmäßige Audioausgabe"}
 
     async def play_album_by_url(self, url: str) -> None:
         """Record attempted playback."""
@@ -145,6 +151,25 @@ async def test_preflight_accepts_exact_blackhole_and_browser_output() -> None:
     assert await qobuz.selected_output_name() == "Web Player Chrome"
 
 
+async def test_preflight_accepts_expanded_provider_config_entries() -> None:
+    """The real config API wraps each persisted value in a ConfigEntry payload."""
+    provider = _provider(BLACKHOLE_PLAYER_ID)
+    provider["values"] = {
+        key: {"key": key, "value": value} for key, value in provider["values"].items()
+    }
+    qobuz = FakeQobuzPage(("Local Dev Hardening abc123",), "Landwarekan")
+    preflight = SafetyPreflight(
+        qobuz=qobuz,
+        ma_query_func=_query([provider], [_player()]),
+        connect_target="Local Dev Hardening abc123",
+        managed_pid=1234,
+    )
+
+    result = await preflight.run()
+
+    assert result.passed
+
+
 async def test_preflight_rejects_attached_process_without_identity() -> None:
     """An unmanaged or unidentified MA process cannot be used for playback."""
     preflight = SafetyPreflight(
@@ -189,6 +214,30 @@ def test_skipped_scenario_is_not_a_pass() -> None:
 
     assert result.status is ScenarioStatus.SKIP
     assert not result.passed
+
+
+def test_websocket_queue_reconstruction_preserves_pairs_after_reorder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The authoritative cloud-queue oracle keeps slot/track pairs through reorder."""
+
+    def track(slot: int, qid: int) -> SimpleNamespace:
+        return SimpleNamespace(queueItemId=slot, trackId=qid)
+
+    loaded = SimpleNamespace(
+        messageType=QConnectMessageType.SRVR_CTRL_QUEUE_TRACKS_LOADED,
+        srvrCtrlQueueTracksLoaded=SimpleNamespace(
+            tracks=[track(1, 101), track(2, 102), track(3, 103)]
+        ),
+    )
+    reordered = SimpleNamespace(
+        messageType=QConnectMessageType.SRVR_CTRL_QUEUE_TRACKS_REORDERED,
+        srvrCtrlQueueTracksReordered=SimpleNamespace(queueItemIds=[3], insertAfter=0),
+    )
+    recorder = WsRecorder(cast("Any", None))
+    monkeypatch.setattr(recorder, "_incoming_messages", lambda: [loaded, reordered])
+
+    assert recorder.cloud_queue_track_ids() == ("103", "101", "102")
 
 
 async def test_qobuz_page_reads_exact_track_ids_from_player_state() -> None:

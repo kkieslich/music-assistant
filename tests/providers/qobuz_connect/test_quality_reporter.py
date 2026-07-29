@@ -33,16 +33,21 @@ async def test_report_current_sends_ceiling_and_actual_file_separately() -> None
         bit_depth=24,
         channels=2,
     )
+    logger = MagicMock()
     reporter = QualityReporter(
         session_getter=lambda: session,
         file_quality_getter=lambda: actual,
-        logger=MagicMock(),
+        logger=logger,
     )
 
     await reporter.report_current(27)
 
     session.send_max_quality_report.assert_awaited_once_with(27)
     session.send_file_quality_report.assert_awaited_once_with(actual)
+    assert any(
+        "Qobuz maximum quality report" in call.args[0] for call in logger.debug.call_args_list
+    )
+    assert any("Qobuz file quality report" in call.args[0] for call in logger.debug.call_args_list)
 
 
 async def test_report_current_omits_unknown_file_and_device_formats() -> None:

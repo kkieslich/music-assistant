@@ -48,6 +48,7 @@ class QualityReporter:
         if session is None or quality == self._last_max_quality:
             return
         await session.send_max_quality_report(quality)
+        self._logger.debug("Qobuz maximum quality report quality=%s", quality)
         self._last_max_quality = quality
 
     async def report_file(self, report: AudioQualityReport | None) -> None:
@@ -56,6 +57,13 @@ class QualityReporter:
         if session is None or report is None or report == self._last_file_quality:
             return
         await session.send_file_quality_report(report)
+        self._logger.debug(
+            "Qobuz file quality report quality=%s sample_rate=%s bit_depth=%s channels=%s",
+            report.quality,
+            report.sampling_rate,
+            report.bit_depth,
+            report.channels,
+        )
         self._last_file_quality = report
 
     def reset(self) -> None:

@@ -155,7 +155,7 @@ message QConnectMessage {
   optional SrvrCtrlLoopModeSet                  srvrCtrlLoopModeSet                 = 97;
   optional SrvrCtrlVolumeMuted                  srvrCtrlVolumeMuted                 = 98;
   optional SrvrCtrlMaxAudioQualityChanged       srvrCtrlMaxAudioQualityChanged      = 99;
-  optional SrvrCtrlFileAudioQualityChanged      srvrCtrlFileAudioQualityChanged     = 100; //definitiv falsch
+  optional SrvrCtrlFileAudioQualityChanged      srvrCtrlFileAudioQualityChanged     = 100;
   optional SrvrCtrlDeviceAudioQualityChanged    srvrCtrlDeviceAudioQualityChanged   = 101;
   optional SrvrCtrlAutoplayModeSet              srvrCtrlAutoplayModeSet             = 102;
   optional SrvrCtrlAutoplayTracksLoaded         srvrCtrlAutoplayTracksLoaded        = 103;
@@ -177,9 +177,21 @@ message RndrSrvrStateUpdated      { optional QueueRendererState state = 1; }
 message RndrSrvrRendererAction    { optional int32 action = 1; } // enum numeric
 message RndrSrvrVolumeChanged     { optional uint32 volume = 1; }
 message RndrSrvrVolumeMuted       { optional bool   value  = 1; }
-message RndrSrvrFileAudioQualityChanged   { optional int32 value = 1; }
-message RndrSrvrDeviceAudioQualityChanged { optional int32 value = 1; }
-message RndrSrvrMaxAudioQualityChanged    { optional int32 value = 1; }
+message RndrSrvrFileAudioQualityChanged {
+  optional int32 sampling_rate = 1;
+  optional int32 bit_depth     = 2;
+  optional int32 nb_channels   = 3;
+  optional int32 audio_quality = 4;
+}
+message RndrSrvrDeviceAudioQualityChanged {
+  optional int32 sampling_rate = 1;
+  optional int32 bit_depth     = 2;
+  optional int32 nb_channels   = 3;
+}
+message RndrSrvrMaxAudioQualityChanged {
+  optional int32 audio_quality = 1;
+  optional int32 network_type  = 2;
+}
 
 // Server → Renderer commands
 message SrvrRndrSetState { // Xt (control variant)
@@ -236,7 +248,10 @@ message CtrlSrvrSetShuffleMode {
   optional bytes       queueHash    = 100;
 }
 message CtrlSrvrSetLoopMode    { optional LoopMode mode           = 1; }
-message CtrlSrvrSetMaxAudioQuality { optional int32 maxAudioQuality = 1; }
+message CtrlSrvrSetMaxAudioQuality {
+  optional int32 rendererId       = 1;
+  optional int32 maxAudioQuality  = 2;
+}
 message CtrlSrvrSetQueueState  { /* controller-originated snapshot; rarely used */ }
 message CtrlSrvrAskForQueueState  {
   optional QueueVersion queueVersion = 1;
@@ -287,9 +302,24 @@ message SrvrCtrlShuffleModeSet          {
   optional bytes       queueHash    = 100;
 }
 message SrvrCtrlLoopModeSet             { optional LoopMode mode           = 1; }
-message SrvrCtrlMaxAudioQualityChanged  { optional int32    maxAudioQuality = 1; }
-message SrvrCtrlFileAudioQualityChanged { optional int32    fileAudioQuality = 1; }
-message SrvrCtrlDeviceAudioQualityChanged { optional int32  deviceAudioQuality = 1; }
+message SrvrCtrlMaxAudioQualityChanged {
+  optional int32 rendererId       = 1;
+  optional int32 maxAudioQuality  = 2;
+  optional int32 networkType      = 3;
+}
+message SrvrCtrlFileAudioQualityChanged {
+  optional int32  rendererId    = 1;
+  optional uint32 sampling_rate = 2;
+  optional uint32 bit_depth     = 3;
+  optional uint32 nb_channels   = 4;
+  optional int32  audio_quality = 5;
+}
+message SrvrCtrlDeviceAudioQualityChanged {
+  optional int32  rendererId    = 1;
+  optional uint32 sampling_rate = 2;
+  optional uint32 bit_depth     = 3;
+  optional uint32 nb_channels   = 4;
+}
 message SrvrCtrlAutoplayModeSet         { optional bool     autoplayOn     = 1; }
 message SrvrCtrlAutoplayTracksLoaded    {
   optional QueueVersion          queueVersion          = 1;

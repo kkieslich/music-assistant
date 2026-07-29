@@ -93,6 +93,20 @@ async def _open_client(
     storage_state_arg = str(storage_state_path) if storage_state_path.exists() else None
     context = await browser.new_context(storage_state=storage_state_arg)
     page = await context.new_page()
+    await page.add_init_script(
+        """
+        (() => {
+            const NativeWebSocket = window.WebSocket;
+            window.__qobuzTrackedSockets = [];
+            window.WebSocket = class TrackedWebSocket extends NativeWebSocket {
+                constructor(...args) {
+                    super(...args);
+                    window.__qobuzTrackedSockets.push(this);
+                }
+            };
+        })();
+        """
+    )
     qobuz = QobuzPage(page, label=label)
     recorder = WsRecorder(page)
     http_recorder = HttpRecorder(page)

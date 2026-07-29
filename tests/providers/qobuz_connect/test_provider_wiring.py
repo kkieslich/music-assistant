@@ -145,6 +145,9 @@ async def test_config_entries_select_qobuz_instance_and_suggest_unused_port() ->
         if provider_domain == "qobuz":
             return [qobuz_one, qobuz_two]
         if provider_domain == "qobuz_connect":
+            assert not _kwargs.get("include_values"), (
+                "expanded Connect configs recurse through get_config_entries"
+            )
             return [connect_one]
         return []
 
@@ -197,6 +200,48 @@ def test_missing_selected_qobuz_instance_has_actionable_error() -> None:
 
     with pytest.raises(InvalidDataError, match="qobuz--missing"):
         provider.get_qobuz_provider()
+
+
+def test_queue_mapping_does_not_require_selected_provider_to_be_loaded_yet() -> None:
+    """Early player events may resolve IDs while native Qobuz is still starting."""
+    provider, mass = _make_provider(qobuz_provider_id="qobuz--selected")
+    mass.get_provider.side_effect = lambda _instance_id: None
+    item = SimpleNamespace(
+        media_item=SimpleNamespace(
+            media_type="track",
+            provider="qobuz--selected",
+            item_id="123",
+            provider_mappings=(),
+        )
+    )
+
+    assert provider.get_qobuz_track_id_from_queue_item(item) == "123"
+
+
+def test_queue_mapping_exposes_every_qobuz_alias() -> None:
+    """Library items retain every Qobuz mapping so Connect can match canonical ids."""
+    provider, _mass = _make_provider(qobuz_provider_id="qobuz--selected")
+    item = SimpleNamespace(
+        media_item=SimpleNamespace(
+            media_type="track",
+            provider="library",
+            item_id="1051",
+            provider_mappings=(
+                SimpleNamespace(
+                    provider_domain="qobuz",
+                    provider_instance="qobuz--selected",
+                    item_id="3972279",
+                ),
+                SimpleNamespace(
+                    provider_domain="qobuz",
+                    provider_instance="qobuz--selected",
+                    item_id="3879020",
+                ),
+            ),
+        )
+    )
+
+    assert provider.get_qobuz_track_ids_from_queue_item(item) == ("3972279", "3879020")
 
 
 def test_setup_constructs_coordinator_and_effect_runner() -> None:

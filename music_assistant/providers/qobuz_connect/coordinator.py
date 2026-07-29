@@ -234,8 +234,14 @@ class QobuzConnectCoordinator:
         """Translate MA's current queue contents into a ``MaQueueChanged`` event."""
         track_ids: list[int] = []
         resolvable: set[int] = set()
-        for item in self._bridge.queue_items(player_id):
-            qid = try_parse_qobuz_id(self._bridge.qobuz_track_id_for(item))
+        canonical_ids = tuple(
+            qid
+            for ref in self._state.tracks
+            if (qid := try_parse_qobuz_id(ref.track_id)) is not None
+        )
+        for index, item in enumerate(self._bridge.queue_items(player_id)):
+            preferred = canonical_ids[index] if index < len(canonical_ids) else None
+            qid = self._qobuz_track_id_for(item, preferred=preferred)
             if qid is None:
                 continue
             track_ids.append(qid)
@@ -266,8 +272,8 @@ class QobuzConnectCoordinator:
         current_track_id = None
         queue = self._bridge.get_queue(player_id)
         if queue is not None and queue.current_item is not None:
-            current_track_id = try_parse_qobuz_id(
-                self._bridge.qobuz_track_id_for(queue.current_item)
+            current_track_id = self._qobuz_track_id_for(
+                queue.current_item, preferred=self._state.current_id
             )
         await self._submit(
             MaQueueChanged(
@@ -290,8 +296,8 @@ class QobuzConnectCoordinator:
         )
         current_track_id = None
         if queue.current_item is not None:
-            current_track_id = try_parse_qobuz_id(
-                self._bridge.qobuz_track_id_for(queue.current_item)
+            current_track_id = self._qobuz_track_id_for(
+                queue.current_item, preferred=self._state.current_id
             )
         await self._submit(
             MaTransportChanged(
@@ -443,6 +449,25 @@ class QobuzConnectCoordinator:
 
     async def _on_disconnected(self) -> None:
         await self.submit(Disconnected(now_ms=self._now()))
+
+    def _qobuz_track_id_for(self, item: Any, *, preferred: int | None = None) -> int | None:
+        """Resolve an MA item to the Qobuz id that matches canonical Connect state."""
+        candidates_getter = getattr(self._bridge, "qobuz_track_ids_for", None)
+        if candidates_getter is None:
+            candidates = (self._bridge.qobuz_track_id_for(item),)
+        else:
+            candidates = candidates_getter(item)
+        parsed = tuple(
+            qid for value in candidates if (qid := try_parse_qobuz_id(value)) is not None
+        )
+        if preferred in parsed:
+            return preferred
+        canonical_ids = {
+            qid
+            for ref in self._state.tracks
+            if (qid := try_parse_qobuz_id(ref.track_id)) is not None
+        }
+        return next((qid for qid in parsed if qid in canonical_ids), parsed[0] if parsed else None)
 
     # ---- proposal-timeout timer ----------------------------------------------
 

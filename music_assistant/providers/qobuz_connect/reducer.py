@@ -61,7 +61,6 @@ from .sync_types import (
     Proposal,
     ProposalKind,
     ProposalTimeout,
-    PushAdd,
     PushClear,
     PushInsert,
     PushLoad,
@@ -758,7 +757,11 @@ def _reduce_load_ack(state: CanonicalState, event: CloudLoadAck) -> ReduceResult
         # briefly show the new track at the old track's position. _with_resync
         # reads only tracks/current/active, so result.effects is unchanged.
         settling = dataclasses.replace(
-            new, position_ms=0, settling_position=True, buffer_state=BufferState.BUFFERING
+            new,
+            position_ms=0,
+            position_anchor_ms=event.now_ms,
+            settling_position=True,
+            buffer_state=BufferState.BUFFERING,
         )
         effects = _report_on_buffer_change(
             state.buffer_state, settling.buffer_state, (*result.effects, play)
@@ -1093,18 +1096,23 @@ def _emit_push(state: CanonicalState, proposal: Proposal) -> Effect:
             context_uuid=proposal.context_uuid,
         )
     if proposal.kind is ProposalKind.ADD:
-        # The cloud's add command APPENDS its payload to the existing cloud
-        # queue, so only the appended tail may be pushed — the full target
-        # list would duplicate tracks the cloud already has. The tail is
-        # computed positionally (not by set-membership) where the proposal
-        # is built, so a duplicate re-add of an already-canonical track is
-        # preserved rather than dropped. The proposal itself still carries
-        # the full target list since _confirm_proposal folds that into
-        # canonical truth on echo.
-        return PushAdd(
+        # CTRL_SRVR_QUEUE_ADD_TRACKS identifies tracks by a controller-session
+        # slot (66 in the reference capture), not by catalog Qobuz id. MA has
+        # no such web-session slot: sending QueueTrackRef(trackId=...) is
+        # silently ignored by the real cloud. A full load speaks catalog ids,
+        # preserves duplicate occurrences, and keeps playback on the same
+        # current index.
+        current_index = (
+            proposal.target_track_ids.index(proposal.current_track_id)
+            if proposal.current_track_id in proposal.target_track_ids
+            else 0
+        )
+        return PushLoad(
             action_uuid=proposal.action_uuid,
             base_version=proposal.base_version,
-            track_ids=proposal.push_payload_ids,
+            track_ids=proposal.target_track_ids,
+            current_index=current_index,
+            context_uuid=proposal.context_uuid,
         )
     if proposal.kind is ProposalKind.INSERT:
         # No diff path produces INSERT proposals yet; implemented
@@ -1114,6 +1122,7 @@ def _emit_push(state: CanonicalState, proposal: Proposal) -> Effect:
             base_version=proposal.base_version,
             track_ids=proposal.push_payload_ids,
             insert_after=0,
+            context_uuid=proposal.context_uuid,
         )
     if proposal.kind is ProposalKind.REMOVE:
         # push_payload_ids carries the REMOVED Qobuz ids (canonical minus the

@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 
 from .integration_harness import (
+    IntegrationSession,
     ScenarioResult,
     close_session,
     default_probe,
@@ -74,20 +75,63 @@ async def _run(args: argparse.Namespace) -> int:
     failures = 0
     try:
         session, session_handle = await open_session(ma)
+        assert session is not None
+        assert session_handle is not None
         for name in names:
             LOGGER.info("=== scenario: %s ===", name)
-            result = await SCENARIOS[name](session)
+            assert session is not None
+            result, cleanup_ok = await _run_scenario(name, session)
+            if not cleanup_ok:
+                LOGGER.warning(
+                    "Recycling both browser clients after Qobuz refused local-output cleanup"
+                )
+                try:
+                    assert session_handle is not None
+                    await close_session(session_handle)
+                    session_handle = None
+                    session = None
+                    session, session_handle = await open_session(ma)
+                    await session.ensure_safe_for_playback()
+                    cleanup_ok = True
+                except Exception:
+                    LOGGER.exception("Browser-session isolation recovery failed")
+            result.check("isolated cleanup completed", cleanup_ok)
             _print_result(result)
             if not result.passed:
                 failures += 1
     finally:
-        if session is not None:
-            await session.cleanup_playback()
-        if session_handle is not None:
-            await close_session(session_handle)
-        if started_here:
-            ma.stop()
+        try:
+            if session_handle is not None:
+                await close_session(session_handle)
+        except Exception:
+            LOGGER.exception("Browser cleanup failed")
+            failures += 1
+        finally:
+            if started_here:
+                ma.stop()
     return 1 if failures else 0
+
+
+async def _run_scenario(name: str, session: IntegrationSession) -> tuple[ScenarioResult, bool]:
+    """Run, capture, and isolate one scenario without aborting the full suite."""
+    try:
+        result = await SCENARIOS[name](session)
+    except Exception as err:
+        LOGGER.exception("Scenario %s raised an exception", name)
+        result = ScenarioResult(scenario=name)
+        result.check(
+            "scenario completed without exception",
+            False,
+            detail=f"{type(err).__name__}: {err}",
+        )
+    evidence = session.write_evidence(name)
+    LOGGER.info("Saved live websocket evidence: %s", evidence)
+    try:
+        cleanup_ok = await session.cleanup_playback()
+    except Exception:
+        LOGGER.exception("Per-scenario cleanup failed")
+        cleanup_ok = False
+    return result, cleanup_ok
 
 
 def _print_result(result: ScenarioResult) -> None:

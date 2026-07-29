@@ -3,7 +3,7 @@
 Automated end-to-end tests that drive **two real Qobuz Web Clients** (Playwright,
 one acting as the controller and one as an independent cloud observer) against the
 **real Qobuz cloud**, with a
-**real Music Assistant** instance joined as the `Local Dev` Connect renderer.
+**real Music Assistant** instance joined under a unique managed Connect name.
 This replaces hand-testing on physical hardware: each scenario resets to a
 clean state, performs one controller action, and asserts MA's observable
 behaviour — from its debug log **and from real audio output**.
@@ -29,8 +29,9 @@ during a run.
 
 - `audio_probe.py` — captures/measures the BlackHole loopback (`AudioProbe`).
 - `ma_probe.py` — manages (or attaches to) a live MA process, pins/restores the
-  BlackHole target on managed start/stop, and parses the debug log into
-  structured events (`ReduceTrace`, `StreamStart`, `Report`) with
+  BlackHole target on managed start/stop, binds the exact native Qobuz
+  instance and an isolated Connect port/name, and parses the debug log into
+  structured events (`ReduceTrace`, `StreamStart`, `Report`, `QualityReport`) with
   condition-based `wait_for_event`.
 - `integration_harness.py` — two logged-in web clients + the MA probe + an
   `AudioProbe`; `reset_to_clean_state()`, condition waits
@@ -49,10 +50,12 @@ during a run.
 2. `ffmpeg` on PATH and the `BlackHole 2ch` device installed.
 3. Persisted Qobuz logins at `.auth/client_a.json` and `.auth/client_b.json`
    (first run must be headed to log in once; see `harness.py`).
-4. An MA data dir (`.mass-data`) with the `qobuz` and `qobuz_connect` providers
-   configured. The managed runner pins the Connect target to BlackHole
-   automatically and restores it on stop; when attaching to your own MA, pin
-   `target_player` to BlackHole yourself so runs make no audible sound.
+4. Worktree-local MA data/cache dirs (`.mass-data`, `.mass-cache`) with the
+   `qobuz` and `qobuz_connect` providers configured. The managed runner pins
+   that Connect instance to BlackHole with a unique name/port and explicit
+   native Qobuz instance, then restores its values on stop. Keep these as
+   disposable copies rather than pointing them at a live MA data directory.
+   When attaching to your own MA, pin `target_player` to BlackHole yourself.
 5. For MA-driven scenarios: an MA token —
    `MA_USER=<u> MA_PASS=<p> .venv/bin/python -m tests.providers.qobuz_connect.protocol_capture.mint_ma_token`
    writes `.auth/ma_token`. A missing token marks those scenarios `SKIP`;
@@ -76,6 +79,7 @@ Let the harness manage the MA process itself (pins/restores BlackHole):
 
 Run one scenario by name instead of `all`. Scenario runs are slow (real cloud
 round-trips + 1-2 s audio captures); run individually while developing.
+Each run writes both clients' raw WebSocket evidence to `.runs/live_*`.
 
 ## Scenarios
 
@@ -93,6 +97,8 @@ Every scenario expecting playback also asserts **real audio**.
 | `seek_scrub` | An app seek keeps audio flowing and does not restart the track. |
 | `queue_add` / `queue_reorder` | Queue edits reflect on MA without restarting audio. |
 | `pause_resume` | Pause silences MA output; resume brings sound back. |
+| `actual_quality` | A known 24-bit/44.1-kHz file is reported identically by MA and both clients while the 24/192 ceiling remains separate. |
+| `quality_change` | A real controller quality command persists to both the Connect and selected native Qobuz provider, then restores the original ceiling. |
 
 ### Modes / volume (App -> MA)
 

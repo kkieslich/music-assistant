@@ -17,7 +17,6 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     Proposal,
     ProposalKind,
     ProposalTimeout,
-    PushAdd,
     PushInsert,
     PushLoad,
     PushRemove,
@@ -52,7 +51,7 @@ def test_ma_append_emits_proposal_without_mutating_truth() -> None:
     assert tuple(t.queue_item_id for t in result.state.tracks) == (0, 1)  # truth unchanged
     assert len(result.state.pending) == 1
     assert result.state.pending[0].action_uuid == b"\xaa" * 16
-    assert any(isinstance(e, PushAdd) for e in result.effects)
+    assert any(isinstance(e, PushLoad) for e in result.effects)
 
 
 def test_own_echo_confirms_and_does_not_resync_ma() -> None:
@@ -106,7 +105,7 @@ def test_reject_rebases_once_then_converges() -> None:
     assert r2.state.cloud_version == QueueVersion(7, 1)
     assert len(r2.state.pending) == 1  # rebased, still pending
     assert r2.state.pending[0].retries_left == 0
-    assert any(isinstance(e, PushAdd) for e in r2.effects)  # re-pushed
+    assert any(isinstance(e, PushLoad) for e in r2.effects)  # re-pushed
     # second rejection -> give up, converge MA
     r3 = reduce(
         r2.state,
@@ -149,7 +148,7 @@ def test_reject_at_equal_version_still_rebases() -> None:
     )
     assert len(r2.state.pending) == 1  # rebased, still pending
     assert r2.state.pending[0].retries_left == 0
-    assert any(isinstance(e, PushAdd) for e in r2.effects)  # re-pushed
+    assert any(isinstance(e, PushLoad) for e in r2.effects)  # re-pushed
 
 
 def test_proposal_timeout_drops_and_converges() -> None:
@@ -197,8 +196,8 @@ def test_confirm_add_uses_real_item_ids_from_echo() -> None:
     assert confirmed.track_id == "900002"
 
 
-def test_reject_retry_add_repushes_tail_not_full() -> None:
-    """A version-stale rejection of an ADD re-pushes only the tail, not the full target list."""
+def test_reject_retry_add_reloads_full_target() -> None:
+    """A version-stale rejection of an ADD reloads the full intended queue."""
     state = _state()
     r1 = reduce(
         state,
@@ -220,9 +219,9 @@ def test_reject_retry_add_repushes_tail_not_full() -> None:
             message="Queue version mismatch",
         ),
     )
-    pushes = [e for e in r2.effects if isinstance(e, PushAdd)]
+    pushes = [e for e in r2.effects if isinstance(e, PushLoad)]
     assert len(pushes) == 1
-    assert pushes[0].track_ids == (900002,)
+    assert pushes[0].track_ids == (900000, 900001, 900002)
     assert r2.state.pending[0].retries_left == 0
 
 
@@ -520,9 +519,10 @@ def test_add_duplicate_retry_preserves_one_appended_occurrence() -> None:
         ),
     )
 
-    pushes = [effect for effect in r2.effects if isinstance(effect, PushAdd)]
+    pushes = [effect for effect in r2.effects if isinstance(effect, PushLoad)]
     assert len(pushes) == 1
-    assert pushes[0].track_ids == (900000,)
+    assert pushes[0].track_ids == (900000, 900000)
+    assert pushes[0].context_uuid == b"\xcc" * 16
 
 
 def test_insert_retry_preserves_insert_payload() -> None:
@@ -552,3 +552,4 @@ def test_insert_retry_preserves_insert_payload() -> None:
     pushes = [effect for effect in result.effects if isinstance(effect, PushInsert)]
     assert len(pushes) == 1
     assert pushes[0].track_ids == (900002,)
+    assert pushes[0].context_uuid == b"\xcc" * 16

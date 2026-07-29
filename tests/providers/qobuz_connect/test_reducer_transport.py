@@ -387,6 +387,44 @@ def test_load_ack_while_playing_plays_new_current() -> None:
     assert result.state.settling_position is True
 
 
+def test_load_ack_reanchors_settling_window_for_stale_ma_position() -> None:
+    """A track-changing load starts a fresh settle window instead of using the old anchor."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0, 1),
+        current_id=900000,
+        playing=PlayingState.PLAYING,
+        position_ms=35000,
+        position_anchor_ms=1000,
+        active=True,
+    )
+    loaded = reduce(
+        state,
+        CloudLoadAck(
+            now_ms=40000,
+            version=QueueVersion(6, 1),
+            action_uuid=b"\xcc" * 16,
+            tracks=_refs(7, 8),
+            queue_position=0,
+        ),
+    )
+    assert loaded.state.position_ms == 0
+    assert loaded.state.position_anchor_ms == 40000
+    assert loaded.state.settling_position is True
+
+    stale = reduce(
+        loaded.state,
+        MaTransportChanged(
+            now_ms=40400,
+            playing=PlayingState.PLAYING,
+            current_track_id=900007,
+            position_ms=35359,
+        ),
+    )
+    assert stale.state.position_ms == 0
+    assert stale.state.settling_position is True
+
+
 def test_load_ack_same_current_does_not_restart() -> None:
     """A reorder (shuffle) keeps the current track — audio must not restart."""
     state = CanonicalState(

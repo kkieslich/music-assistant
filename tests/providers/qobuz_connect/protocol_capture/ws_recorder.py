@@ -16,9 +16,16 @@ import datetime as dt
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from music_assistant.providers.qobuz_connect.models import (
+    OuterMessageType,
+    QConnectMessageType,
+)
+from music_assistant.providers.qobuz_connect.protocol import QobuzConnectCodec
 
 if TYPE_CHECKING:
     from playwright.async_api import BrowserContext, CDPSession, Page
@@ -171,6 +178,68 @@ class WsRecorder:
         """True if at least one matching WebSocket has been opened."""
         return bool(self._connections)
 
+    def renderer_id(self, friendly_name: str) -> int | None:
+        """Return the latest cloud renderer ID advertised for ``friendly_name``."""
+        renderer_id: int | None = None
+        for message in self._incoming_messages():
+            if (
+                message.messageType == QConnectMessageType.SRVR_CTRL_ADD_RENDERER
+                and message.HasField("srvrCtrlAddRenderer")
+                and message.srvrCtrlAddRenderer.renderer.friendlyName == friendly_name
+            ):
+                renderer_id = int(message.srvrCtrlAddRenderer.rendererId)
+        return renderer_id
+
+    def cloud_queue_track_ids(self) -> tuple[str, ...]:
+        """Reconstruct the latest cloud queue observed on this client's WebSocket."""
+        queue: list[tuple[int, str]] = []
+        for message in self._incoming_messages():
+            if message.messageType == QConnectMessageType.SRVR_CTRL_QUEUE_STATE:
+                queue = _wire_track_pairs(message.srvrCtrlQueueState.tracks)
+            elif message.messageType == QConnectMessageType.SRVR_CTRL_QUEUE_TRACKS_LOADED:
+                queue = _wire_track_pairs(message.srvrCtrlQueueTracksLoaded.tracks)
+            elif message.messageType == QConnectMessageType.SRVR_CTRL_QUEUE_TRACKS_ADDED:
+                queue.extend(_wire_track_pairs(message.srvrCtrlQueueTracksAdded.tracks))
+            elif message.messageType == QConnectMessageType.SRVR_CTRL_QUEUE_TRACKS_INSERTED:
+                event = message.srvrCtrlQueueTracksInserted
+                index = max(0, min(int(event.insertAfter), len(queue)))
+                queue[index:index] = _wire_track_pairs(event.tracks)
+            elif message.messageType == QConnectMessageType.SRVR_CTRL_QUEUE_TRACKS_REMOVED:
+                removed = set(message.srvrCtrlQueueTracksRemoved.queueItemIds)
+                queue = [item for item in queue if item[0] not in removed]
+            elif message.messageType == QConnectMessageType.SRVR_CTRL_QUEUE_TRACKS_REORDERED:
+                event = message.srvrCtrlQueueTracksReordered
+                moving_ids = tuple(event.queueItemIds)
+                moving_set = set(moving_ids)
+                by_id = dict(queue)
+                moving = [(item_id, by_id[item_id]) for item_id in moving_ids if item_id in by_id]
+                remaining = [item for item in queue if item[0] not in moving_set]
+                index = max(0, min(int(event.insertAfter), len(remaining)))
+                remaining[index:index] = moving
+                queue = remaining
+            elif message.messageType == QConnectMessageType.SRVR_CTRL_QUEUE_CLEARED:
+                queue = []
+        return tuple(track_id for _, track_id in queue)
+
+    def _incoming_messages(self) -> list[Any]:
+        """Decode all QConnect messages received by the browser client."""
+        codec = QobuzConnectCodec(uuid.uuid4().bytes)
+        messages: list[Any] = []
+        for frame in self._frames:
+            if frame.direction != "incoming":
+                continue
+            decoded = codec.decode_frame(frame.payload)
+            if (
+                decoded is None
+                or decoded.msg_type is not OuterMessageType.PAYLOAD
+                or decoded.payload is None
+            ):
+                continue
+            batch = codec.decode_qconnect_batch(decoded.payload)
+            if batch is not None:
+                messages.extend(batch.messages)
+        return messages
+
     async def wait_for_first_frame(
         self, timeout_seconds: float, poll_interval_seconds: float = 0.5
     ) -> bool:
@@ -315,3 +384,8 @@ def _decode_payload(payload_data: str, opcode: int) -> bytes:
     if decoded is not None and len(decoded) > 0:
         return decoded
     return payload_data.encode("latin1", errors="replace")
+
+
+def _wire_track_pairs(tracks: Any) -> list[tuple[int, str]]:
+    """Return cloud slot and Qobuz track IDs from wire queue refs."""
+    return [(int(track.queueItemId), str(track.trackId)) for track in tracks]
