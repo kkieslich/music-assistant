@@ -46,6 +46,7 @@ import websockets
 from websockets import ClientConnection
 
 from .models import (
+    AudioQualityReport,
     BufferState,
     ConnectTokens,
     DeviceConfig,
@@ -452,11 +453,17 @@ class QobuzConnectSession:
             )
         )
 
-    async def send_quality_reports(self, quality: int) -> None:
-        """Report device/file/max quality to Qobuz."""
-        await self.send_message(self._codec.encode_file_audio_quality_changed(quality))
-        await self.send_message(self._codec.encode_device_audio_quality_changed(quality))
-        await self.send_message(self._codec.encode_max_audio_quality_changed(quality))
+    async def send_file_quality_report(self, report: AudioQualityReport) -> bool:
+        """Report the actual current-file format to Qobuz."""
+        return await self.send_message(self._codec.encode_file_audio_quality_changed(report))
+
+    async def send_device_quality_report(self, report: AudioQualityReport) -> bool:
+        """Report a known renderer output format to Qobuz."""
+        return await self.send_message(self._codec.encode_device_audio_quality_changed(report))
+
+    async def send_max_quality_report(self, quality: int) -> bool:
+        """Report the configured maximum stream quality to Qobuz."""
+        return await self.send_message(self._codec.encode_max_audio_quality_changed(quality))
 
     async def send_message(self, data: bytes) -> bool:
         """Send an encoded websocket frame, queuing if disconnected."""

@@ -23,6 +23,7 @@ from music_assistant.providers.qobuz_connect import outbound_reporter as outboun
 from music_assistant.providers.qobuz_connect.coordinator import QobuzConnectCoordinator
 from music_assistant.providers.qobuz_connect.effect_runner import EffectRunner
 from music_assistant.providers.qobuz_connect.models import (
+    AudioQualityReport,
     BufferState,
     PlayingState,
     QueueTrackRef,
@@ -59,7 +60,7 @@ def _fake_player(player_id: str = "player_1") -> SimpleNamespace:
     )
 
 
-def _fake_qobuz_provider() -> SimpleNamespace:
+def _fake_qobuz_provider(native_quality: str = "27") -> SimpleNamespace:
     async def _get_track(track_id: str) -> Track:
         return Track(
             item_id=track_id,
@@ -69,11 +70,21 @@ def _fake_qobuz_provider() -> SimpleNamespace:
             duration=200,
         )
 
-    return SimpleNamespace(domain="qobuz", instance_id="qobuz", get_track=_get_track)
+    config = MagicMock()
+    config.get_value.return_value = native_quality
+    return SimpleNamespace(
+        domain="qobuz",
+        instance_id="qobuz",
+        config=config,
+        get_track=_get_track,
+    )
 
 
 def _make_provider(
     target_player: SimpleNamespace | None = None,
+    *,
+    max_quality: str = "27",
+    native_quality: str = "27",
 ) -> tuple[QobuzConnectProvider, MagicMock]:
     """Build a real ``QobuzConnectProvider`` against a mocked ``mass``; returns both."""
     player = target_player or _fake_player()
@@ -90,7 +101,7 @@ def _make_provider(
     mass.player_queues.play_media = AsyncMock()
     mass.player_queues.play_index = AsyncMock()
     mass.player_queues.update_items = MagicMock()
-    qobuz_provider = _fake_qobuz_provider()
+    qobuz_provider = _fake_qobuz_provider(native_quality)
     mass.get_provider.side_effect = lambda domain: qobuz_provider if domain == "qobuz" else None
 
     manifest = MagicMock()
@@ -100,7 +111,7 @@ def _make_provider(
         CONF_TARGET_PLAYER: PLAYER_ID_AUTO,
         CONF_PUBLISH_NAME: "Test Qobuz Connect",
         CONF_HTTP_PORT: 8695,
-        CONF_MAX_QUALITY: "27",
+        CONF_MAX_QUALITY: max_quality,
         CONF_INITIAL_VOLUME: 25,
     }
     config = MagicMock()
@@ -176,14 +187,15 @@ async def test_on_set_active_broadcasts_volume_and_quality_before_delegating() -
     """Activation still broadcasts MA volume + a quality report, then submits to the coordinator."""
     provider, _mass = _make_provider()
     provider._session = MagicMock()
-    provider._session.send_quality_reports = AsyncMock()
     provider._session.send_volume_changed = AsyncMock()
     provider._session.send_volume_muted = AsyncMock()
+    provider._quality_reporter = MagicMock()
+    provider._quality_reporter.report_current = AsyncMock()
 
     await provider._on_set_active(True)
 
     provider._session.send_volume_changed.assert_awaited_once()
-    provider._session.send_quality_reports.assert_awaited_once_with(provider._max_quality)
+    provider._quality_reporter.report_current.assert_awaited_once_with(provider._max_quality)
     assert provider._coordinator.state.active is True
 
 
@@ -191,18 +203,19 @@ async def test_on_set_active_false_releases_without_broadcast() -> None:
     """Deactivation does not broadcast volume/quality, only deactivates the coordinator."""
     provider, _mass = _make_provider()
     provider._session = MagicMock()
-    provider._session.send_quality_reports = AsyncMock()
     provider._session.send_volume_changed = AsyncMock()
     provider._session.send_volume_muted = AsyncMock()
+    provider._quality_reporter = MagicMock()
+    provider._quality_reporter.report_current = AsyncMock()
 
     await provider._on_set_active(True)
     provider._session.send_volume_changed.reset_mock()
-    provider._session.send_quality_reports.reset_mock()
+    provider._quality_reporter.report_current.reset_mock()
 
     await provider._on_set_active(False)
 
     provider._session.send_volume_changed.assert_not_awaited()
-    provider._session.send_quality_reports.assert_not_awaited()
+    provider._quality_reporter.report_current.assert_not_awaited()
     assert provider._coordinator.state.active is False
 
 
@@ -210,23 +223,63 @@ async def test_ma_queue_event_delegates_to_transport_and_modes() -> None:
     """QUEUE_UPDATED delegates to both the transport and modes coordinator entry points."""
     provider, _mass = _make_provider()
     provider._coordinator = AsyncMock()
+    provider._quality_reporter = MagicMock()
+    provider._quality_reporter.report_file = AsyncMock()
     event = _fake_event("player_1")
 
     await provider._on_ma_queue_event(event)
 
     provider._coordinator.on_ma_transport_event.assert_awaited_once_with("player_1")
     provider._coordinator.on_ma_modes_event.assert_awaited_once_with("player_1")
+    provider._quality_reporter.report_file.assert_awaited_once_with(None)
 
 
 async def test_ma_queue_items_event_delegates_to_queue_event() -> None:
     """QUEUE_ITEMS_UPDATED delegates to the coordinator's queue entry point."""
     provider, _mass = _make_provider()
     provider._coordinator = AsyncMock()
+    provider._quality_reporter = MagicMock()
+    provider._quality_reporter.report_file = AsyncMock()
     event = _fake_event("player_1")
 
     await provider._on_ma_queue_items_event(event)
 
     provider._coordinator.on_ma_queue_event.assert_awaited_once_with("player_1")
+    provider._quality_reporter.report_file.assert_awaited_once_with(None)
+
+
+def test_current_file_quality_reads_real_ma_stream_details() -> None:
+    """A 24/44.1 stream stays 24/44.1 even when the configured ceiling is 24/192."""
+    provider, mass = _make_provider()
+    mass.player_queues.get.return_value = SimpleNamespace(
+        current_item=SimpleNamespace(
+            streamdetails=SimpleNamespace(
+                audio_format=SimpleNamespace(
+                    content_type="flac",
+                    sample_rate=44_100,
+                    bit_depth=24,
+                    channels=2,
+                )
+            )
+        )
+    )
+
+    assert provider._current_file_quality() == AudioQualityReport(
+        quality=7,
+        sampling_rate=44_100,
+        bit_depth=24,
+        channels=2,
+    )
+
+
+def test_current_file_quality_is_unknown_until_stream_details_resolve() -> None:
+    """The provider must not invent actual properties before MA resolves the stream."""
+    provider, mass = _make_provider()
+    mass.player_queues.get.return_value = SimpleNamespace(
+        current_item=SimpleNamespace(streamdetails=None)
+    )
+
+    assert provider._current_file_quality() is None
 
 
 async def test_player_updated_event_delegates_to_volume_event() -> None:
@@ -495,6 +548,68 @@ async def test_quality_change_survives_missing_qobuz_provider() -> None:
     await provider._on_quality_change(6)  # must not raise
 
     assert provider._max_quality == 6
+
+
+async def test_connect_quality_save_failure_still_updates_native_qobuz() -> None:
+    """The two config writes are independent so one failure cannot skip the other."""
+    provider, mass = _make_provider()
+    calls: list[str] = []
+
+    async def save(domain: str, *_args: Any, **_kwargs: Any) -> None:
+        calls.append(domain)
+        if domain == provider.domain:
+            raise RuntimeError("connect save failed")
+
+    mass.config.save_provider_config = AsyncMock(side_effect=save)
+
+    await provider._on_quality_change(6)
+
+    assert calls == [provider.domain, "qobuz"]
+
+
+async def test_native_quality_save_failure_still_reports_selected_maximum() -> None:
+    """A config backend failure must not suppress the renderer's wire response."""
+    provider, mass = _make_provider()
+
+    async def save(domain: str, *_args: Any, **_kwargs: Any) -> None:
+        if domain == "qobuz":
+            raise RuntimeError("native save failed")
+
+    mass.config.save_provider_config = AsyncMock(side_effect=save)
+    provider._quality_reporter = MagicMock()
+    provider._quality_reporter.report_current = AsyncMock()
+
+    await provider._on_quality_change(7)
+
+    provider._quality_reporter.report_current.assert_awaited_once_with(7)
+
+
+async def test_ma_side_quality_update_synchronizes_native_qobuz() -> None:
+    """Changing Connect quality in MA updates the native provider stream setting."""
+    provider, mass = _make_provider()
+    config = MagicMock()
+    config.get_value.return_value = "7"
+    provider._quality_reporter = MagicMock()
+    provider._quality_reporter.report_current = AsyncMock()
+    mass.config.save_provider_config = AsyncMock()
+
+    await provider.update_config(config, {f"values/{CONF_MAX_QUALITY}"})
+
+    mass.config.save_provider_config.assert_awaited_once_with(
+        "qobuz",
+        {"quality": "7"},
+        "qobuz",
+    )
+    provider._quality_reporter.report_current.assert_awaited_once_with(7)
+
+
+def test_auto_quality_resolves_native_provider_config() -> None:
+    """Auto never reaches the wire as protocol quality zero."""
+    provider, _mass = _make_provider(max_quality="0", native_quality="7")
+
+    assert provider._configured_max_quality == 0
+    assert provider._max_quality == 7
+    assert provider._device_config.max_quality == 7
 
 
 async def test_unload_blocks_late_websocket_setup_and_reaps_timers(

@@ -190,7 +190,7 @@ class EffectRunner:
         elif isinstance(effect, PushMute):
             await self._session.send_volume_muted(effect.muted)
         elif isinstance(effect, PushQuality):
-            await self._session.send_quality_reports(effect.quality)
+            await self._session.send_max_quality_report(effect.quality)
         elif isinstance(effect, AskSnapshot):
             await self._session.send_ask_for_queue_state(
                 queue_version=effect.version,

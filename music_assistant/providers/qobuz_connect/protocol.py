@@ -36,8 +36,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from .models import (
-    QUALITY_AUDIO_PROPERTIES,
     QUALITY_TO_PROTOCOL,
+    AudioQualityReport,
     BufferState,
     LoopMode,
     OuterMessageType,
@@ -513,18 +513,14 @@ class QobuzConnectCodec:
 
     def encode_file_audio_quality_changed(
         self,
-        quality: int,
-        sampling_rate: int = 0,
-        bit_depth: int = 0,
-        nb_channels: int = 0,
+        report: AudioQualityReport,
     ) -> bytes:
         """Encode current file quality update."""
-        defaults = QUALITY_AUDIO_PROPERTIES.get(quality, (44100, 16, 2))
         quality_msg = payload_pb2.RndrSrvrFileAudioQualityChanged()
-        quality_msg.sampling_rate = sampling_rate or defaults[0]
-        quality_msg.bit_depth = bit_depth or defaults[1]
-        quality_msg.nb_channels = nb_channels or defaults[2]
-        quality_msg.audio_quality = QUALITY_TO_PROTOCOL.get(quality, 4)
+        quality_msg.sampling_rate = report.sampling_rate
+        quality_msg.bit_depth = report.bit_depth
+        quality_msg.nb_channels = report.channels
+        quality_msg.audio_quality = QUALITY_TO_PROTOCOL.get(report.quality, 4)
         msg = payload_pb2.QConnectMessage()
         msg.messageType = QConnectMessageType.RNDR_SRVR_FILE_AUDIO_QUALITY_CHANGED
         msg.rndrSrvrFileAudioQualityChanged.CopyFrom(quality_msg)
@@ -532,17 +528,13 @@ class QobuzConnectCodec:
 
     def encode_device_audio_quality_changed(
         self,
-        quality: int,
-        sampling_rate: int = 0,
-        bit_depth: int = 0,
-        nb_channels: int = 0,
+        report: AudioQualityReport,
     ) -> bytes:
         """Encode device quality update."""
-        defaults = QUALITY_AUDIO_PROPERTIES.get(quality, (44100, 16, 2))
         quality_msg = payload_pb2.RndrSrvrDeviceAudioQualityChanged()
-        quality_msg.sampling_rate = sampling_rate or defaults[0]
-        quality_msg.bit_depth = bit_depth or defaults[1]
-        quality_msg.nb_channels = nb_channels or defaults[2]
+        quality_msg.sampling_rate = report.sampling_rate
+        quality_msg.bit_depth = report.bit_depth
+        quality_msg.nb_channels = report.channels
         msg = payload_pb2.QConnectMessage()
         msg.messageType = QConnectMessageType.RNDR_SRVR_DEVICE_AUDIO_QUALITY_CHANGED
         msg.rndrSrvrDeviceAudioQualityChanged.CopyFrom(quality_msg)

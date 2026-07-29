@@ -387,9 +387,9 @@ by `session.py` / the provider.
 |       2 | `SUBSCRIBE` (outer envelope)             | `encode_subscribe`                       | `session.start()` after AUTHENTICATE (renderer: session-uuid channel; controller: empty)  |
 |      23 | `RNDR_SRVR_STATE_UPDATED`                | `encode_renderer_state`                  | `ReportState` effect / `outbound_reporter` heartbeat (5s + after every command, 1s during buffering) |
 |      25 | `RNDR_SRVR_VOLUME_CHANGED`               | `encode_volume_changed`                  | `PushVolume` effect; `_broadcast_current_volume` on connect/activate                       |
-|      26 | `RNDR_SRVR_FILE_AUDIO_QUALITY_CHANGED`   | `encode_file_audio_quality_changed`      | `session.send_quality_reports` after connect / quality change                              |
-|      27 | `RNDR_SRVR_DEVICE_AUDIO_QUALITY_CHANGED` | `encode_device_audio_quality_changed`    | same                                                                                       |
-|      28 | `RNDR_SRVR_MAX_AUDIO_QUALITY_CHANGED`    | `encode_max_audio_quality_changed`       | same                                                                                       |
+|      26 | `RNDR_SRVR_FILE_AUDIO_QUALITY_CHANGED`   | `encode_file_audio_quality_changed`      | `QualityReporter` after MA resolves current stream details                                  |
+|      27 | `RNDR_SRVR_DEVICE_AUDIO_QUALITY_CHANGED` | `encode_device_audio_quality_changed`    | omitted until the renderer output format is known                                           |
+|      28 | `RNDR_SRVR_MAX_AUDIO_QUALITY_CHANGED`    | `encode_max_audio_quality_changed`       | `QualityReporter` after connect / quality change                                            |
 |      61 | `CTRL_SRVR_JOIN_SESSION`                 | `encode_ctrl_join_session`               | `session.start()` in controller role, joining with the device deviceUuid                   |
 |      62 | `CTRL_SRVR_SET_PLAYER_STATE` (partial)   | `encode_ctrl_set_player_state`           | `PushPlayerState` effect via `session.send_ctrl_player_state` (no reducer callsite yet)    |
 |      63 | `CTRL_SRVR_SET_ACTIVE_RENDERER`          | `encode_set_active_renderer`             | `PushSetActive` effect before an MA-origin load if we aren't the active renderer            |

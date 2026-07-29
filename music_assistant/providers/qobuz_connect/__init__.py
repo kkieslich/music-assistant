@@ -66,11 +66,14 @@ from .metadata_resolver import MetadataResolver
 from .models import (
     PROTOCOL_TO_QUALITY,
     QUALITY_TO_PROTOCOL,
+    AudioQualityReport,
     ConnectTokens,
     DeviceConfig,
     JWTConnectToken,
+    quality_id_for_format,
 )
 from .outbound_reporter import OutboundReporter
+from .quality_reporter import QualityReporter
 from .session import QobuzConnectSession, SessionCallbacks
 from .sync_types import CloudSetActive
 
@@ -180,7 +183,8 @@ class QobuzConnectProvider(PluginProvider):
         self._target_player_id = cast("str", config.get_value(CONF_TARGET_PLAYER)) or PLAYER_ID_AUTO
         self._publish_name = cast("str", config.get_value(CONF_PUBLISH_NAME)) or self.name
         self._http_port = int(cast("int | str", config.get_value(CONF_HTTP_PORT)) or 8695)
-        self._max_quality = int(cast("str", config.get_value(CONF_MAX_QUALITY)) or "27")
+        self._configured_max_quality = int(cast("str", config.get_value(CONF_MAX_QUALITY)) or "27")
+        self._max_quality = self._resolve_max_quality(self._configured_max_quality)
         self._initial_volume = max(
             0,
             min(
@@ -219,6 +223,11 @@ class QobuzConnectProvider(PluginProvider):
             active_getter=lambda: (
                 self._coordinator.state.active and self._bridge.target_player_id() is not None
             ),
+            logger=self.logger,
+        )
+        self._quality_reporter = QualityReporter(
+            session_getter=lambda: self._session,
+            file_quality_getter=self._current_file_quality,
             logger=self.logger,
         )
         # EffectRunner's ``session`` parameter wants a concrete session, but
@@ -358,8 +367,17 @@ class QobuzConnectProvider(PluginProvider):
         """Handle dynamic provider config updates."""
         if changed_keys == {f"values/{CONF_MAX_QUALITY}"}:
             self.config = config
-            self._max_quality = int(cast("str", config.get_value(CONF_MAX_QUALITY)) or "27")
+            self._configured_max_quality = int(
+                cast("str", config.get_value(CONF_MAX_QUALITY)) or "27"
+            )
+            self._max_quality = self._resolve_max_quality(self._configured_max_quality)
             self._device_config.max_quality = self._max_quality
+            if self._configured_max_quality != AUTO_QUALITY:
+                try:
+                    await self._update_qobuz_stream_quality(self._max_quality)
+                except Exception as err:
+                    self.logger.warning("Failed to update native Qobuz quality: %s", err)
+            await self._quality_reporter.report_current(self._max_quality)
             return
         await super().update_config(config, changed_keys)
 
@@ -418,6 +436,17 @@ class QobuzConnectProvider(PluginProvider):
             raise InvalidDataError("The Qobuz music provider must be configured first")
         return cast("QobuzProvider", provider)
 
+    def _resolve_max_quality(self, configured_quality: int) -> int:
+        """Resolve the auto setting against the native Qobuz provider."""
+        if configured_quality != AUTO_QUALITY:
+            return _normalize_quality_id(configured_quality) or 27
+        try:
+            provider = self.get_qobuz_provider()
+            native_quality = int(cast("str", provider.config.get_value(QOBUZ_CONF_QUALITY)) or "27")
+        except AttributeError, InvalidDataError, TypeError, ValueError:
+            return 27
+        return _normalize_quality_id(native_quality) or 27
+
     def _shared_zeroconf(self) -> Any | None:
         """Return MA's shared ``Zeroconf`` instance, or ``None`` if unavailable."""
         try:
@@ -446,7 +475,7 @@ class QobuzConnectProvider(PluginProvider):
                 if tokens is not None and not self._session.is_connected:
                     self._session.set_tokens(tokens)
                 await self._broadcast_current_volume()
-                await self._session.send_quality_reports(self._max_quality)
+                await self._quality_reporter.report_current(self._max_quality)
                 return
 
             # A single controller socket, like the reference web client: joined
@@ -461,8 +490,9 @@ class QobuzConnectProvider(PluginProvider):
             if tokens is not None:
                 self._session.set_tokens(tokens)
             await self._session.start()
+            self._quality_reporter.reset()
             await self._broadcast_current_volume()
-            await self._session.send_quality_reports(self._max_quality)
+            await self._quality_reporter.report_current(self._max_quality)
             self.logger.info("Qobuz Connect WebSocket connected")
 
     def _build_session_callbacks(self) -> SessionCallbacks:
@@ -491,10 +521,10 @@ class QobuzConnectProvider(PluginProvider):
         quality = _normalize_quality_id(new_quality)
         if quality is None:
             self.logger.warning("Ignoring unsupported Qobuz Connect quality value: %s", new_quality)
-            if self._session:
-                await self._session.send_quality_reports(self._max_quality)
+            await self._quality_reporter.report_current(self._max_quality)
             return
         self.logger.info("Qobuz Connect quality changed: %s -> %s", self._max_quality, quality)
+        self._configured_max_quality = quality
         self._max_quality = quality
         self._device_config.max_quality = quality
         # This runs as a session dispatcher callback: persistence failures
@@ -502,11 +532,13 @@ class QobuzConnectProvider(PluginProvider):
         # propagate into the receive loop and cost the connection.
         try:
             await self._update_connect_quality_config(quality)
-            await self._update_qobuz_stream_quality(quality)
         except Exception as err:
             self.logger.warning("Failed to persist Qobuz Connect quality change: %s", err)
-        if self._session:
-            await self._session.send_quality_reports(quality)
+        try:
+            await self._update_qobuz_stream_quality(quality)
+        except Exception as err:
+            self.logger.warning("Failed to persist native Qobuz quality change: %s", err)
+        await self._quality_reporter.report_current(quality)
 
     async def _update_connect_quality_config(self, quality: int) -> None:
         """Persist selected Connect quality to this provider's config."""
@@ -595,8 +627,7 @@ class QobuzConnectProvider(PluginProvider):
         if active:
             self.logger.info("Qobuz Connect activated")
             await self._broadcast_current_volume()
-            if self._session:
-                await self._session.send_quality_reports(self._max_quality)
+            await self._quality_reporter.report_current(self._max_quality)
         else:
             self.logger.info("Qobuz Connect deactivated by cloud; releasing MA player")
         await self._coordinator.submit(
@@ -636,6 +667,32 @@ class QobuzConnectProvider(PluginProvider):
         duration_s = getattr(current_item, "duration", None) if current_item is not None else None
         return int(duration_s * 1000) if duration_s else 0
 
+    def _current_file_quality(self) -> AudioQualityReport | None:
+        """Return actual audio properties from the target queue's resolved stream."""
+        player_id = self._bridge.target_player_id()
+        queue = self._bridge.get_queue(player_id) if player_id else None
+        current_item = getattr(queue, "current_item", None) if queue is not None else None
+        streamdetails = (
+            getattr(current_item, "streamdetails", None) if current_item is not None else None
+        )
+        audio_format = (
+            getattr(streamdetails, "audio_format", None) if streamdetails is not None else None
+        )
+        if audio_format is None:
+            return None
+        sampling_rate = int(getattr(audio_format, "sample_rate", 0) or 0)
+        bit_depth = int(getattr(audio_format, "bit_depth", 0) or 0)
+        channels = int(getattr(audio_format, "channels", 0) or 0)
+        if sampling_rate <= 0 or bit_depth <= 0 or channels <= 0:
+            return None
+        content_type = getattr(audio_format, "content_type", "")
+        return AudioQualityReport(
+            quality=quality_id_for_format(content_type, sampling_rate, bit_depth),
+            sampling_rate=sampling_rate,
+            bit_depth=bit_depth,
+            channels=channels,
+        )
+
     async def _on_ma_queue_event(self, event: MassEvent) -> None:
         """
         Forward MA transport/mode changes (``QUEUE_UPDATED``) into the coordinator.
@@ -648,6 +705,7 @@ class QobuzConnectProvider(PluginProvider):
             return
         await self._coordinator.on_ma_transport_event(player_id)
         await self._coordinator.on_ma_modes_event(player_id)
+        await self._quality_reporter.report_file(self._current_file_quality())
 
     async def _on_ma_queue_items_event(self, event: MassEvent) -> None:
         """Forward MA queue-item mutations (``QUEUE_ITEMS_UPDATED``) into the coordinator."""
@@ -655,6 +713,7 @@ class QobuzConnectProvider(PluginProvider):
         if not player_id or event.object_id != player_id:
             return
         await self._coordinator.on_ma_queue_event(player_id)
+        await self._quality_reporter.report_file(self._current_file_quality())
 
     async def _on_ma_player_updated(self, event: MassEvent) -> None:
         """

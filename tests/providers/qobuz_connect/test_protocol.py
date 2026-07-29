@@ -7,6 +7,7 @@ from typing import Any
 
 from music_assistant.providers.qobuz_connect import _normalize_quality_id
 from music_assistant.providers.qobuz_connect.models import (
+    AudioQualityReport,
     BufferState,
     LoopMode,
     OuterMessageType,
@@ -82,6 +83,50 @@ def test_normalize_quality_id_accepts_protocol_and_qobuz_format_ids() -> None:
     assert _normalize_quality_id(7) == 7
     assert _normalize_quality_id(27) == 27
     assert _normalize_quality_id(99) is None
+
+
+def test_file_quality_report_preserves_actual_stream_format() -> None:
+    """The current-file report must not inflate 24/44.1 to the 24/192 ceiling."""
+    codec = QobuzConnectCodec(DEVICE_UUID)
+
+    msg = _first_inner_message(
+        codec.encode_file_audio_quality_changed(
+            AudioQualityReport(
+                quality=7,
+                sampling_rate=44_100,
+                bit_depth=24,
+                channels=2,
+            )
+        )
+    )
+
+    assert msg.messageType == QConnectMessageType.RNDR_SRVR_FILE_AUDIO_QUALITY_CHANGED
+    quality = msg.rndrSrvrFileAudioQualityChanged
+    assert quality.audio_quality == 3
+    assert quality.sampling_rate == 44_100
+    assert quality.bit_depth == 24
+    assert quality.nb_channels == 2
+
+
+def test_device_quality_report_preserves_known_output_format() -> None:
+    """A known device format is encoded verbatim instead of using tier defaults."""
+    codec = QobuzConnectCodec(DEVICE_UUID)
+
+    msg = _first_inner_message(
+        codec.encode_device_audio_quality_changed(
+            AudioQualityReport(
+                quality=6,
+                sampling_rate=48_000,
+                bit_depth=16,
+                channels=2,
+            )
+        )
+    )
+
+    quality = msg.rndrSrvrDeviceAudioQualityChanged
+    assert quality.sampling_rate == 48_000
+    assert quality.bit_depth == 16
+    assert quality.nb_channels == 2
 
 
 def test_encode_controller_queue_load_tracks() -> None:

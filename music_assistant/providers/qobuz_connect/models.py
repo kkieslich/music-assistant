@@ -46,6 +46,28 @@ QUALITY_AUDIO_PROPERTIES = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class AudioQualityReport:
+    """Actual audio properties for a Qobuz renderer quality report."""
+
+    quality: int
+    sampling_rate: int
+    bit_depth: int
+    channels: int
+
+
+def quality_id_for_format(content_type: object, sampling_rate: int, bit_depth: int) -> int:
+    """Return the Qobuz quality id matching an actual stream format."""
+    encoding = str(content_type).lower()
+    if "mp3" in encoding or "mpeg" in encoding:
+        return 5
+    if bit_depth <= 16:
+        return 6
+    if sampling_rate <= 96_000:
+        return 7
+    return 27
+
+
 class OuterMessageType(IntEnum):
     """Qobuz cloud websocket envelope message types."""
 
