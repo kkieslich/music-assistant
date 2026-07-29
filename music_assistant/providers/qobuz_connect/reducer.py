@@ -43,6 +43,7 @@ from .sync_types import (
     Disconnected,
     Effect,
     Event,
+    MaAdjustVolume,
     MaModesChanged,
     MaPause,
     MaPlayTrack,
@@ -52,6 +53,7 @@ from .sync_types import (
     MaResyncQueue,
     MaSeek,
     MaSetLoop,
+    MaSetMuted,
     MaSetShuffleFlag,
     MaSetVolume,
     MaTransportChanged,
@@ -386,6 +388,9 @@ def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
         new = dataclasses.replace(
             state,
             active=False,
+            activation_requested=False,
+            own_rid=None,
+            active_rid=None,
             pending=(),
             last_asked_version=QueueVersion(),
             cloud_version=QueueVersion(),
@@ -422,8 +427,11 @@ def _reduce_side(state: CanonicalState, event: Event) -> ReduceResult:
     """
     if isinstance(event, CloudVolume):
         return ReduceResult(state, (MaSetVolume(event.volume),))
-    if isinstance(event, CloudVolumeDelta | CloudMute | CloudQuality):
-        # No MA effect exists for a relative delta, mute, or quality change.
+    if isinstance(event, CloudVolumeDelta):
+        return ReduceResult(state, (MaAdjustVolume(event.delta),))
+    if isinstance(event, CloudMute):
+        return ReduceResult(state, (MaSetMuted(event.muted),))
+    if isinstance(event, CloudQuality):
         return ReduceResult(state, ())
     if isinstance(event, MaVolumeChanged):
         return ReduceResult(state, (PushVolume(event.volume), PushMute(event.muted)))
@@ -791,7 +799,11 @@ def _with_resync(new: CanonicalState) -> ReduceResult:
         return ReduceResult(new, ())
     effects: tuple[Effect, ...] = (
         MaResyncQueue(
-            track_ids=tuple(qid for t in new.tracks if (qid := _safe_qid(t)) is not None),
+            track_ids=tuple(
+                qid
+                for track in (*new.tracks, *new.autoplay_tracks)
+                if (qid := _safe_qid(track)) is not None
+            ),
             current_track_id=new.current_id,
         ),
     )

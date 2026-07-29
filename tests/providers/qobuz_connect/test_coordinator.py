@@ -14,6 +14,7 @@ from music_assistant.providers.qobuz_connect.models import (
     QueueVersion,
 )
 from music_assistant.providers.qobuz_connect.sync_types import (
+    CanonicalState,
     CloudAddRenderer,
     CloudQueueError,
     CloudRendererStateUpdated,
@@ -632,6 +633,23 @@ async def test_ma_removal_is_detected_via_unresolvable_getter() -> None:
     assert removes, runner.effects
     assert removes[0].queue_item_ids == (1,)
     assert not any(isinstance(e, PushLoad) for e in runner.effects)
+
+
+async def test_materialized_autoplay_suffix_is_not_pushed_into_main_queue() -> None:
+    """MA echoing the combined main+autoplay view is not a user ADD."""
+    coord, runner, bridge = _coordinator()
+    coord._state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=(QueueTrackRef(queue_item_id=1, track_id="100"),),
+        autoplay_tracks=(QueueTrackRef(queue_item_id=2, track_id="200"),),
+        current_id=100,
+        active=True,
+    )
+    bridge.items = [{"track_id": "100"}, {"track_id": "200"}]
+
+    await coord.on_ma_queue_event("player")
+
+    assert not any(isinstance(effect, PushAdd | PushLoad) for effect in runner.effects)
 
 
 async def test_ma_loads_get_distinct_valid_action_and_context_uuids() -> None:

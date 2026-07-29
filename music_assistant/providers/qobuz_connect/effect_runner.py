@@ -36,6 +36,7 @@ from .models import LoopMode, QueueTrackRef
 from .sync_types import (
     AskSnapshot,
     Effect,
+    MaAdjustVolume,
     MaPause,
     MaPlayTrack,
     MaReleasePlayer,
@@ -43,6 +44,7 @@ from .sync_types import (
     MaResyncQueue,
     MaSeek,
     MaSetLoop,
+    MaSetMuted,
     MaSetShuffleFlag,
     MaSetVolume,
     PushAdd,
@@ -125,6 +127,8 @@ class EffectRunner:
             | MaSetLoop
             | MaSetShuffleFlag
             | MaSetVolume
+            | MaAdjustVolume
+            | MaSetMuted
             | MaReleasePlayer,
         ):
             await self._run_ma_effect(effect)
@@ -222,6 +226,12 @@ class EffectRunner:
         elif isinstance(effect, MaSetVolume):
             if (pid := self._target_player_id("MaSetVolume")) is not None:
                 await self._bridge.cmd_volume_set(pid, effect.volume)
+        elif isinstance(effect, MaAdjustVolume):
+            if (pid := self._target_player_id("MaAdjustVolume")) is not None:
+                await self._bridge.adjust_volume(pid, effect.delta)
+        elif isinstance(effect, MaSetMuted):
+            if (pid := self._target_player_id("MaSetMuted")) is not None:
+                await self._bridge.set_muted(pid, effect.muted)
         elif isinstance(effect, MaReleasePlayer):
             await self._run_ma_release_player(effect)
 

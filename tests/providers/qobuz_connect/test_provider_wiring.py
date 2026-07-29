@@ -138,11 +138,12 @@ def test_build_session_callbacks_delegates_to_coordinator() -> None:
     callbacks = provider._build_session_callbacks()
 
     assert callbacks.submit == provider._coordinator.submit
-    assert callbacks.on_disconnected == provider._coordinator._on_disconnected
+    assert callbacks.on_disconnected == provider._on_session_disconnected
 
     # Provider-level overrides that do strictly more than the reducer.
     assert callbacks.on_set_active == provider._on_set_active
     assert callbacks.on_quality == provider._on_quality_change
+    assert callbacks.on_connected == provider._on_session_connected
 
 
 async def test_snapshot_then_activate_reaches_ma_play() -> None:
@@ -395,6 +396,33 @@ async def test_reporter_uses_current_duplicate_occurrence_index() -> None:
     assert sent["queue_item_id"] == 11
 
 
+async def test_reporter_resolves_current_autoplay_item() -> None:
+    """A continuation track reports the cloud slot from the autoplay tail."""
+    sent: dict[str, Any] = {}
+
+    class _Session:
+        async def send_renderer_state(self, **kwargs: Any) -> bool:
+            sent.update(kwargs)
+            return True
+
+    state = CanonicalState(
+        tracks=(QueueTrackRef(queue_item_id=10, track_id="100"),),
+        autoplay_tracks=(QueueTrackRef(queue_item_id=20, track_id="200"),),
+        current_id=200,
+    )
+    reporter = OutboundReporter(
+        session_getter=lambda: cast("Any", _Session()),
+        state_getter=lambda: state,
+        duration_getter=lambda: 200_000,
+        active_getter=lambda: True,
+        logger=outbound_reporter_module.LOGGER,
+    )
+
+    await reporter.report_state()
+
+    assert sent["queue_item_id"] == 20
+
+
 async def test_reporter_ships_buffering_with_frozen_anchor() -> None:
     """A BUFFERING canonical state reaches the wire as BUFFERING with a frozen (now) anchor."""
     sent: dict[str, Any] = {}
@@ -482,6 +510,36 @@ def test_current_track_duration_ms_reads_live_ma_queue() -> None:
 
     mass.player_queues.get.return_value = None
     assert provider._current_track_duration_ms() == 0
+
+
+async def test_bridge_relative_volume_clamps_and_mute_uses_ma_commands() -> None:
+    """Relative controls read current state and stay inside MA's 0-100 range."""
+    player = _fake_player()
+    player.volume_level = 3
+    provider, mass = _make_provider(player)
+    mass.players.cmd_volume_set = AsyncMock()
+    mass.players.cmd_volume_mute = AsyncMock()
+
+    await provider._bridge.adjust_volume(player.player_id, -7)
+    player.volume_level = 98
+    await provider._bridge.adjust_volume(player.player_id, 7)
+    await provider._bridge.set_muted(player.player_id, True)
+
+    assert mass.players.cmd_volume_set.await_args_list == [
+        ((player.player_id, 0),),
+        ((player.player_id, 100),),
+    ]
+    mass.players.cmd_volume_mute.assert_awaited_once_with(player.player_id, True)
+
+
+async def test_connected_log_is_emitted_only_from_confirmed_callback() -> None:
+    """Starting the background loop is distinct from a confirmed websocket connection."""
+    provider, _mass = _make_provider()
+    provider.logger = MagicMock()
+
+    await provider._on_session_connected()
+
+    provider.logger.info.assert_called_once_with("Qobuz Connect WebSocket connected")
 
 
 def test_reporter_active_getter_requires_active_and_target_player() -> None:

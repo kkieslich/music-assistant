@@ -14,6 +14,7 @@ from music_assistant.providers.qobuz_connect.models import LoopMode, PlayingStat
 from music_assistant.providers.qobuz_connect.sync_types import (
     AskSnapshot,
     Effect,
+    MaAdjustVolume,
     MaPause,
     MaPlayTrack,
     MaReleasePlayer,
@@ -21,6 +22,7 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     MaResyncQueue,
     MaSeek,
     MaSetLoop,
+    MaSetMuted,
     MaSetShuffleFlag,
     MaSetVolume,
     PushAdd,
@@ -132,6 +134,14 @@ class _FakeBridge:
     async def cmd_volume_set(self, pid: str, volume: int) -> None:
         """Record a volume-set call."""
         self.calls.append(("cmd_volume_set", (pid, volume)))
+
+    async def adjust_volume(self, pid: str, delta: int) -> None:
+        """Record a relative volume call."""
+        self.calls.append(("adjust_volume", (pid, delta)))
+
+    async def set_muted(self, pid: str, muted: bool) -> None:
+        """Record a mute call."""
+        self.calls.append(("set_muted", (pid, muted)))
 
     async def stop_queue(self, pid: str) -> None:
         """Record a stop-queue call."""
@@ -512,6 +522,18 @@ async def test_ma_set_volume_calls_bridge() -> None:
     runner = _runner(session, bridge)
     await runner.run(MaSetVolume(volume=50))
     assert ("cmd_volume_set", ("player", 50)) in bridge.calls
+
+
+async def test_ma_adjust_volume_and_mute_call_bridge() -> None:
+    """Relative and mute effects use their dedicated bridge operations."""
+    session, bridge = _FakeSession(), _FakeBridge()
+    runner = _runner(session, bridge)
+
+    await runner.run(MaAdjustVolume(delta=-7))
+    await runner.run(MaSetMuted(muted=True))
+
+    assert ("adjust_volume", ("player", -7)) in bridge.calls
+    assert ("set_muted", ("player", True)) in bridge.calls
 
 
 async def test_ma_release_player_stops_and_clears_queue() -> None:

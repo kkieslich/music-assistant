@@ -7,11 +7,17 @@ from music_assistant.providers.qobuz_connect.reducer import reduce
 from music_assistant.providers.qobuz_connect.sync_types import (
     CanonicalState,
     CloudAutoplaySet,
+    CloudAutoplayTracksLoaded,
     CloudLoopSet,
+    CloudMute,
     CloudShuffleSet,
     CloudVolume,
+    CloudVolumeDelta,
+    MaAdjustVolume,
     MaModesChanged,
+    MaResyncQueue,
     MaSetLoop,
+    MaSetMuted,
     MaSetShuffleFlag,
     MaSetVolume,
     MaVolumeChanged,
@@ -92,3 +98,35 @@ def test_cloud_autoplay_set_updates_canonical_only() -> None:
     )
     assert result.state.autoplay is True
     assert result.effects == ()
+
+
+def test_autoplay_tracks_materialize_after_main_queue_without_restarting() -> None:
+    """Autoplay continuation is part of MA's view but does not restart the main item."""
+    main = (QueueTrackRef(queue_item_id=1, track_id="100"),)
+    autoplay = (QueueTrackRef(queue_item_id=2, track_id="200"),)
+    result = reduce(
+        CanonicalState(
+            tracks=main,
+            current_id=100,
+            active=True,
+        ),
+        CloudAutoplayTracksLoaded(
+            now_ms=1,
+            version=QueueVersion(6, 1),
+            action_uuid=b"\xaa" * 16,
+            tracks=autoplay,
+        ),
+    )
+
+    resync = next(effect for effect in result.effects if isinstance(effect, MaResyncQueue))
+    assert resync.track_ids == (100, 200)
+    assert not any(effect.__class__.__name__ == "MaPlayTrack" for effect in result.effects)
+
+
+def test_cloud_volume_delta_and_mute_drive_typed_ma_effects() -> None:
+    """Relative volume and mute are not silently discarded."""
+    delta = reduce(CanonicalState(), CloudVolumeDelta(now_ms=1, delta=-7))
+    muted = reduce(CanonicalState(), CloudMute(now_ms=2, muted=True))
+
+    assert delta.effects == (MaAdjustVolume(delta=-7),)
+    assert muted.effects == (MaSetMuted(muted=True),)

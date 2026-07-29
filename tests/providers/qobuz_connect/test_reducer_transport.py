@@ -736,9 +736,17 @@ def test_disconnect_resets_cloud_version_so_a_session_reset_is_not_stale() -> No
         cloud_version=QueueVersion(84, 1),
         tracks=_refs(0, 1),
         last_asked_version=QueueVersion(84, 1),
+        own_rid=42,
+        active_rid=42,
+        active=True,
+        activation_requested=True,
     )
     dropped = reduce(state, Disconnected(now_ms=1))
     assert dropped.state.cloud_version == QueueVersion(0, 0)
+    assert dropped.state.own_rid is None
+    assert dropped.state.active_rid is None
+    assert dropped.state.activation_requested is False
+    assert dropped.state.active is False
 
     rejoined = reduce(
         dropped.state, CloudSessionState(now_ms=2, version=QueueVersion(2, 1), track_index=1)

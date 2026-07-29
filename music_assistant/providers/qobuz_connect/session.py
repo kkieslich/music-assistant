@@ -111,6 +111,7 @@ class SessionCallbacks:
     submit: Callable[[Event], Awaitable[None]]
     on_set_active: Callable[[bool], Awaitable[None]]
     on_quality: Callable[[int], Awaitable[None]]
+    on_connected: Callable[[], Awaitable[None]] | None = None
     # Fired whenever the connection loop tears down the websocket (both on
     # error and on a clean stop iteration); lets owners drop any state that
     # is only valid while connected.
@@ -505,6 +506,8 @@ class QobuzConnectSession:
                     )
                     self._is_connected = True
                     self._reconnect_delay = INITIAL_RECONNECT_DELAY
+                    if self._cb.on_connected is not None:
+                        await self._cb.on_connected()
                     await self._flush_pending_messages()
                     await self._receive_loop()
             except TokenRefreshRequired:

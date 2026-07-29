@@ -240,6 +240,13 @@ class QobuzConnectCoordinator:
                 continue
             track_ids.append(qid)
             resolvable.add(qid)
+        autoplay_ids = tuple(
+            qid
+            for ref in self._state.autoplay_tracks
+            if (qid := try_parse_qobuz_id(ref.track_id)) is not None
+        )
+        if autoplay_ids and tuple(track_ids[-len(autoplay_ids) :]) == autoplay_ids:
+            del track_ids[-len(autoplay_ids) :]
         # Resolvability is a property of the TRACK (can MA materialize it?),
         # not of the current queue contents. Canonical tracks the metadata
         # resolver never failed on count as resolvable even when absent from
@@ -392,6 +399,7 @@ class QobuzConnectCoordinator:
                 # The cloud forgets our reported volume with the session;
                 # drop the dedup so the level is re-sent after reconnect.
                 self._last_volume_state = None
+                self._owned_target_player_id = None
             if LOGGER.isEnabledFor(logging.DEBUG):
                 state = result.state
                 LOGGER.debug(

@@ -495,10 +495,7 @@ class QobuzConnectProvider(PluginProvider):
             if tokens is not None:
                 self._session.set_tokens(tokens)
             await self._session.start()
-            self._quality_reporter.reset()
-            await self._broadcast_current_volume()
-            await self._quality_reporter.report_current(self._max_quality)
-            self.logger.info("Qobuz Connect WebSocket connected")
+            self.logger.info("Qobuz Connect WebSocket session started")
 
     def _build_session_callbacks(self) -> SessionCallbacks:
         """
@@ -519,7 +516,21 @@ class QobuzConnectProvider(PluginProvider):
             callbacks,
             on_set_active=self._on_set_active,
             on_quality=self._on_quality_change,
+            on_connected=self._on_session_connected,
+            on_disconnected=self._on_session_disconnected,
         )
+
+    async def _on_session_connected(self) -> None:
+        """Log a confirmed Qobuz websocket connection."""
+        self.logger.info("Qobuz Connect WebSocket connected")
+        await self._broadcast_current_volume()
+        await self._quality_reporter.report_current(self._max_quality)
+
+    async def _on_session_disconnected(self) -> None:
+        """Reset connection-scoped reporting state."""
+        self._last_sent_muted = None
+        self._quality_reporter.reset()
+        await self._coordinator._on_disconnected()
 
     async def _on_quality_change(self, new_quality: int) -> None:
         """Remember quality selected in Qobuz app."""

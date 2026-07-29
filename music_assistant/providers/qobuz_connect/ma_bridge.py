@@ -214,3 +214,14 @@ class MABridge:
     async def cmd_volume_set(self, player_id: str, volume: int) -> None:
         """Set the player's volume."""
         await self._provider.mass.players.cmd_volume_set(player_id, volume)
+
+    async def adjust_volume(self, player_id: str, delta: int) -> None:
+        """Adjust the player's current volume and clamp it to MA's valid range."""
+        player = self.get_player(player_id)
+        if player is None or player.volume_level is None:
+            return
+        await self.cmd_volume_set(player_id, max(0, min(100, player.volume_level + delta)))
+
+    async def set_muted(self, player_id: str, muted: bool) -> None:
+        """Set the player's mute state."""
+        await self._provider.mass.players.cmd_volume_mute(player_id, muted)

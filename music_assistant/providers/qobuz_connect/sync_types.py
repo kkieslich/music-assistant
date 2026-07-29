@@ -617,6 +617,20 @@ class MaSetVolume:
 
 
 @dataclass(slots=True, frozen=True)
+class MaAdjustVolume:
+    """Instruct MA to adjust volume relative to its current level."""
+
+    delta: int
+
+
+@dataclass(slots=True, frozen=True)
+class MaSetMuted:
+    """Instruct MA to set the player mute state."""
+
+    muted: bool
+
+
+@dataclass(slots=True, frozen=True)
 class MaReleasePlayer:
     """Deactivation: instruct MA to stop and clear queue."""
 
@@ -694,5 +708,7 @@ Effect = (
     | MaSetLoop
     | MaSetShuffleFlag
     | MaSetVolume
+    | MaAdjustVolume
+    | MaSetMuted
     | MaReleasePlayer
 )

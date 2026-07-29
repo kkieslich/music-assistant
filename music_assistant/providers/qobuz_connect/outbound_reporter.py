@@ -137,11 +137,12 @@ class OutboundReporter:
         if state.current_id is None:
             return None
         current_index = self._current_index_getter()
-        if current_index is not None and 0 <= current_index < len(state.tracks):
-            indexed = state.tracks[current_index]
+        tracks = (*state.tracks, *state.autoplay_tracks)
+        if current_index is not None and 0 <= current_index < len(tracks):
+            indexed = tracks[current_index]
             if indexed.track_id == str(state.current_id):
                 return indexed
-        return next((t for t in state.tracks if t.track_id == str(state.current_id)), None)
+        return next((track for track in tracks if track.track_id == str(state.current_id)), None)
 
     def _wire_anchor(self, state: CanonicalState) -> tuple[int, int]:
         """
