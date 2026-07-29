@@ -78,10 +78,14 @@ async def _run(args: argparse.Namespace) -> int:
     async with capture_session(
         headed=args.headed, out_dir=args.out_dir, slow_mo_ms=args.slow_mo
     ) as session:
-        await scenario_fn(session)
-        path_a, path_b = await session.write_captures(args.scenario)
-        LOGGER.info("Capture A: %s", path_a)
-        LOGGER.info("Capture B: %s", path_b)
+        await session.b.qobuz.select_local_output(expected_name="Web Player Chrome")
+        try:
+            await scenario_fn(session)
+            path_a, path_b = await session.write_captures(args.scenario)
+            LOGGER.info("Capture A: %s", path_a)
+            LOGGER.info("Capture B: %s", path_b)
+        finally:
+            await session.b.qobuz.select_local_output(expected_name="Web Player Chrome")
     return 0
 
 

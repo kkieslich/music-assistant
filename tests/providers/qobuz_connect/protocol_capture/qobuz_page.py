@@ -18,6 +18,7 @@ DOM details.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -467,25 +468,51 @@ class QobuzPage:
 
     async def open_connect_picker(self) -> None:
         """Open the Qobuz Connect device-picker popover."""
+        popover = self.page.locator("#player-popover-devices")
+        if await popover.count() and await popover.first.is_visible():
+            return
         await self.page.locator(".pct-audio-output-button").first.click()
 
     async def select_connect_target(self, name: str) -> None:
         """
         Hand off playback to a Qobuz Connect target by displayed name.
 
-        :param name: Substring match against the target's visible name
-            (e.g. "Web Player Chrome" or your MA-advertised device name).
+        :param name: Exact visible target name.
         """
         await self.open_connect_picker()
-        await self.page.locator(
-            ".NetworkAudioOutputListItem",
-            has=self.page.locator(
-                ".NetworkAudioOutputListItem__content__name",
-                has_text=name,
-            ),
-        ).first.click()
+        items = self.page.locator(".NetworkAudioOutputListItem")
+        matches: list[int] = []
+        for index in range(await items.count()):
+            item_name = (
+                await items.nth(index)
+                .locator(".NetworkAudioOutputListItem__content__name")
+                .inner_text()
+            ).strip()
+            if item_name == name:
+                matches.append(index)
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"Expected exactly one Qobuz Connect target {name!r}; "
+                f"matches={len(matches)}, outputs={await self.network_output_names()!r}"
+            )
+        await items.nth(matches[0]).click()
 
-    async def select_local_output(self) -> None:
+    async def network_output_names(self) -> tuple[str, ...]:
+        """Return exact visible names from the network-output picker."""
+        await self.open_connect_picker()
+        names = self.page.locator(".NetworkAudioOutputListItem__content__name")
+        result: list[str] = []
+        for index in range(await names.count()):
+            result.append(str(await names.nth(index).inner_text()).strip())
+        return tuple(result)
+
+    async def selected_output_name(self) -> str:
+        """Return the exact currently selected output name."""
+        await self.open_connect_picker()
+        selected = self.page.locator(".AudioOutputSelected__content__main__name").first
+        return str(await selected.inner_text()).strip()
+
+    async def select_local_output(self, expected_name: str = "Web Player Chrome") -> None:
         """
         Route playback back to this browser's local audio output.
 
@@ -496,6 +523,15 @@ class QobuzPage:
         """
         await self.open_connect_picker()
         await self.page.locator(".DirectAudioOutputListItem").first.click()
+        deadline = asyncio.get_running_loop().time() + 8
+        while asyncio.get_running_loop().time() < deadline:
+            await self.page.wait_for_timeout(250)
+            if await self.selected_output_name() == expected_name:
+                return
+        raise RuntimeError(
+            f"Browser-local output did not become {expected_name!r}; "
+            f"selected={await self.selected_output_name()!r}"
+        )
 
     async def select_connect_target_other_web_player(self) -> None:
         """

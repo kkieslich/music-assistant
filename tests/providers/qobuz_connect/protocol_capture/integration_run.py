@@ -70,6 +70,7 @@ async def _run(args: argparse.Namespace) -> int:
 
     names = sorted(SCENARIOS) if args.scenario == "all" else [args.scenario]
     session_handle = None
+    session = None
     failures = 0
     try:
         session, session_handle = await open_session(ma)
@@ -80,6 +81,8 @@ async def _run(args: argparse.Namespace) -> int:
             if not result.passed:
                 failures += 1
     finally:
+        if session is not None:
+            await session.cleanup_playback()
         if session_handle is not None:
             await close_session(session_handle)
         if started_here:

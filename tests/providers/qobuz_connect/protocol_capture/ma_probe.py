@@ -186,6 +186,11 @@ class MAProbe:
         )
         self.wait_for("Qobuz Connect WebSocket connected", timeout=connect_timeout)
 
+    @property
+    def managed_pid(self) -> int | None:
+        """Return the PID of the MA process started by this probe."""
+        return self._proc.pid if self._proc is not None else None
+
     def stop(self) -> None:
         """Terminate MA if this probe started it, then restore the target player."""
         if self._proc is not None:

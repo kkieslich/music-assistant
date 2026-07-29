@@ -23,9 +23,10 @@ import logging
 import os
 import tempfile
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .audio_probe import AudioProbe
 from .harness import AUTH_DIR, _open_client
@@ -77,6 +78,128 @@ class ScenarioResult:
         self.checks.append(Check(name=name, passed=passed, detail=detail))
 
 
+@dataclass(slots=True, frozen=True)
+class PreflightResult:
+    """Outcome of the live playback safety preflight."""
+
+    checks: tuple[str, ...]
+    failures: tuple[str, ...]
+
+    @property
+    def passed(self) -> bool:
+        """Return whether every mandatory safety condition passed."""
+        return not self.failures
+
+
+class SafetyPreflight:
+    """Validate the exact managed MA and silent target before live playback."""
+
+    def __init__(
+        self,
+        *,
+        qobuz: Any,
+        ma_query_func: Callable[[str, dict[str, object]], Awaitable[object]],
+        connect_target: str,
+        managed_pid: int | None,
+    ) -> None:
+        """Store preflight dependencies."""
+        self._qobuz = qobuz
+        self._ma_query = ma_query_func
+        self._connect_target = connect_target
+        self._managed_pid = managed_pid
+
+    async def run(self) -> PreflightResult:
+        """Run every mandatory safety check."""
+        checks: list[str] = []
+        failures: list[str] = []
+        if self._managed_pid is None:
+            failures.append("No identified managed MA process is available")
+        else:
+            checks.append(f"managed MA process pid={self._managed_pid}")
+
+        provider_result = await self._ma_query(
+            "config/providers",
+            {"provider_domain": "qobuz_connect", "include_values": True},
+        )
+        providers = provider_result if isinstance(provider_result, list) else []
+        matching_providers = [
+            provider
+            for provider in providers
+            if isinstance(provider, dict)
+            and provider.get("domain") == "qobuz_connect"
+            and isinstance(provider.get("values"), dict)
+            and provider["values"].get("publish_name") == self._connect_target
+        ]
+        if len(matching_providers) != 1:
+            failures.append(
+                f"Expected exactly one loaded MA provider named {self._connect_target!r}"
+            )
+        else:
+            provider = matching_providers[0]
+            target = provider["values"].get("target_player")
+            if target != BLACKHOLE_PLAYER_ID:
+                failures.append(
+                    f"Qobuz Connect target player is {target!r}, expected BlackHole "
+                    f"{BLACKHOLE_PLAYER_ID!r}"
+                )
+            else:
+                checks.append(f"provider target={BLACKHOLE_PLAYER_ID}")
+            if provider.get("last_error"):
+                failures.append(f"Qobuz Connect provider error: {provider['last_error']}")
+
+        player_result = await self._ma_query(
+            "players/all",
+            {
+                "return_unavailable": True,
+                "return_disabled": True,
+                "return_protocol_players": False,
+            },
+        )
+        players = player_result if isinstance(player_result, list) else []
+        blackholes = [
+            player
+            for player in players
+            if isinstance(player, dict) and player.get("player_id") == BLACKHOLE_PLAYER_ID
+        ]
+        if len(blackholes) != 1:
+            failures.append(f"Expected exactly one BlackHole player {BLACKHOLE_PLAYER_ID!r}")
+        else:
+            blackhole = blackholes[0]
+            name = blackhole.get("name") or blackhole.get("display_name")
+            if (
+                name != "BlackHole 2ch"
+                or blackhole.get("provider") != "local_audio"
+                or blackhole.get("available") is not True
+            ):
+                failures.append(
+                    "BlackHole target is not the available local_audio player "
+                    f"(name={name!r}, provider={blackhole.get('provider')!r}, "
+                    f"available={blackhole.get('available')!r})"
+                )
+            else:
+                checks.append("BlackHole 2ch is available via local_audio")
+
+        outputs = await self._qobuz.network_output_names()
+        if outputs.count(self._connect_target) != 1:
+            failures.append(
+                f"Cloud renderer {self._connect_target!r} must appear exactly once; "
+                f"visible outputs={outputs!r}"
+            )
+        else:
+            checks.append(f"cloud renderer={self._connect_target}")
+
+        if not failures:
+            await self._qobuz.select_local_output(expected_name="Web Player Chrome")
+            selected = await self._qobuz.selected_output_name()
+            if selected != "Web Player Chrome":
+                failures.append(
+                    f"Browser-local output selection did not stick: selected={selected!r}"
+                )
+            else:
+                checks.append("browser-local output=Web Player Chrome")
+        return PreflightResult(checks=tuple(checks), failures=tuple(failures))
+
+
 class IntegrationSession:
     """
     A running web client + MA probe, with reset and observation helpers.
@@ -85,11 +208,18 @@ class IntegrationSession:
     :param ma: Probe attached to the live MA renderer.
     """
 
-    def __init__(self, client: ClientHandle, ma: MAProbe) -> None:
+    def __init__(
+        self,
+        client: ClientHandle,
+        ma: MAProbe,
+        preflight: SafetyPreflight,
+    ) -> None:
         """Bind a web-client controller handle to a live MA probe."""
         self.client = client
         self.ma = ma
         self.audio = AudioProbe()
+        self._preflight = preflight
+        self._safe_for_playback = False
 
     @property
     def q(self) -> QobuzPage:
@@ -107,17 +237,42 @@ class IntegrationSession:
         is freshly versioned at track index 0. Gives every scenario the same
         deterministic starting point, free of cross-run pollution.
         """
-        try:
-            await self.q.select_local_output()
-        except Exception as err:
-            LOGGER.debug("select_local_output during reset failed (non-fatal): %s", err)
+        await self.ensure_safe_for_playback()
+        await self.q.select_local_output(expected_name="Web Player Chrome")
         await asyncio.sleep(3)
         await self.q.play_album_by_url(ALBUM_URL)
         await asyncio.sleep(4)
 
     async def handoff_to_ma(self) -> None:
         """Hand playback off to the MA renderer (``Local Dev``)."""
+        await self.ensure_safe_for_playback()
         await self.q.select_connect_target(CONNECT_TARGET)
+
+    async def ensure_safe_for_playback(self) -> None:
+        """Abort unless the managed receiver is pinned to the silent BlackHole player."""
+        if self._safe_for_playback:
+            return
+        result = await self._preflight.run()
+        if not result.passed:
+            raise RuntimeError(
+                "Live playback safety preflight failed: " + "; ".join(result.failures)
+            )
+        LOGGER.info("Live playback safety preflight passed: %s", ", ".join(result.checks))
+        self._safe_for_playback = True
+
+    async def cleanup_playback(self) -> None:
+        """Stop the verified BlackHole queue and return control to browser-local output."""
+        if not self._safe_for_playback:
+            return
+        stop_error = await _ma_send("player_queues/stop", {"queue_id": BLACKHOLE_PLAYER_ID})
+        clear_error = await _ma_send("player_queues/clear", {"queue_id": BLACKHOLE_PLAYER_ID})
+        if stop_error or clear_error:
+            LOGGER.warning(
+                "BlackHole cleanup errors: stop=%s clear=%s",
+                stop_error,
+                clear_error,
+            )
+        await self.q.select_local_output(expected_name="Web Player Chrome")
 
     def observe(self, cursor: int) -> ProbeEvents:
         """Parse MA log events written since ``cursor``."""
@@ -345,7 +500,13 @@ async def open_session(
     client = await _open_client(
         browser, label="A", storage_state_path=AUTH_DIR / "client_a.json", headed=False
     )
-    session = IntegrationSession(client, ma)
+    preflight = SafetyPreflight(
+        qobuz=client.qobuz,
+        ma_query_func=ma_query,
+        connect_target=CONNECT_TARGET,
+        managed_pid=ma.managed_pid,
+    )
+    session = IntegrationSession(client, ma, preflight)
     return session, (pw, browser)
 
 
