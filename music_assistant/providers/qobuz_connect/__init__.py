@@ -25,14 +25,15 @@ Exposes:
 - ``setup``, ``get_config_entries`` (the provider-protocol hooks).
 - ``QobuzConnectProvider`` for typing.
 - Module-level constants ``CONF_TARGET_PLAYER`` / ``CONF_PUBLISH_NAME``
-  / ``CONF_HTTP_PORT`` / ``CONF_MAX_QUALITY`` / ``CONF_INITIAL_VOLUME``.
+  / ``CONF_HTTP_PORT`` / ``CONF_MAX_QUALITY`` / ``CONF_INITIAL_VOLUME``
+  / ``CONF_QOBUZ_PROVIDER``.
 
 Depends on:
 - :mod:`.discovery`, :mod:`.session`, :mod:`.coordinator`, :mod:`.effect_runner`,
   :mod:`.models`.
-- The native ``qobuz`` music provider (``mass.get_provider("qobuz")``)
-  must be configured — looked up lazily via ``get_qobuz_provider()``,
-  which raises ``InvalidDataError`` if absent.
+- The selected native ``qobuz`` music-provider instance must be configured
+  and loaded — looked up lazily via ``get_qobuz_provider()``, which raises
+  ``InvalidDataError`` if absent.
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the end-to-end flow.
 """
@@ -92,6 +93,7 @@ CONF_PUBLISH_NAME = "publish_name"
 CONF_HTTP_PORT = "http_port"
 CONF_MAX_QUALITY = "max_quality"
 CONF_INITIAL_VOLUME = "initial_volume"
+CONF_QOBUZ_PROVIDER = "qobuz_provider"
 
 PLAYER_ID_AUTO = "__auto__"
 DEFAULT_INITIAL_VOLUME = 25
@@ -113,12 +115,23 @@ async def setup(
 
 async def get_config_entries(
     mass: MusicAssistant,
-    instance_id: str | None = None,  # noqa: ARG001
+    instance_id: str | None = None,
     action: str | None = None,  # noqa: ARG001
     values: dict[str, ConfigValueType] | None = None,  # noqa: ARG001
 ) -> tuple[ConfigEntry, ...]:
     """Return config entries for this provider."""
+    qobuz_configs = await mass.config.get_provider_configs(provider_domain="qobuz")
+    default_qobuz_provider = qobuz_configs[0].instance_id if qobuz_configs else None
     return (
+        ConfigEntry(
+            key=CONF_QOBUZ_PROVIDER,
+            type=ConfigEntryType.STRING,
+            default_value=default_qobuz_provider,
+            required=True,
+            options=[
+                ConfigValueOption(config.instance_id, title=config.name) for config in qobuz_configs
+            ],
+        ),
         ConfigEntry(
             key=CONF_TARGET_PLAYER,
             type=ConfigEntryType.STRING,
@@ -145,7 +158,7 @@ async def get_config_entries(
         ConfigEntry(
             key=CONF_HTTP_PORT,
             type=ConfigEntryType.INTEGER,
-            default_value=8695,
+            default_value=await _suggest_http_port(mass, instance_id),
             required=True,
         ),
         ConfigEntry(
@@ -183,6 +196,7 @@ class QobuzConnectProvider(PluginProvider):
         self._target_player_id = cast("str", config.get_value(CONF_TARGET_PLAYER)) or PLAYER_ID_AUTO
         self._publish_name = cast("str", config.get_value(CONF_PUBLISH_NAME)) or self.name
         self._http_port = int(cast("int | str", config.get_value(CONF_HTTP_PORT)) or 8695)
+        self._qobuz_provider_id = cast("str | None", config.get_value(CONF_QOBUZ_PROVIDER))
         self._configured_max_quality = int(cast("str", config.get_value(CONF_MAX_QUALITY)) or "27")
         self._max_quality = self._resolve_max_quality(self._configured_max_quality)
         self._initial_volume = max(
@@ -436,9 +450,14 @@ class QobuzConnectProvider(PluginProvider):
 
     def get_qobuz_provider(self) -> QobuzProvider:
         """Return the configured Music Assistant Qobuz music provider."""
-        provider = self.mass.get_provider("qobuz")
-        if provider is None:
-            raise InvalidDataError("The Qobuz music provider must be configured first")
+        if not self._qobuz_provider_id:
+            raise InvalidDataError("A specific Qobuz music provider instance must be selected")
+        provider = self.mass.get_provider(self._qobuz_provider_id)
+        if provider is None or provider.domain != "qobuz":
+            raise InvalidDataError(
+                f"The selected Qobuz music provider {self._qobuz_provider_id!r} "
+                "must be configured and loaded"
+            )
         return cast("QobuzProvider", provider)
 
     def _resolve_max_quality(self, configured_quality: int) -> int:
@@ -807,6 +826,24 @@ class _LiveSessionProxy:
             return False
 
         return _noop
+
+
+async def _suggest_http_port(mass: MusicAssistant, instance_id: str | None) -> int:
+    """Return the first default HTTP port not used by another Connect instance."""
+    configs = await mass.config.get_provider_configs(
+        provider_domain="qobuz_connect",
+        include_values=True,
+    )
+    used_ports = {
+        int(cast("int | str", port))
+        for config in configs
+        if config.instance_id != instance_id
+        and (port := config.get_value(CONF_HTTP_PORT)) is not None
+    }
+    port = 8695
+    while port in used_ports:
+        port += 1
+    return port
 
 
 def _normalize_quality_id(value: int) -> int | None:

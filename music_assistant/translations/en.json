@@ -1884,6 +1884,8 @@
   "provider.qobuz_connect.config_entries.max_quality.options.6": "CD Quality 44.1kHz/16 bit",
   "provider.qobuz_connect.config_entries.max_quality.options.7": "Hi-Res 96kHz/24 bit",
   "provider.qobuz_connect.config_entries.publish_name.label": "Name shown in the Qobuz app",
+  "provider.qobuz_connect.config_entries.qobuz_provider.description": "Native Qobuz music-provider instance used to resolve tracks, fetch Connect tokens, and apply stream-quality changes.",
+  "provider.qobuz_connect.config_entries.qobuz_provider.label": "Qobuz account",
   "provider.qobuz_connect.config_entries.target_player.label": "Target Music Assistant player",
   "provider.qobuz_connect.config_entries.target_player.options.__auto__": "Auto (prefer playing player)",
   "provider.qobuz_connect.manifest.description": "Makes Music Assistant appear as a device in the official Qobuz app via Qobuz Connect.",

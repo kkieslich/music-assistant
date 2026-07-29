@@ -1,5 +1,9 @@
 {
   "config_entries": {
+    "qobuz_provider": {
+      "label": "Qobuz account",
+      "description": "Native Qobuz music-provider instance used to resolve tracks, fetch Connect tokens, and apply stream-quality changes."
+    },
     "target_player": {
       "label": "Target Music Assistant player",
       "options": {

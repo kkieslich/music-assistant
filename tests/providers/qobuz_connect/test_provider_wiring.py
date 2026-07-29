@@ -7,7 +7,9 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from music_assistant_models.enums import PlaybackState as MAPlaybackState
+from music_assistant_models.errors import InvalidDataError
 from music_assistant_models.media_items import Track
 
 from music_assistant.providers.qobuz_connect import (
@@ -15,9 +17,11 @@ from music_assistant.providers.qobuz_connect import (
     CONF_INITIAL_VOLUME,
     CONF_MAX_QUALITY,
     CONF_PUBLISH_NAME,
+    CONF_QOBUZ_PROVIDER,
     CONF_TARGET_PLAYER,
     PLAYER_ID_AUTO,
     QobuzConnectProvider,
+    get_config_entries,
 )
 from music_assistant.providers.qobuz_connect import outbound_reporter as outbound_reporter_module
 from music_assistant.providers.qobuz_connect.coordinator import QobuzConnectCoordinator
@@ -39,7 +43,6 @@ from music_assistant.providers.qobuz_connect.sync_types import (
 )
 
 if TYPE_CHECKING:
-    import pytest
     from music_assistant_models.event import MassEvent
 
 
@@ -85,6 +88,7 @@ def _make_provider(
     *,
     max_quality: str = "27",
     native_quality: str = "27",
+    qobuz_provider_id: str = "qobuz",
 ) -> tuple[QobuzConnectProvider, MagicMock]:
     """Build a real ``QobuzConnectProvider`` against a mocked ``mass``; returns both."""
     player = target_player or _fake_player()
@@ -102,7 +106,10 @@ def _make_provider(
     mass.player_queues.play_index = AsyncMock()
     mass.player_queues.update_items = MagicMock()
     qobuz_provider = _fake_qobuz_provider(native_quality)
-    mass.get_provider.side_effect = lambda domain: qobuz_provider if domain == "qobuz" else None
+    qobuz_provider.instance_id = qobuz_provider_id
+    mass.get_provider.side_effect = lambda instance_id: (
+        qobuz_provider if instance_id == qobuz_provider_id else None
+    )
 
     manifest = MagicMock()
     manifest.domain = "qobuz_connect"
@@ -113,6 +120,7 @@ def _make_provider(
         CONF_HTTP_PORT: 8695,
         CONF_MAX_QUALITY: max_quality,
         CONF_INITIAL_VOLUME: 25,
+        CONF_QOBUZ_PROVIDER: qobuz_provider_id,
     }
     config = MagicMock()
     config.instance_id = "qobuz_connect--test"
@@ -120,6 +128,75 @@ def _make_provider(
     config.get_value.side_effect = lambda key, *_a, **_k: values.get(key, "GLOBAL")
 
     return QobuzConnectProvider(mass, manifest, config), mass
+
+
+async def test_config_entries_select_qobuz_instance_and_suggest_unused_port() -> None:
+    """New instances select an account explicitly and avoid ports used by sibling instances."""
+    mass = MagicMock()
+    mass.players.all_players.return_value = []
+    qobuz_one = SimpleNamespace(instance_id="qobuz--one", name="Qobuz One")
+    qobuz_two = SimpleNamespace(instance_id="qobuz--two", name="Qobuz Two")
+    connect_one = SimpleNamespace(
+        instance_id="qobuz_connect--one",
+        get_value=lambda key: 8695 if key == CONF_HTTP_PORT else None,
+    )
+
+    async def configs(*_args: Any, provider_domain: str, **_kwargs: Any) -> list[Any]:
+        if provider_domain == "qobuz":
+            return [qobuz_one, qobuz_two]
+        if provider_domain == "qobuz_connect":
+            return [connect_one]
+        return []
+
+    mass.config.get_provider_configs = AsyncMock(side_effect=configs)
+
+    entries = await get_config_entries(mass)
+    by_key = {entry.key: entry for entry in entries}
+
+    assert [(option.value, option.title) for option in by_key[CONF_QOBUZ_PROVIDER].options] == [
+        ("qobuz--one", "Qobuz One"),
+        ("qobuz--two", "Qobuz Two"),
+    ]
+    assert by_key[CONF_QOBUZ_PROVIDER].default_value == "qobuz--one"
+    assert by_key[CONF_HTTP_PORT].default_value == 8696
+
+
+async def test_existing_instance_does_not_collide_with_itself_when_suggesting_port() -> None:
+    """Editing an instance may retain its current default port."""
+    mass = MagicMock()
+    mass.players.all_players.return_value = []
+    qobuz = SimpleNamespace(instance_id="qobuz--one", name="Qobuz One")
+    connect = SimpleNamespace(
+        instance_id="qobuz_connect--one",
+        get_value=lambda key: 8695 if key == CONF_HTTP_PORT else None,
+    )
+
+    async def configs(*_args: Any, provider_domain: str, **_kwargs: Any) -> list[Any]:
+        return [qobuz] if provider_domain == "qobuz" else [connect]
+
+    mass.config.get_provider_configs = AsyncMock(side_effect=configs)
+
+    entries = await get_config_entries(mass, instance_id="qobuz_connect--one")
+
+    assert next(entry for entry in entries if entry.key == CONF_HTTP_PORT).default_value == 8695
+
+
+def test_selected_qobuz_instance_is_used_for_streams() -> None:
+    """Native Qobuz work is routed through the explicitly selected account."""
+    provider, mass = _make_provider(qobuz_provider_id="qobuz--selected")
+
+    assert provider.get_qobuz_provider().instance_id == "qobuz--selected"
+    mass.get_provider.assert_called_with("qobuz--selected")
+
+
+def test_missing_selected_qobuz_instance_has_actionable_error() -> None:
+    """A deleted or unloaded selected account is identified by instance id."""
+    provider, mass = _make_provider(qobuz_provider_id="qobuz--missing")
+    mass.get_provider.return_value = None
+    mass.get_provider.side_effect = None
+
+    with pytest.raises(InvalidDataError, match="qobuz--missing"):
+        provider.get_qobuz_provider()
 
 
 def test_setup_constructs_coordinator_and_effect_runner() -> None:
@@ -725,7 +802,7 @@ async def test_native_quality_save_failure_still_reports_selected_maximum() -> N
 
 async def test_ma_side_quality_update_synchronizes_native_qobuz() -> None:
     """Changing Connect quality in MA updates the native provider stream setting."""
-    provider, mass = _make_provider()
+    provider, mass = _make_provider(qobuz_provider_id="qobuz--selected")
     config = MagicMock()
     config.get_value.return_value = "7"
     provider._quality_reporter = MagicMock()
@@ -737,7 +814,7 @@ async def test_ma_side_quality_update_synchronizes_native_qobuz() -> None:
     mass.config.save_provider_config.assert_awaited_once_with(
         "qobuz",
         {"quality": "7"},
-        "qobuz",
+        "qobuz--selected",
     )
     provider._quality_reporter.report_current.assert_awaited_once_with(7)
 
