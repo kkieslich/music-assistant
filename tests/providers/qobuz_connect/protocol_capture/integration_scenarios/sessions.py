@@ -111,7 +111,7 @@ async def scenario_bidirectional_edit(session: IntegrationSession) -> ScenarioRe
     await session.assert_playing_and_synced(result, "new_album")
 
     if (await session.ma_reorder(5, -3)) == "no-token":
-        result.check("skipped (no MA token; run mint_ma_token)", True)
+        result.skip("no MA token; run mint_ma_token")
         return result
 
     for round_no in range(3):

@@ -1,5 +1,5 @@
 """
-Live integration harness: one real Qobuz web client + one real MA renderer.
+Live integration harness: two real Qobuz web clients + one real MA renderer.
 
 Drives a genuine Qobuz Web Client (Playwright, the controller) against the
 real Qobuz cloud, with a real Music Assistant instance joined as the
@@ -25,6 +25,7 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -61,21 +62,43 @@ class Check:
     detail: str = ""
 
 
+class ScenarioStatus(StrEnum):
+    """Authoritative outcome of one live integration scenario."""
+
+    PASS = "pass"
+    FAIL = "fail"
+    SKIP = "skip"
+
+
 @dataclass(slots=True)
 class ScenarioResult:
     """Aggregate outcome of a scenario run."""
 
     scenario: str
     checks: list[Check] = field(default_factory=list)
+    skip_reason: str | None = None
+
+    @property
+    def status(self) -> ScenarioStatus:
+        """Return the scenario's authoritative status."""
+        if self.skip_reason is not None:
+            return ScenarioStatus.SKIP
+        if self.checks and all(check.passed for check in self.checks):
+            return ScenarioStatus.PASS
+        return ScenarioStatus.FAIL
 
     @property
     def passed(self) -> bool:
         """Return whether every check passed (and at least one ran)."""
-        return all(c.passed for c in self.checks) and bool(self.checks)
+        return self.status is ScenarioStatus.PASS
 
     def check(self, name: str, passed: bool, detail: str = "") -> None:
         """Record one named assertion outcome on this result."""
         self.checks.append(Check(name=name, passed=passed, detail=detail))
+
+    def skip(self, reason: str) -> None:
+        """Mark the scenario as not run because a required prerequisite is absent."""
+        self.skip_reason = reason
 
 
 @dataclass(slots=True, frozen=True)
@@ -98,12 +121,14 @@ class SafetyPreflight:
         self,
         *,
         qobuz: Any,
+        qobuz_observer: Any | None = None,
         ma_query_func: Callable[[str, dict[str, object]], Awaitable[object]],
         connect_target: str,
         managed_pid: int | None,
     ) -> None:
         """Store preflight dependencies."""
         self._qobuz = qobuz
+        self._qobuz_observer = qobuz_observer
         self._ma_query = ma_query_func
         self._connect_target = connect_target
         self._managed_pid = managed_pid
@@ -179,24 +204,30 @@ class SafetyPreflight:
             else:
                 checks.append("BlackHole 2ch is available via local_audio")
 
-        outputs = await self._qobuz.network_output_names()
-        if outputs.count(self._connect_target) != 1:
-            failures.append(
-                f"Cloud renderer {self._connect_target!r} must appear exactly once; "
-                f"visible outputs={outputs!r}"
-            )
-        else:
-            checks.append(f"cloud renderer={self._connect_target}")
-
-        if not failures:
-            await self._qobuz.select_local_output(expected_name="Web Player Chrome")
-            selected = await self._qobuz.selected_output_name()
-            if selected != "Web Player Chrome":
+        cloud_clients = [("A", self._qobuz)]
+        if self._qobuz_observer is not None:
+            cloud_clients.append(("B", self._qobuz_observer))
+        for label, qobuz in cloud_clients:
+            outputs = await qobuz.network_output_names()
+            if outputs.count(self._connect_target) != 1:
                 failures.append(
-                    f"Browser-local output selection did not stick: selected={selected!r}"
+                    f"Cloud renderer {self._connect_target!r} must appear exactly once "
+                    f"on client {label}; visible outputs={outputs!r}"
                 )
             else:
-                checks.append("browser-local output=Web Player Chrome")
+                checks.append(f"client {label} cloud renderer={self._connect_target}")
+
+        if not failures:
+            for label, qobuz in cloud_clients:
+                await qobuz.select_local_output(expected_name="Web Player Chrome")
+                selected = await qobuz.selected_output_name()
+                if selected != "Web Player Chrome":
+                    failures.append(
+                        f"Client {label} browser-local output selection did not stick: "
+                        f"selected={selected!r}"
+                    )
+                else:
+                    checks.append(f"client {label} browser-local output=Web Player Chrome")
         return PreflightResult(checks=tuple(checks), failures=tuple(failures))
 
 
@@ -213,9 +244,11 @@ class IntegrationSession:
         client: ClientHandle,
         ma: MAProbe,
         preflight: SafetyPreflight,
+        observer: ClientHandle | None = None,
     ) -> None:
         """Bind a web-client controller handle to a live MA probe."""
         self.client = client
+        self.observer = observer
         self.ma = ma
         self.audio = AudioProbe()
         self._preflight = preflight
@@ -225,6 +258,11 @@ class IntegrationSession:
     def q(self) -> QobuzPage:
         """The web client's page-object controller API."""
         return self.client.qobuz
+
+    @property
+    def q2(self) -> QobuzPage | None:
+        """Return the independent second Qobuz cloud observer."""
+        return self.observer.qobuz if self.observer is not None else None
 
     async def reset_to_clean_state(self) -> None:
         """
@@ -321,6 +359,11 @@ class IntegrationSession:
                 return stream.title
         return ""
 
+    def ma_current_track_id(self) -> str:
+        """Return the exact Qobuz track ID most recently reported by MA."""
+        reports = self.ma.events_since(0).reports
+        return str(reports[-1].track_id) if reports else ""
+
     def wait_for_playing(self, cursor: int, *, timeout: float = 25.0) -> ProbeEvents:
         """Wait until MA reports playing (Report state=2) after ``cursor``."""
         return self.ma.wait_for_event(
@@ -331,24 +374,31 @@ class IntegrationSession:
         self, result: ScenarioResult, name: str, *, timeout: float = 12.0
     ) -> None:
         """
-        Record a check that the app's shown track matches what MA is streaming.
+        Record a check that both apps' exact Qobuz track IDs match MA.
 
-        Polls to tolerate brief update races: passes as soon as the web
-        client's ``current_track_name`` appears within MA's most-recently
-        streamed title; fails if they stay divergent (the drift bug). Also
-        records the observed pair in the detail.
+        Polls to tolerate brief cloud/browser update races.
         """
         deadline = time.monotonic() + timeout
-        app_name = ""
-        ma_title = ""
+        app_a_id = ""
+        app_b_id = ""
+        ma_id = ""
         while time.monotonic() < deadline:
-            app_name = (await self.q.current_track_name()).lower()
-            ma_title = self.ma_current_title().lower()
-            if app_name and ma_title and app_name in ma_title:
-                result.check(name, True, detail=f"app={app_name!r} ma={ma_title!r}")
+            app_a_id = await self.q.current_track_id()
+            app_b_id = await self.q2.current_track_id() if self.q2 is not None else app_a_id
+            ma_id = self.ma_current_track_id()
+            if app_a_id and app_a_id == app_b_id == ma_id:
+                result.check(
+                    name,
+                    True,
+                    detail=f"app_a={app_a_id} app_b={app_b_id} ma={ma_id}",
+                )
                 return
             await asyncio.sleep(1.0)
-        result.check(name, False, detail=f"DRIFT app={app_name!r} ma={ma_title!r}")
+        result.check(
+            name,
+            False,
+            detail=f"DRIFT app_a={app_a_id!r} app_b={app_b_id!r} ma={ma_id!r}",
+        )
 
     async def assert_playing_and_synced(self, result: ScenarioResult, step: str) -> None:
         """Assert both real audio and app/MA track agreement for a step."""
@@ -487,7 +537,7 @@ async def open_session(
     ma: MAProbe,
 ) -> tuple[IntegrationSession, tuple[Playwright, Browser]]:
     """
-    Launch Chromium + one logged-in web client and bind it to ``ma``.
+    Launch Chromium + two logged-in web clients and bind them to ``ma``.
 
     :param ma: An already-started/attached MA probe.
     :returns: ``(session, (playwright, browser))`` — pass the second element
@@ -497,16 +547,28 @@ async def open_session(
 
     pw = await async_playwright().start()
     browser = await pw.chromium.launch(headless=True)
-    client = await _open_client(
-        browser, label="A", storage_state_path=AUTH_DIR / "client_a.json", headed=False
+    client, observer = await asyncio.gather(
+        _open_client(
+            browser,
+            label="A",
+            storage_state_path=AUTH_DIR / "client_a.json",
+            headed=False,
+        ),
+        _open_client(
+            browser,
+            label="B",
+            storage_state_path=AUTH_DIR / "client_b.json",
+            headed=False,
+        ),
     )
     preflight = SafetyPreflight(
         qobuz=client.qobuz,
+        qobuz_observer=observer.qobuz,
         ma_query_func=ma_query,
         connect_target=CONNECT_TARGET,
         managed_pid=ma.managed_pid,
     )
-    session = IntegrationSession(client, ma, preflight)
+    session = IntegrationSession(client, ma, preflight, observer)
     return session, (pw, browser)
 
 

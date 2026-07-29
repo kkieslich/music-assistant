@@ -91,8 +91,10 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 def _print_result(result: ScenarioResult) -> None:
-    status = "PASS" if result.passed else "FAIL"
+    status = result.status.value.upper()
     print(f"\n[{status}] {result.scenario}")  # noqa: T201 - CLI result output
+    if result.skip_reason is not None:
+        print(f"  - {result.skip_reason}")  # noqa: T201 - CLI result output
     for c in result.checks:
         mark = "  ✓" if c.passed else "  ✗"
         line = f"{mark} {c.name}"

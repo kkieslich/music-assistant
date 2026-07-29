@@ -24,12 +24,16 @@ import pytest
 
 from music_assistant.providers.qobuz_connect.coordinator import QobuzConnectCoordinator
 from music_assistant.providers.qobuz_connect.inbound_dispatcher import InboundDispatcher
+from music_assistant.providers.qobuz_connect.models import QConnectMessageType
+from music_assistant.providers.qobuz_connect.proto import qconnect_payload_pb2 as _payload_pb2
 from music_assistant.providers.qobuz_connect.protocol import QobuzConnectCodec
+from music_assistant.providers.qobuz_connect.session import SessionCallbacks
 
 RUNS_DIR = Path(__file__).parent / "protocol_capture" / ".runs"
 CAPTURES = sorted(RUNS_DIR.glob("*__client_*.json")) if RUNS_DIR.is_dir() else []
 # Excludes the http side-captures which share the directory.
 CAPTURES = [c for c in CAPTURES if not c.name.endswith("_http.json")]
+payload_pb2: Any = _payload_pb2
 
 
 class _NullRunner:
@@ -72,6 +76,36 @@ def _frames(capture: Path) -> list[bytes]:
     return out
 
 
+async def test_replay_observes_handler_errors_contained_by_runtime_dispatch() -> None:
+    """A skipped poison message must be visible to replay even though runtime stays alive."""
+
+    async def raise_on_submit(_event: Any) -> None:
+        raise RuntimeError("poison")
+
+    async def noop_bool(_value: Any) -> None:
+        return None
+
+    errors: list[tuple[int, Exception]] = []
+    codec = QobuzConnectCodec(uuid.uuid4().bytes)
+    dispatcher = InboundDispatcher(
+        codec,
+        SessionCallbacks(
+            submit=raise_on_submit,
+            on_set_active=noop_bool,
+            on_quality=noop_bool,
+        ),
+        on_dispatch_error=lambda message_type, error: errors.append((message_type, error)),
+    )
+    message = payload_pb2.QConnectMessage()
+    message.messageType = QConnectMessageType.CTRL_SRVR_ASK_FOR_RENDERER_STATE
+
+    await dispatcher.dispatch(message)
+
+    assert len(errors) == 1
+    assert errors[0][0] == QConnectMessageType.CTRL_SRVR_ASK_FOR_RENDERER_STATE
+    assert "poison" in str(errors[0][1])
+
+
 @pytest.mark.skipif(not CAPTURES, reason="no local protocol_capture/.runs captures")
 @pytest.mark.parametrize("capture", CAPTURES, ids=lambda c: c.stem)
 async def test_replay_capture_through_real_pipeline(capture: Path) -> None:
@@ -82,7 +116,14 @@ async def test_replay_capture_through_real_pipeline(capture: Path) -> None:
         bridge=_NullBridge(),  # type: ignore[arg-type]
         device_uuid=uuid.uuid4().bytes,
     )
-    dispatcher = InboundDispatcher(codec, coordinator.build_session_callbacks())
+    contained_errors: list[tuple[int, Exception]] = []
+    dispatcher = InboundDispatcher(
+        codec,
+        coordinator.build_session_callbacks(),
+        on_dispatch_error=lambda message_type, error: contained_errors.append(
+            (message_type, error)
+        ),
+    )
     dispatched = 0
     for index, raw in enumerate(_frames(capture)):
         outer = codec.decode_frame(raw)
@@ -110,3 +151,6 @@ async def test_replay_capture_through_real_pipeline(capture: Path) -> None:
     real_ids = [t.queue_item_id for t in state.tracks if t.queue_item_id != 0]
     assert len(real_ids) == len(set(real_ids)), "duplicate cloud queue_item_ids in canonical"
     assert dispatched > 0, f"{capture.name}: no dispatchable frames decoded"
+    assert contained_errors == [], (
+        f"{capture.name}: dispatcher contained handler errors: {contained_errors!r}"
+    )

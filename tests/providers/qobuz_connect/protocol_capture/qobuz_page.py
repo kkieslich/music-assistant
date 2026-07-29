@@ -123,6 +123,26 @@ class QobuzPage:
             return ""
         return str(await loc.inner_text()).strip()
 
+    async def current_track_id(self) -> str:
+        """Return the exact Qobuz ID at the Web Client's current queue index."""
+        snapshot = await self._player_snapshot()
+        track_ids = snapshot.get("trackIds", [])
+        current_index = snapshot.get("currentIndex")
+        if (
+            not isinstance(track_ids, list)
+            or not isinstance(current_index, int)
+            or not 0 <= current_index < len(track_ids)
+        ):
+            return ""
+        return str(track_ids[current_index])
+
+    async def queue_track_ids(self) -> tuple[str, ...]:
+        """Return the Web Client's cloud queue as exact Qobuz track IDs."""
+        track_ids = (await self._player_snapshot()).get("trackIds", [])
+        if not isinstance(track_ids, list):
+            return ()
+        return tuple(str(track_id) for track_id in track_ids)
+
     async def skip_next(self) -> None:
         """Skip to the next track."""
         await self.page.locator(".player__action-next").first.click()
@@ -569,6 +589,41 @@ class QobuzPage:
         await self.page.wait_for_load_state("networkidle", timeout=15_000)
 
     # ---- private locators -----------------------------------------------
+
+    async def _player_snapshot(self) -> dict[str, object]:
+        """Read the most recent persisted Qobuz player/queue snapshot."""
+        snapshot = await self.page.evaluate(
+            """
+            () => {
+                const candidates = Object.keys(localStorage)
+                    .filter((key) => key.startsWith("player-"))
+                    .map((key) => {
+                        try {
+                            const value = JSON.parse(localStorage.getItem(key));
+                            const queue = value?.playqueue?.data;
+                            const items = queue?.items;
+                            if (!Array.isArray(items)) return null;
+                            return {
+                                currentIndex: queue.currentIndex,
+                                trackIds: items.map((item) => item.trackId),
+                                queueVersion:
+                                    queue.queueVersion ??
+                                    queue.version ??
+                                    value?.playqueue?.version ??
+                                    null,
+                                timestamp: value?.player?.data?.position?.timestamp ?? 0,
+                            };
+                        } catch {
+                            return null;
+                        }
+                    })
+                    .filter(Boolean)
+                    .sort((a, b) => b.timestamp - a.timestamp);
+                return candidates[0] ?? {};
+            }
+            """
+        )
+        return snapshot if isinstance(snapshot, dict) else {}
 
     def _play_pause_locator(self) -> Locator:
         """

@@ -11,7 +11,10 @@ from tests.providers.qobuz_connect.protocol_capture.integration_harness import (
     BLACKHOLE_PLAYER_ID,
     IntegrationSession,
     SafetyPreflight,
+    ScenarioResult,
+    ScenarioStatus,
 )
+from tests.providers.qobuz_connect.protocol_capture.qobuz_page import QobuzPage
 
 
 class FakeQobuzPage:
@@ -176,3 +179,42 @@ async def test_reset_cannot_reach_playback_when_preflight_fails() -> None:
         await session.reset_to_clean_state()
 
     assert qobuz.played_urls == []
+
+
+def test_skipped_scenario_is_not_a_pass() -> None:
+    """A missing required live prerequisite must not produce a green run."""
+    result = ScenarioResult(scenario="required")
+
+    result.skip("no token")
+
+    assert result.status is ScenarioStatus.SKIP
+    assert not result.passed
+
+
+async def test_qobuz_page_reads_exact_track_ids_from_player_state() -> None:
+    """Browser assertions use Qobuz IDs, not ambiguous localized titles."""
+    page = SimpleNamespace(
+        evaluate=AsyncResult(
+            {
+                "currentIndex": 1,
+                "trackIds": [1065476, 1065477, 1065477],
+                "queueVersion": "12.4",
+            }
+        )
+    )
+    qobuz = QobuzPage(cast("Any", page))
+
+    assert await qobuz.current_track_id() == "1065477"
+    assert await qobuz.queue_track_ids() == ("1065476", "1065477", "1065477")
+
+
+class AsyncResult:
+    """Callable returning one awaitable fixture value."""
+
+    def __init__(self, value: object) -> None:
+        """Store the result value."""
+        self.value = value
+
+    async def __call__(self, _expression: str) -> object:
+        """Return the stored result."""
+        return self.value

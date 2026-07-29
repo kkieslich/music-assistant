@@ -8,18 +8,19 @@ Without a token each scenario records a clean SKIP.
 
 from __future__ import annotations
 
+from collections import Counter
+
 from tests.providers.qobuz_connect.protocol_capture.integration_harness import (
-    BLACKHOLE_PLAYER_ID,
     IntegrationSession,
     ScenarioResult,
     ma_play_media,
     ma_player_command,
-    ma_query,
 )
 
 ALBUM_B_IDS = set(range(3879017, 3879037))
 ALBUM_B_URI = "qobuz://album/0060694932902"
 TRACK_B_URI = "qobuz://track/3879019"  # a track within album B
+TRACK_B_ID = "3879019"
 
 
 async def _reset_ma_inactive(session: IntegrationSession) -> None:
@@ -35,7 +36,7 @@ async def scenario_initiate_album_from_ma(session: IntegrationSession) -> Scenar
     cursor = session.ma.cursor()
     err = await ma_play_media(ALBUM_B_URI)
     if err == "no-token":
-        result.check("skipped (no MA token; run mint_ma_token)", True)
+        result.skip("no MA token; run mint_ma_token")
         return result
     result.check("MA accepted play_media", err is None, detail=f"error={err}")
     ev = session.ma.wait_for_event(cursor, lambda e: bool(e.streams), timeout=25.0)
@@ -61,16 +62,22 @@ async def scenario_initiate_track_from_ma(session: IntegrationSession) -> Scenar
     cursor = session.ma.cursor()
     err = await ma_play_media(TRACK_B_URI)
     if err == "no-token":
-        result.check("skipped (no MA token; run mint_ma_token)", True)
+        result.skip("no MA token; run mint_ma_token")
         return result
     result.check("MA accepted play_media", err is None, detail=f"error={err}")
     ev = session.ma.wait_for_event(cursor, lambda e: bool(e.streams), timeout=25.0)
     result.check(
-        "MA streamed a track from album B",
-        bool(ev.streams) and ev.streams[-1].track_id in ALBUM_B_IDS,
+        "MA streamed the requested track",
+        any(str(stream.track_id) == TRACK_B_ID for stream in ev.streams),
         detail=f"streams={[s.track_id for s in ev.streams]}",
     )
     session.assert_sound(result, "audio plays for MA-initiated track")
+    await session.assert_in_sync(result, "both apps and MA show requested track")
+    result.check(
+        "requested track remained current",
+        session.ma_current_track_id() == TRACK_B_ID,
+        detail=f"requested={TRACK_B_ID} current={session.ma_current_track_id()}",
+    )
     return result
 
 
@@ -79,7 +86,7 @@ async def scenario_ma_skip(session: IntegrationSession) -> ScenarioResult:
     result = ScenarioResult(scenario="ma_skip")
     await _reset_ma_inactive(session)
     if await ma_play_media(ALBUM_B_URI) == "no-token":
-        result.check("skipped (no MA token)", True)
+        result.skip("no MA token")
         return result
     session.wait_for_stream(session.ma.cursor(), timeout=25.0)
     cursor = session.ma.cursor()
@@ -99,7 +106,7 @@ async def scenario_ma_pause(session: IntegrationSession) -> ScenarioResult:
     result = ScenarioResult(scenario="ma_pause")
     await _reset_ma_inactive(session)
     if await ma_play_media(ALBUM_B_URI) == "no-token":
-        result.check("skipped (no MA token)", True)
+        result.skip("no MA token")
         return result
     session.wait_for_stream(session.ma.cursor(), timeout=25.0)
     session.assert_sound(result, "sound before MA pause")
@@ -111,37 +118,37 @@ async def scenario_ma_pause(session: IntegrationSession) -> ScenarioResult:
 
 
 async def scenario_ma_queue_edit(session: IntegrationSession) -> ScenarioResult:
-    """Enqueuing a track on MA grows MA's queue (proposal path)."""
+    """Enqueuing a track on MA adds that exact occurrence to both cloud clients."""
     result = ScenarioResult(scenario="ma_queue_edit")
     await _reset_ma_inactive(session)
     if await ma_play_media(ALBUM_B_URI) == "no-token":
-        result.check("skipped (no MA token)", True)
+        result.skip("no MA token")
         return result
     session.wait_for_stream(session.ma.cursor(), timeout=25.0)
 
-    async def _queue_len() -> int:
-        # Read MA's ACTUAL queue length rather than the canonical cloud
-        # track count from the reduce log: an MA-initiated edit while MA is
-        # inactive drives optimistic proposals that make the cloud count
-        # churn (load/reject/rebase) before it converges, so the reduce-log
-        # `tracks` is an unreliable baseline for "did MA's queue grow".
-        items = await ma_query(
-            "player_queues/items", {"queue_id": BLACKHOLE_PLAYER_ID, "limit": 500}
-        )
-        return len(items) if isinstance(items, list) else -1
-
-    base_len = await _queue_len()
+    before_a = await session.q.queue_track_ids()
+    before_b = await session.q2.queue_track_ids() if session.q2 is not None else ()
+    result.check(
+        "both clients start from the same cloud queue",
+        bool(before_a) and before_a == before_b,
+        detail=f"a={before_a} b={before_b}",
+    )
     await ma_play_media(TRACK_B_URI, option="add")
-    grew = False
+    converged = False
+    after_a: tuple[str, ...] = ()
+    after_b: tuple[str, ...] = ()
     for _ in range(20):
         await session.q.page.wait_for_timeout(1000)
-        if await _queue_len() > base_len:
-            grew = True
+        after_a = await session.q.queue_track_ids()
+        after_b = await session.q2.queue_track_ids() if session.q2 is not None else ()
+        added = Counter(after_a) - Counter(before_a)
+        if after_a == after_b and added == Counter({TRACK_B_ID: 1}):
+            converged = True
             break
     result.check(
-        "MA queue changed after MA-side enqueue",
-        grew,
-        detail=f"MA queue grew past {base_len} items? {grew}",
+        "both clients received exactly the requested added occurrence",
+        converged,
+        detail=f"before={before_a} after_a={after_a} after_b={after_b}",
     )
     return result
 

@@ -1,7 +1,8 @@
 # Qobuz Connect live integration harness
 
-Automated end-to-end tests that drive a **real Qobuz Web Client** (Playwright,
-acting as the controller/phone) against the **real Qobuz cloud**, with a
+Automated end-to-end tests that drive **two real Qobuz Web Clients** (Playwright,
+one acting as the controller and one as an independent cloud observer) against the
+**real Qobuz cloud**, with a
 **real Music Assistant** instance joined as the `Local Dev` Connect renderer.
 This replaces hand-testing on physical hardware: each scenario resets to a
 clean state, performs one controller action, and asserts MA's observable
@@ -31,10 +32,11 @@ during a run.
   BlackHole target on managed start/stop, and parses the debug log into
   structured events (`ReduceTrace`, `StreamStart`, `Report`) with
   condition-based `wait_for_event`.
-- `integration_harness.py` — one logged-in web client + the MA probe + an
+- `integration_harness.py` — two logged-in web clients + the MA probe + an
   `AudioProbe`; `reset_to_clean_state()`, condition waits
   (`wait_for_stream`/`wait_for_sound`/`wait_for_silence`), audio assertions,
-  and `ma_play_media`/`ma_player_command` (authenticated MA WS commands).
+  exact Qobuz track-ID/queue convergence assertions, and
+  `ma_play_media`/`ma_player_command` (authenticated MA WS commands).
 - `integration_scenarios/` — the scenario package: `app_driven`, `modes_volume`,
   `ma_driven`.
 - `mint_ma_token.py` — one-time MA token minting for the MA-driven scenarios.
@@ -45,15 +47,16 @@ during a run.
 1. Playwright + Chromium: `uv pip install --python .venv/bin/python playwright`
    then `.venv/bin/python -m playwright install chromium`.
 2. `ffmpeg` on PATH and the `BlackHole 2ch` device installed.
-3. A persisted Qobuz login at `.auth/client_a.json` (first run must be headed
-   to log in once; see `harness.py`).
+3. Persisted Qobuz logins at `.auth/client_a.json` and `.auth/client_b.json`
+   (first run must be headed to log in once; see `harness.py`).
 4. An MA data dir (`.mass-data`) with the `qobuz` and `qobuz_connect` providers
    configured. The managed runner pins the Connect target to BlackHole
    automatically and restores it on stop; when attaching to your own MA, pin
    `target_player` to BlackHole yourself so runs make no audible sound.
 5. For MA-driven scenarios: an MA token —
    `MA_USER=<u> MA_PASS=<p> .venv/bin/python -m tests.providers.qobuz_connect.protocol_capture.mint_ma_token`
-   writes `.auth/ma_token`. Without it those scenarios skip cleanly.
+   writes `.auth/ma_token`. A missing token marks those scenarios `SKIP`;
+   `--scenario all` treats a required skip as a nonzero run.
 
 ## Running
 
@@ -108,7 +111,7 @@ there is no stable web autoplay control (see `QobuzPage.toggle_mute`).
 | --- | --- |
 | `initiate_album_from_ma` / `initiate_track_from_ma` | Starting Qobuz content on MA plays it with sound and claims the cloud renderer role. |
 | `ma_skip` / `ma_pause` | MA-side skip/pause behave (advance / silence-then-resume). |
-| `ma_queue_edit` | An MA-side enqueue grows the cloud queue. |
+| `ma_queue_edit` | Both clients receive exactly the requested added Qobuz track occurrence. |
 
 These scenarios also serve as regression protection against future MA and
 Qobuz cloud/protocol changes: when the cloud behaviour shifts, extend or

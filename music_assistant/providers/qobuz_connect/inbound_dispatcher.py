@@ -68,7 +68,13 @@ def _format_track_ref(ref: Any) -> str:
 class InboundDispatcher:
     """Routes a decoded inner ``QConnectMessage`` to the right callback."""
 
-    __slots__ = ("_cb", "_codec", "_logger", "_on_error_message")
+    __slots__ = (
+        "_cb",
+        "_codec",
+        "_logger",
+        "_on_dispatch_error",
+        "_on_error_message",
+    )
 
     def __init__(
         self,
@@ -77,6 +83,7 @@ class InboundDispatcher:
         *,
         label: str = "",
         on_error_message: Callable[[str], Awaitable[None]] | None = None,
+        on_dispatch_error: Callable[[int, Exception], None] | None = None,
     ) -> None:
         """
         Hold the codec + callback bundle this dispatcher will fan out to.
@@ -89,11 +96,14 @@ class InboundDispatcher:
         :param on_error_message: Optional hook invoked for message-level
             errors (``messageType`` 1) — the shape the cloud uses to reject
             frames from a deregistered renderer.
+        :param on_dispatch_error: Optional observer for exceptions contained
+            at the per-message boundary.
         """
         self._codec = codec
         self._cb = callbacks
         self._logger = LOGGER.getChild(label) if label else LOGGER
         self._on_error_message = on_error_message
+        self._on_dispatch_error = on_dispatch_error
 
     async def dispatch(self, msg: Any) -> None:
         """Parse and forward a single inner message."""
@@ -107,10 +117,12 @@ class InboundDispatcher:
             # churn. One bad message must never cost the connection.
             try:
                 await handler(self, msg)
-            except Exception:
+            except Exception as err:
                 self._logger.exception(
                     "Error handling Qobuz Connect message type %s; message skipped", msg_type
                 )
+                if self._on_dispatch_error is not None:
+                    self._on_dispatch_error(msg_type, err)
             return
         if msg_type in _KNOWN_IGNORED_MESSAGE_TYPES:
             self._logger.debug("Qobuz broadcast ignored: type=%s", msg_type)
