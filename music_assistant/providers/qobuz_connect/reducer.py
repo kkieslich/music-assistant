@@ -892,14 +892,14 @@ def _rebase_proposal(state: CanonicalState, proposal: Proposal, version: QueueVe
             kind = ProposalKind.LOAD
             payload = target_ids
     elif kind is ProposalKind.INSERT:
-        inserted = _removed_if_subsequence(target_ids, canonical_ids)
+        inserted = _consume_subsequence(target_ids, canonical_ids)
         if inserted is None:
             kind = ProposalKind.LOAD
             payload = target_ids
         else:
             payload = inserted
     elif kind is ProposalKind.REMOVE:
-        removed = _removed_if_subsequence(canonical_ids, target_ids)
+        removed = _consume_subsequence(canonical_ids, target_ids)
         if removed is None:
             kind = ProposalKind.LOAD
             payload = target_ids
@@ -921,21 +921,21 @@ def _rebase_proposal(state: CanonicalState, proposal: Proposal, version: QueueVe
 _SUBSEQ_DONE = object()
 
 
-def _removed_if_subsequence(
-    canonical_ids: tuple[int, ...], target_ids: tuple[int, ...]
+def _consume_subsequence(
+    source: tuple[int, ...], target: tuple[int, ...]
 ) -> tuple[int, ...] | None:
     """
-    Return the ids removed to turn ``canonical_ids`` into ``target_ids``.
+    Return source occurrences left after consuming ``target`` left-to-right.
 
-    ``target_ids`` must be an order-preserving, multiset-aware subsequence of
-    ``canonical_ids`` (a pure removal, no reorder), else ``None``. Duplicates
+    ``target`` must be an order-preserving, multiset-aware subsequence of
+    ``source`` (a pure removal, no reorder), else ``None``. Duplicates
     are consumed first-match, so dropping one of two identical ids yields
     exactly one removed id.
     """
     removed: list[int] = []
-    remaining = iter(target_ids)
+    remaining = iter(target)
     expected: object = next(remaining, _SUBSEQ_DONE)
-    for qid in canonical_ids:
+    for qid in source:
         if qid == expected:
             expected = next(remaining, _SUBSEQ_DONE)
         else:
@@ -943,6 +943,23 @@ def _removed_if_subsequence(
     if expected is not _SUBSEQ_DONE:
         return None
     return tuple(removed)
+
+
+def _match_occurrences(
+    refs: tuple[QueueTrackRef, ...], ids: tuple[int, ...]
+) -> tuple[QueueTrackRef, ...] | None:
+    """Match Qobuz ids to distinct canonical refs in left-to-right order."""
+    remaining = list(refs)
+    matched: list[QueueTrackRef] = []
+    for qid in ids:
+        index = next(
+            (idx for idx, ref in enumerate(remaining) if _safe_qid(ref) == qid),
+            None,
+        )
+        if index is None:
+            return None
+        matched.append(remaining.pop(index))
+    return tuple(matched)
 
 
 def _diff_ma_list(state: CanonicalState, event: MaQueueChanged) -> Proposal | None:
@@ -973,14 +990,14 @@ def _diff_ma_list(state: CanonicalState, event: MaQueueChanged) -> Proposal | No
         # Positional tail against the resolvable-filtered canonical prefix —
         # preserves duplicate ids, unlike a set-membership filter would.
         push_payload_ids = event.track_ids[len(canonical_ids) :]
-    elif (removed := _removed_if_subsequence(canonical_ids, event.track_ids)) is not None:
+    elif (removed := _consume_subsequence(canonical_ids, event.track_ids)) is not None:
         # A pure removal: the new list is an order-preserving subsequence of
         # canonical. Carry the REMOVED qids in push_payload_ids (translated to
         # cloud slot ids at emit time); target_track_ids stays the survivor
         # list that the CloudTracksRemoved echo folds into canonical.
         kind = ProposalKind.REMOVE
         push_payload_ids = removed
-    elif set(event.track_ids) == set(canonical_ids):
+    elif sorted(event.track_ids) == sorted(canonical_ids):
         kind = ProposalKind.REORDER
         push_payload_ids = ()  # translated to slot ids at emit time.
     else:
@@ -1054,14 +1071,11 @@ def _emit_push(state: CanonicalState, proposal: Proposal) -> Effect:
         # survivors in target_track_ids — to cloud queue_item_ids; the wire
         # remove command speaks slot ids. target_track_ids stays the survivor
         # list that _confirm_proposal folds into canonical on the echo.
+        matched = _match_occurrences(state.tracks, proposal.push_payload_ids) or ()
         return PushRemove(
             action_uuid=proposal.action_uuid,
             base_version=proposal.base_version,
-            queue_item_ids=tuple(
-                item
-                for q in proposal.push_payload_ids
-                if (item := _item_id_for_qid(state, q)) is not None
-            ),
+            queue_item_ids=tuple(ref.queue_item_id for ref in matched),
         )
     if proposal.kind is ProposalKind.REORDER:
         # The wire command speaks cloud queue_item_ids (slots), not Qobuz
@@ -1069,14 +1083,11 @@ def _emit_push(state: CanonicalState, proposal: Proposal) -> Effect:
         # correspondence against ``state``. A REORDER is same-set by
         # construction, so every target id is present in canonical and the
         # translation is total.
+        matched = _match_occurrences(state.tracks, proposal.target_track_ids) or ()
         return PushReorder(
             action_uuid=proposal.action_uuid,
             base_version=proposal.base_version,
-            queue_item_ids=tuple(
-                item
-                for q in proposal.target_track_ids
-                if (item := _item_id_for_qid(state, q)) is not None
-            ),
+            queue_item_ids=tuple(ref.queue_item_id for ref in matched),
             insert_after=0,
         )
     raise NotImplementedError(f"push mapping for {proposal.kind} lands in a later task")
@@ -1093,11 +1104,3 @@ def _safe_qid(ref: QueueTrackRef) -> int | None:
         return int(ref.track_id)
     except ValueError:
         return None
-
-
-def _item_id_for_qid(state: CanonicalState, qid: int) -> int | None:
-    """Translate a Qobuz track id to its cloud queue_item_id, if known."""
-    for t in state.tracks:
-        if _safe_qid(t) == qid:
-            return t.queue_item_id
-    return None

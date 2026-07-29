@@ -223,6 +223,7 @@ class QobuzConnectProvider(PluginProvider):
             active_getter=lambda: (
                 self._coordinator.state.active and self._bridge.target_player_id() is not None
             ),
+            current_index_getter=self._current_queue_index,
             logger=self.logger,
         )
         self._quality_reporter = QualityReporter(
@@ -666,6 +667,13 @@ class QobuzConnectProvider(PluginProvider):
         current_item = getattr(queue, "current_item", None) if queue is not None else None
         duration_s = getattr(current_item, "duration", None) if current_item is not None else None
         return int(duration_s * 1000) if duration_s else 0
+
+    def _current_queue_index(self) -> int | None:
+        """Return the target MA queue's current occurrence index."""
+        player_id = self._bridge.target_player_id()
+        queue = self._bridge.get_queue(player_id) if player_id else None
+        current_index = getattr(queue, "current_index", None) if queue is not None else None
+        return current_index if isinstance(current_index, int) else None
 
     def _current_file_quality(self) -> AudioQualityReport | None:
         """Return actual audio properties from the target queue's resolved stream."""

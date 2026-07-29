@@ -340,6 +340,36 @@ async def test_reporter_emits_canonical_state_with_live_duration() -> None:
     assert sent["duration_ms"] == 200_000
 
 
+async def test_reporter_uses_current_duplicate_occurrence_index() -> None:
+    """The second copy of a repeated track reports its own cloud queue-item id."""
+    sent: dict[str, Any] = {}
+
+    class _Session:
+        async def send_renderer_state(self, **kwargs: Any) -> bool:
+            sent.update(kwargs)
+            return True
+
+    state = CanonicalState(
+        tracks=(
+            QueueTrackRef(queue_item_id=10, track_id="501"),
+            QueueTrackRef(queue_item_id=11, track_id="501"),
+        ),
+        current_id=501,
+    )
+    reporter = OutboundReporter(
+        session_getter=lambda: cast("Any", _Session()),
+        state_getter=lambda: state,
+        duration_getter=lambda: 200_000,
+        active_getter=lambda: True,
+        current_index_getter=lambda: 1,
+        logger=outbound_reporter_module.LOGGER,
+    )
+
+    await reporter.report_state()
+
+    assert sent["queue_item_id"] == 11
+
+
 async def test_reporter_ships_buffering_with_frozen_anchor() -> None:
     """A BUFFERING canonical state reaches the wire as BUFFERING with a frozen (now) anchor."""
     sent: dict[str, Any] = {}

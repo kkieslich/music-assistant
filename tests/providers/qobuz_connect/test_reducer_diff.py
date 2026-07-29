@@ -130,6 +130,34 @@ def test_removal_of_duplicate_removes_only_one_occurrence() -> None:
     assert push.queue_item_ids == (0,)  # first matching slot
 
 
+def test_removing_two_duplicate_occurrences_uses_two_distinct_slots() -> None:
+    """Occurrence translation must never reuse the first matching cloud slot."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=(
+            QueueTrackRef(queue_item_id=10, track_id="900000"),
+            QueueTrackRef(queue_item_id=11, track_id="900000"),
+            QueueTrackRef(queue_item_id=12, track_id="900002"),
+        ),
+        current_id=900002,
+        active=True,
+    )
+    result = reduce(
+        state,
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xaa" * 16,
+            track_ids=(900002,),
+            current_track_id=900002,
+            resolvable=frozenset({900000, 900002}),
+        ),
+    )
+
+    push = result.effects[0]
+    assert isinstance(push, PushRemove)
+    assert push.queue_item_ids == (10, 11)
+
+
 def test_removal_plus_reorder_falls_back_to_load() -> None:
     """A removal combined with a reorder is not a clean subsequence -> LOAD."""
     result = reduce(
@@ -143,6 +171,32 @@ def test_removal_plus_reorder_falls_back_to_load() -> None:
         ),
     )
     assert len(result.state.pending) == 1
+    assert result.state.pending[0].kind is ProposalKind.LOAD
+
+
+def test_changed_duplicate_multiplicity_falls_back_to_load() -> None:
+    """Equal sets with unequal occurrence counts are not a valid REORDER."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=(
+            QueueTrackRef(queue_item_id=10, track_id="900000"),
+            QueueTrackRef(queue_item_id=11, track_id="900000"),
+            QueueTrackRef(queue_item_id=12, track_id="900002"),
+        ),
+        current_id=900000,
+        active=True,
+    )
+    result = reduce(
+        state,
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xaa" * 16,
+            track_ids=(900000, 900002, 900002),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900002}),
+        ),
+    )
+
     assert result.state.pending[0].kind is ProposalKind.LOAD
 
 
@@ -280,6 +334,35 @@ def test_reorder_pushes_full_target_order_with_insert_after_zero() -> None:
     # their cloud slot ids (2, 0, 1) via the canonical correspondence.
     assert push.queue_item_ids == (2, 0, 1)
     assert push.insert_after == 0
+
+
+def test_reorder_with_duplicates_consumes_each_cloud_slot_once() -> None:
+    """Repeated Qobuz IDs retain distinct occurrence identity in a REORDER."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=(
+            QueueTrackRef(queue_item_id=10, track_id="900000"),
+            QueueTrackRef(queue_item_id=11, track_id="900000"),
+            QueueTrackRef(queue_item_id=12, track_id="900002"),
+        ),
+        current_id=900000,
+        active=True,
+    )
+    result = reduce(
+        state,
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xaa" * 16,
+            track_ids=(900000, 900002, 900000),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900002}),
+        ),
+    )
+
+    push = result.effects[0]
+    assert isinstance(push, PushReorder)
+    assert push.queue_item_ids == (10, 12, 11)
+    assert len(set(push.queue_item_ids)) == 3
 
 
 def test_diff_matches_by_qobuz_id_not_slot() -> None:

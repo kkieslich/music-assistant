@@ -43,6 +43,7 @@ class OutboundReporter:
 
     __slots__ = (
         "_active_getter",
+        "_current_index_getter",
         "_duration_getter",
         "_heartbeat_task",
         "_logger",
@@ -58,6 +59,7 @@ class OutboundReporter:
         duration_getter: Callable[[], int],
         active_getter: Callable[[], bool],
         logger: logging.Logger,
+        current_index_getter: Callable[[], int | None] = lambda: None,
     ) -> None:
         """
         Bind the reporter to explicit getters for everything it reports.
@@ -69,11 +71,13 @@ class OutboundReporter:
         :param active_getter: Returns whether the heartbeat should report — active
             AND a target player exists.
         :param logger: Logger for report/heartbeat diagnostics.
+        :param current_index_getter: Returns MA's current queue occurrence index.
         """
         self._session_getter = session_getter
         self._state_getter = state_getter
         self._duration_getter = duration_getter
         self._active_getter = active_getter
+        self._current_index_getter = current_index_getter
         self._logger = logger
         self._heartbeat_task: asyncio.Task[None] | None = None
 
@@ -132,6 +136,11 @@ class OutboundReporter:
         """Resolve the canonical current track (by Qobuz id) to its queue-item ref."""
         if state.current_id is None:
             return None
+        current_index = self._current_index_getter()
+        if current_index is not None and 0 <= current_index < len(state.tracks):
+            indexed = state.tracks[current_index]
+            if indexed.track_id == str(state.current_id):
+                return indexed
         return next((t for t in state.tracks if t.track_id == str(state.current_id)), None)
 
     def _wire_anchor(self, state: CanonicalState) -> tuple[int, int]:

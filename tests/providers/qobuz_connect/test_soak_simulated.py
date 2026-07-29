@@ -270,10 +270,7 @@ class _EventStorm:
                 message="stale version",
             )
         if choice == "ma_queue":
-            # Sampled without replacement: duplicate-track queues are a known
-            # weak spot (placeholder refs share queue_item_id 0) and would
-            # trip the uniqueness invariant before anything else could.
-            ids = tuple(self.rng.sample(QID_POOL, k=self.rng.randint(0, 20)))
+            ids = tuple(self.rng.choices(QID_POOL, k=self.rng.randint(0, 20)))
             return MaQueueChanged(
                 now_ms=now,
                 action_uuid=self._uuid(),
