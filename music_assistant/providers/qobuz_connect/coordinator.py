@@ -261,6 +261,7 @@ class QobuzConnectCoordinator:
                 track_ids=tuple(track_ids),
                 current_track_id=current_track_id,
                 resolvable=frozenset(resolvable),
+                context_uuid=uuid.uuid4().bytes,
             )
         )
 

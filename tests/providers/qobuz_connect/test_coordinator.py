@@ -553,6 +553,36 @@ async def test_ma_removal_is_detected_via_unresolvable_getter() -> None:
     assert not any(isinstance(e, PushLoad) for e in runner.effects)
 
 
+async def test_ma_loads_get_distinct_valid_action_and_context_uuids() -> None:
+    """The coordinator mints both UUIDs at the impure boundary for every LOAD."""
+    coord, runner, bridge = _coordinator()
+    await coord._submit(
+        CloudSnapshot(
+            now_ms=1,
+            version=QueueVersion(5, 1),
+            tracks=_refs(0, 1),
+            autoplay_tracks=(),
+            shuffle=False,
+            autoplay=False,
+            track_index=1,
+        )
+    )
+    await coord._submit(CloudSetActive(now_ms=2, active=True))
+    runner.effects.clear()
+
+    bridge.items = [{"track_id": "200"}, {"track_id": "201"}]
+    await coord.on_ma_queue_event("player")
+    bridge.items = [{"track_id": "300"}, {"track_id": "301"}]
+    await coord.on_ma_queue_event("player")
+
+    loads = [effect for effect in runner.effects if isinstance(effect, PushLoad)]
+    assert len(loads) == 2
+    assert all(len(effect.action_uuid) == 16 and any(effect.action_uuid) for effect in loads)
+    assert all(len(effect.context_uuid) == 16 and any(effect.context_uuid) for effect in loads)
+    assert loads[0].action_uuid != loads[1].action_uuid
+    assert loads[0].context_uuid != loads[1].context_uuid
+
+
 async def test_ma_removal_of_unresolvable_track_is_not_a_change() -> None:
     """A track MA could never materialize disappearing from MA is not a user removal."""
     runner = _RecordingRunner()

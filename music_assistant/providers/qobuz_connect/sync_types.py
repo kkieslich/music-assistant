@@ -92,6 +92,7 @@ class Proposal:
     current_track_id: int | None  # Qobuz track ID.
     retries_left: int = 1
     push_payload_ids: tuple[int, ...] = ()
+    context_uuid: bytes = b""
     """
     Qobuz track ids to actually send on the wire for LOAD/ADD/INSERT — the
     full list for LOAD, the appended tail for ADD, the inserted ids for
@@ -390,6 +391,7 @@ class MaQueueChanged:
     track_ids: tuple[int, ...]  # Qobuz track IDs.
     current_track_id: int | None  # Qobuz track ID.
     resolvable: frozenset[int]  # Qobuz track IDs MA could materialize.
+    context_uuid: bytes = b""
 
 
 @dataclass(slots=True, frozen=True)

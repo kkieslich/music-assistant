@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 from music_assistant.providers.qobuz_connect.models import QueueTrackRef, QueueVersion
 from music_assistant.providers.qobuz_connect.reducer import reduce
 from music_assistant.providers.qobuz_connect.sync_types import (
     CanonicalState,
+    CloudCleared,
     CloudQueueError,
     CloudTracksAdded,
     CloudTracksRemoved,
@@ -15,6 +18,8 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     ProposalKind,
     ProposalTimeout,
     PushAdd,
+    PushInsert,
+    PushLoad,
     PushRemove,
     PushReorder,
 )
@@ -369,3 +374,181 @@ def test_remove_reject_rebases_once_then_converges() -> None:
     )
     assert r3.state.pending == ()
     assert any(isinstance(e, MaResyncQueue) for e in r3.effects)
+
+
+def test_load_retry_preserves_full_target_and_valid_context() -> None:
+    """A rejected LOAD must never retry as the empty request seen in the recorder."""
+    context_uuid = b"\xcc" * 16
+    r1 = reduce(
+        _state(),
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xaa" * 16,
+            context_uuid=context_uuid,
+            track_ids=(20, 21),
+            current_track_id=20,
+            resolvable=frozenset({20, 21, 900000, 900001}),
+        ),
+    )
+
+    r2 = reduce(
+        r1.state,
+        CloudQueueError(
+            now_ms=2,
+            version=QueueVersion(7, 1),
+            action_uuid=b"\xaa" * 16,
+            code="1",
+            message="Queue version mismatch",
+        ),
+    )
+
+    pushes = [effect for effect in r2.effects if isinstance(effect, PushLoad)]
+    assert len(pushes) == 1
+    assert pushes[0].track_ids == (20, 21)
+    assert pushes[0].context_uuid == context_uuid
+    assert len(pushes[0].action_uuid) == 16
+    assert any(pushes[0].action_uuid)
+
+
+def test_clear_echo_then_load_rejection_retries_original_tracks() -> None:
+    """Reproduce the recorder sequence without degrading the retry to an empty LOAD."""
+    clear = reduce(
+        _state(),
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\x01" * 16,
+            context_uuid=b"\x02" * 16,
+            track_ids=(),
+            current_track_id=None,
+            resolvable=frozenset({900000, 900001}),
+        ),
+    )
+    cleared = reduce(
+        clear.state,
+        CloudCleared(
+            now_ms=2,
+            version=QueueVersion(6, 1),
+            action_uuid=b"\x01" * 16,
+        ),
+    )
+    load = reduce(
+        cleared.state,
+        MaQueueChanged(
+            now_ms=3,
+            action_uuid=b"\x03" * 16,
+            context_uuid=b"\x04" * 16,
+            track_ids=(20, 21),
+            current_track_id=20,
+            resolvable=frozenset({20, 21}),
+        ),
+    )
+
+    retried = reduce(
+        load.state,
+        CloudQueueError(
+            now_ms=4,
+            version=QueueVersion(7, 1),
+            action_uuid=b"\x03" * 16,
+            code="1",
+            message="Queue version mismatch",
+        ),
+    )
+
+    pushes = [effect for effect in retried.effects if isinstance(effect, PushLoad)]
+    assert len(pushes) == 1
+    assert pushes[0].track_ids == (20, 21)
+
+
+def test_remove_retry_preserves_removed_occurrence() -> None:
+    """A rejected REMOVE must still target the removed cloud slot."""
+    r1 = reduce(
+        _remove_state(),
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xaa" * 16,
+            context_uuid=b"\xcc" * 16,
+            track_ids=(900000, 900002),
+            current_track_id=900000,
+            resolvable=frozenset({900000, 900001, 900002}),
+        ),
+    )
+
+    r2 = reduce(
+        r1.state,
+        CloudQueueError(
+            now_ms=2,
+            version=QueueVersion(7, 1),
+            action_uuid=b"\xaa" * 16,
+            code="1",
+            message="Queue version mismatch",
+        ),
+    )
+
+    pushes = [effect for effect in r2.effects if isinstance(effect, PushRemove)]
+    assert len(pushes) == 1
+    assert pushes[0].queue_item_ids == (1,)
+
+
+def test_add_duplicate_retry_preserves_one_appended_occurrence() -> None:
+    """Rebasing an ADD uses occurrence counts, not set membership."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0),
+        current_id=900000,
+        active=True,
+    )
+    r1 = reduce(
+        state,
+        MaQueueChanged(
+            now_ms=1,
+            action_uuid=b"\xaa" * 16,
+            context_uuid=b"\xcc" * 16,
+            track_ids=(900000, 900000),
+            current_track_id=900000,
+            resolvable=frozenset({900000}),
+        ),
+    )
+
+    r2 = reduce(
+        r1.state,
+        CloudQueueError(
+            now_ms=2,
+            version=QueueVersion(7, 1),
+            action_uuid=b"\xaa" * 16,
+            code="1",
+            message="Queue version mismatch",
+        ),
+    )
+
+    pushes = [effect for effect in r2.effects if isinstance(effect, PushAdd)]
+    assert len(pushes) == 1
+    assert pushes[0].track_ids == (900000,)
+
+
+def test_insert_retry_preserves_insert_payload() -> None:
+    """A defensively supported INSERT proposal must retain its intended IDs."""
+    proposal = Proposal(
+        action_uuid=b"\xaa" * 16,
+        context_uuid=b"\xcc" * 16,
+        base_version=QueueVersion(5, 1),
+        kind=ProposalKind.INSERT,
+        target_track_ids=(900000, 900002, 900001),
+        current_track_id=900000,
+        push_payload_ids=(900002,),
+    )
+    state = dataclasses.replace(_state(), pending=(proposal,))
+
+    result = reduce(
+        state,
+        CloudQueueError(
+            now_ms=2,
+            version=QueueVersion(7, 1),
+            action_uuid=b"\xaa" * 16,
+            code="1",
+            message="Queue version mismatch",
+        ),
+    )
+
+    pushes = [effect for effect in result.effects if isinstance(effect, PushInsert)]
+    assert len(pushes) == 1
+    assert pushes[0].track_ids == (900002,)

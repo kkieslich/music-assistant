@@ -865,14 +865,7 @@ def _reject_proposal(
     """Rebase a rejected proposal once against the newer version, else converge MA."""
     absorbed = dataclasses.replace(state, cloud_version=event.version)
     if proposal.retries_left > 0:
-        rebased_target = _rebase_target(absorbed, proposal)
-        rebased = dataclasses.replace(
-            proposal,
-            base_version=event.version,
-            retries_left=proposal.retries_left - 1,
-            target_track_ids=rebased_target,
-            push_payload_ids=_rebase_push_payload(absorbed, proposal, rebased_target),
-        )
+        rebased = _rebase_proposal(absorbed, proposal, event.version)
         pending = tuple(rebased if p is proposal else p for p in absorbed.pending)
         new = dataclasses.replace(absorbed, pending=pending)
         # Translate against the post-absorb canonical (current truth), so a
@@ -883,40 +876,46 @@ def _reject_proposal(
     return _with_resync(new)  # converge MA to cloud truth
 
 
-def _rebase_target(state: CanonicalState, proposal: Proposal) -> tuple[int, ...]:
-    """
-    Recompute a rejected proposal's target against current canonical tracks.
+def _rebase_proposal(state: CanonicalState, proposal: Proposal, version: QueueVersion) -> Proposal:
+    """Rebuild a retry from its full intended target against current truth."""
+    canonical_ids = tuple(qid for track in state.tracks if (qid := _safe_qid(track)) is not None)
+    target_ids = proposal.target_track_ids
+    kind = proposal.kind
+    payload = proposal.push_payload_ids
 
-    Only ADD's target is unambiguous to re-derive after canonical drift
-    (current canonical + whichever proposed ids aren't already canonical,
-    in their proposed order). LOAD/CLEAR/REORDER targets are kept as-is:
-    their intended delta can't be reconstructed from target_track_ids alone
-    once canonical has moved.
-    """
-    if proposal.kind is not ProposalKind.ADD:
-        return proposal.target_track_ids
-    canonical_ids = tuple(qid for t in state.tracks if (qid := _safe_qid(t)) is not None)
-    tail = tuple(i for i in proposal.target_track_ids if i not in canonical_ids)
-    return canonical_ids + tail
+    if kind is ProposalKind.LOAD:
+        payload = target_ids
+    elif kind is ProposalKind.ADD:
+        if target_ids[: len(canonical_ids)] == canonical_ids:
+            payload = target_ids[len(canonical_ids) :]
+        else:
+            kind = ProposalKind.LOAD
+            payload = target_ids
+    elif kind is ProposalKind.INSERT:
+        inserted = _removed_if_subsequence(target_ids, canonical_ids)
+        if inserted is None:
+            kind = ProposalKind.LOAD
+            payload = target_ids
+        else:
+            payload = inserted
+    elif kind is ProposalKind.REMOVE:
+        removed = _removed_if_subsequence(canonical_ids, target_ids)
+        if removed is None:
+            kind = ProposalKind.LOAD
+            payload = target_ids
+        else:
+            payload = removed
+    elif kind is ProposalKind.REORDER and sorted(target_ids) != sorted(canonical_ids):
+        kind = ProposalKind.LOAD
+        payload = target_ids
 
-
-def _rebase_push_payload(
-    state: CanonicalState, proposal: Proposal, rebased_target: tuple[int, ...]
-) -> tuple[int, ...]:
-    """
-    Recompute a rejected proposal's wire payload against current canonical tracks.
-
-    Only ADD's payload is worth rebasing: the retry path has no
-    resolvable-vs-unresolvable distinction available, so the positional tail
-    against full current canonical is the correct approximation, since a
-    rebased ADD target is always current-canonical + tail. LOAD/CLEAR/REORDER
-    payloads stay empty; they're either translated fresh at emit time or
-    unused.
-    """
-    if proposal.kind is not ProposalKind.ADD:
-        return ()
-    canonical_ids = tuple(qid for t in state.tracks if (qid := _safe_qid(t)) is not None)
-    return rebased_target[len(canonical_ids) :]
+    return dataclasses.replace(
+        proposal,
+        base_version=version,
+        kind=kind,
+        retries_left=proposal.retries_left - 1,
+        push_payload_ids=payload,
+    )
 
 
 _SUBSEQ_DONE = object()
@@ -994,6 +993,7 @@ def _diff_ma_list(state: CanonicalState, event: MaQueueChanged) -> Proposal | No
         target_track_ids=event.track_ids,
         current_track_id=event.current_track_id,
         push_payload_ids=push_payload_ids,
+        context_uuid=event.context_uuid,
     )
 
 
@@ -1023,7 +1023,7 @@ def _emit_push(state: CanonicalState, proposal: Proposal) -> Effect:
             base_version=proposal.base_version,
             track_ids=proposal.push_payload_ids,
             current_index=current_index,
-            context_uuid=b"\x00" * 16,
+            context_uuid=proposal.context_uuid,
         )
     if proposal.kind is ProposalKind.ADD:
         # The cloud's add command APPENDS its payload to the existing cloud
