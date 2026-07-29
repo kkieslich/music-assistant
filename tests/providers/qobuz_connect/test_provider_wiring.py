@@ -219,6 +219,31 @@ async def test_on_set_active_false_releases_without_broadcast() -> None:
     assert provider._coordinator.state.active is False
 
 
+async def test_deactivation_releases_the_player_captured_at_activation() -> None:
+    """Auto target changes cannot redirect a delayed release to another player."""
+    p1 = _fake_player("p1")
+    p2 = _fake_player("p2")
+    provider, mass = _make_provider(p1)
+    players = {"p1": p1, "p2": p2}
+    mass.players.all_players.return_value = [p1, p2]
+    mass.players.get_player.side_effect = players.get
+    mass.player_queues.stop = AsyncMock()
+    mass.player_queues.clear = MagicMock()
+    provider._session = MagicMock()
+    provider._session.send_volume_changed = AsyncMock()
+    provider._session.send_volume_muted = AsyncMock()
+    provider._quality_reporter = MagicMock()
+    provider._quality_reporter.report_current = AsyncMock()
+
+    await provider._on_set_active(True)
+    mass.players.all_players.return_value = [p2, p1]
+    p2.state.playback_state = MAPlaybackState.PLAYING
+    await provider._on_set_active(False)
+
+    mass.player_queues.stop.assert_awaited_once_with("p1")
+    mass.player_queues.clear.assert_called_once_with("p1", skip_stop=True)
+
+
 async def test_ma_queue_event_delegates_to_transport_and_modes() -> None:
     """QUEUE_UPDATED delegates to both the transport and modes coordinator entry points."""
     provider, _mass = _make_provider()
@@ -426,6 +451,27 @@ async def test_reporter_skips_when_no_current_item() -> None:
     assert calls == 0
 
 
+async def test_reporter_skips_without_confirmed_renderer_ownership() -> None:
+    """Direct ReportState effects stay silent until the cloud confirms ownership."""
+    session = MagicMock()
+    session.send_renderer_state = AsyncMock()
+    reporter = OutboundReporter(
+        session_getter=lambda: session,
+        state_getter=lambda: CanonicalState(
+            tracks=(QueueTrackRef(queue_item_id=7, track_id="501"),),
+            current_id=501,
+            active=True,
+        ),
+        duration_getter=lambda: 0,
+        active_getter=lambda: False,
+        logger=outbound_reporter_module.LOGGER,
+    )
+
+    await reporter.report_state()
+
+    session.send_renderer_state.assert_not_awaited()
+
+
 def test_current_track_duration_ms_reads_live_ma_queue() -> None:
     """The provider's duration getter reads the live MA queue item (seconds -> ms)."""
     provider, mass = _make_provider()
@@ -439,14 +485,19 @@ def test_current_track_duration_ms_reads_live_ma_queue() -> None:
 
 
 def test_reporter_active_getter_requires_active_and_target_player() -> None:
-    """The heartbeat active-getter is (state.active AND a target player exists)."""
+    """Reporting requires confirmed ownership plus an available target player."""
     provider, mass = _make_provider()
 
     provider._coordinator._state = CanonicalState(active=False)
     assert provider._reporter._active_getter() is False
 
-    provider._coordinator._state = CanonicalState(active=True)
+    provider._coordinator._state = CanonicalState(active=True, own_rid=42, active_rid=42)
     assert provider._reporter._active_getter() is True
+
+    provider._coordinator._state = CanonicalState(active=True, own_rid=42, active_rid=9)
+    assert provider._reporter._active_getter() is False
+
+    provider._coordinator._state = CanonicalState(active=True, own_rid=42, active_rid=42)
 
     # Target player vanished: even while active, the heartbeat must fall silent
     # (a frozen canonical state otherwise reports stale PLAYING forever).

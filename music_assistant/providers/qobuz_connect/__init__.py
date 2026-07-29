@@ -221,7 +221,10 @@ class QobuzConnectProvider(PluginProvider):
             state_getter=lambda: self._coordinator.state,
             duration_getter=self._current_track_duration_ms,
             active_getter=lambda: (
-                self._coordinator.state.active and self._bridge.target_player_id() is not None
+                self._coordinator.state.active
+                and self._coordinator.state.own_rid is not None
+                and self._coordinator.state.active_rid == self._coordinator.state.own_rid
+                and self._bridge.target_player_id() is not None
             ),
             current_index_getter=self._current_queue_index,
             logger=self.logger,

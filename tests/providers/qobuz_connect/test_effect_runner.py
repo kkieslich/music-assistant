@@ -515,12 +515,12 @@ async def test_ma_set_volume_calls_bridge() -> None:
 
 
 async def test_ma_release_player_stops_and_clears_queue() -> None:
-    """MaReleasePlayer stops then clears the target player's queue."""
+    """MaReleasePlayer uses its captured target even if auto-resolution changes."""
     session, bridge = _FakeSession(), _FakeBridge()
     runner = _runner(session, bridge)
-    await runner.run(MaReleasePlayer())
-    assert ("stop_queue", "player") in bridge.calls
-    assert ("clear_queue", ("player", True)) in bridge.calls
+    await runner.run(MaReleasePlayer(player_id="captured-player"))
+    assert ("stop_queue", "captured-player") in bridge.calls
+    assert ("clear_queue", ("captured-player", True)) in bridge.calls
 
 
 async def test_ma_effects_noop_when_no_target_player() -> None:

@@ -60,6 +60,7 @@ from .sync_types import (
     Event,
     MaModesChanged,
     MaQueueChanged,
+    MaReleasePlayer,
     MaResyncQueue,
     MaTransportChanged,
     MaVolumeChanged,
@@ -148,6 +149,7 @@ class QobuzConnectCoordinator:
         self._lock = asyncio.Lock()
         self._effect_lock = asyncio.Lock()
         self._queue_generation = 0
+        self._owned_target_player_id: str | None = None
         self._last_track_index = 0
         self._timers: dict[bytes, asyncio.TimerHandle] = {}
         # Last (volume, muted) pair pushed to the cloud, so repeated
@@ -290,6 +292,7 @@ class QobuzConnectCoordinator:
                 playing=playing,
                 current_track_id=current_track_id,
                 position_ms=int(queue.corrected_elapsed_time * 1000),
+                target_player_id=player_id,
             )
         )
 
@@ -344,6 +347,22 @@ class QobuzConnectCoordinator:
         """Reduce one event, then execute its effects in serialized order."""
         async with self._lock:
             previous_tracks = self._state.tracks
+            was_active = self._state.active
+            if (
+                isinstance(event, CloudSetActive)
+                and event.active
+                and self._owned_target_player_id is None
+            ):
+                target_getter = getattr(self._bridge, "target_player_id", None)
+                if target_getter is not None:
+                    self._owned_target_player_id = target_getter()
+            elif (
+                isinstance(event, MaTransportChanged)
+                and event.playing is PlayingState.PLAYING
+                and event.target_player_id is not None
+                and self._owned_target_player_id is None
+            ):
+                self._owned_target_player_id = event.target_player_id
             try:
                 result = reduce(self._state, event)
             except Exception as err:
@@ -359,9 +378,14 @@ class QobuzConnectCoordinator:
             effects = tuple(
                 dataclasses.replace(effect, generation=self._queue_generation)
                 if isinstance(effect, MaResyncQueue)
+                else dataclasses.replace(effect, player_id=self._owned_target_player_id)
+                if isinstance(effect, MaReleasePlayer)
                 else effect
                 for effect in result.effects
             )
+            releasing = any(isinstance(effect, MaReleasePlayer) for effect in effects)
+            if releasing or (was_active and not result.state.active):
+                self._owned_target_player_id = None
             if self._recorder is not None:
                 self._recorder.record_reduce(event, result)
             if isinstance(event, Disconnected):

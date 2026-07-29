@@ -67,6 +67,7 @@ from .sync_types import (
     PushMute,
     PushRemove,
     PushReorder,
+    PushSetActive,
     PushVolume,
     ReduceResult,
     ReportState,
@@ -331,7 +332,9 @@ def _reduce_list_inbound(state: CanonicalState, event: Event) -> ReduceResult:
 def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
     """Route a transport/session-lane event to its handler."""
     if isinstance(event, CloudSetActive):
-        return _takeover(state, event.now_ms) if event.active else _deactivate(state)
+        if event.active:
+            return ReduceResult(state, ()) if state.active else _takeover(state, event.now_ms)
+        return _deactivate(state)
     if isinstance(event, CloudSetState):
         return _reduce_set_state(state, event)
     if isinstance(event, CloudRendererStateUpdated):
@@ -363,7 +366,7 @@ def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
         asked, ask_effects = _maybe_ask_snapshot(new, event.version)
         return ReduceResult(asked, ask_effects)
     if isinstance(event, CloudActiveRendererChanged):
-        return ReduceResult(dataclasses.replace(state, active_rid=event.renderer_id), ())
+        return _active_renderer_changed(state, event)
     if isinstance(event, CloudAddRenderer):
         # Own-renderer matching against device_uuid needs uuid-comparison
         # context the pure reducer doesn't hold; the coordinator resolves
@@ -559,7 +562,7 @@ def _apply_transport(
 
 def _takeover(state: CanonicalState, now_ms: int) -> ReduceResult:
     """Activate this renderer and adopt canonical current, playing it once if it's live."""
-    active = dataclasses.replace(state, active=True)
+    active = dataclasses.replace(state, active=True, activation_requested=False)
     if state.current_id is not None and state.playing is PlayingState.PLAYING:
         # A handoff from phone/web hands us a position anchored at
         # position_anchor_ms; while PLAYING it has advanced since. Resume at the
@@ -590,7 +593,12 @@ def _takeover(state: CanonicalState, now_ms: int) -> ReduceResult:
 
 def _deactivate(state: CanonicalState) -> ReduceResult:
     """Give up the renderer role and release the MA player."""
-    return ReduceResult(dataclasses.replace(state, active=False), (MaReleasePlayer(),))
+    if not state.active:
+        return ReduceResult(state, ())
+    return ReduceResult(
+        dataclasses.replace(state, active=False, activation_requested=False),
+        (MaReleasePlayer(),),
+    )
 
 
 def _ma_transport(state: CanonicalState, event: MaTransportChanged) -> ReduceResult:
@@ -657,7 +665,37 @@ def _ma_transport(state: CanonicalState, event: MaTransportChanged) -> ReduceRes
     # 2026-07-09). Controllers/the app follow the renderer's reported current,
     # so a user skip inside MA still propagates via the report. Our own report
     # echoes back as srvrCtrlRendererStateUpdated(ownId) and is ignored.
+    if not state.active:
+        if (
+            playing is PlayingState.PLAYING
+            and state.own_rid is not None
+            and not state.activation_requested
+        ):
+            return ReduceResult(
+                dataclasses.replace(new, activation_requested=True),
+                (PushSetActive(),),
+            )
+        return ReduceResult(new, ())
     return ReduceResult(new, (ReportState(),))
+
+
+def _active_renderer_changed(
+    state: CanonicalState, event: CloudActiveRendererChanged
+) -> ReduceResult:
+    """Confirm or revoke this renderer's ownership of the cloud session."""
+    new = dataclasses.replace(state, active_rid=event.renderer_id)
+    is_own = state.own_rid is not None and event.renderer_id == state.own_rid
+    if is_own:
+        return ReduceResult(
+            dataclasses.replace(new, active=True, activation_requested=False),
+            (ReportState(),),
+        )
+    if state.active:
+        return ReduceResult(
+            dataclasses.replace(new, active=False, activation_requested=False),
+            (),
+        )
+    return ReduceResult(new, ())
 
 
 def _remove_renderer(state: CanonicalState, event: CloudRemoveRenderer) -> ReduceResult:

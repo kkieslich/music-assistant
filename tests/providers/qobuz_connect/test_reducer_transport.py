@@ -14,6 +14,7 @@ from music_assistant.providers.qobuz_connect.reducer import reduce
 from music_assistant.providers.qobuz_connect.sync_types import (
     AskSnapshot,
     CanonicalState,
+    CloudActiveRendererChanged,
     CloudAddRenderer,
     CloudLoadAck,
     CloudRendererStateUpdated,
@@ -28,6 +29,7 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     MaResyncQueue,
     MaSeek,
     MaTransportChanged,
+    PushSetActive,
     ReportState,
 )
 
@@ -888,6 +890,66 @@ def test_takeover_resumes_at_live_position_while_playing() -> None:
     plays = [e for e in result.effects if isinstance(e, MaPlayTrack)]
     assert len(plays) == 1
     assert plays[0].position_ms == 33000
-    # stored position is re-anchored to the same live value.
     assert result.state.position_ms == 33000
     assert result.state.position_anchor_ms == 4000
+
+
+def test_inactive_ma_play_requests_ownership_once_without_reporting() -> None:
+    """MA-origin playback asks the cloud to activate us before renderer reports."""
+    state = CanonicalState(
+        tracks=_refs(0),
+        current_id=900000,
+        playing=PlayingState.STOPPED,
+        own_rid=42,
+        active_rid=9,
+    )
+    event = MaTransportChanged(
+        now_ms=1,
+        playing=PlayingState.PLAYING,
+        current_track_id=900000,
+        position_ms=0,
+        target_player_id="p1",
+    )
+
+    first = reduce(state, event)
+    second = reduce(first.state, event)
+
+    assert first.state.activation_requested is True
+    assert first.effects == (PushSetActive(),)
+    assert second.effects == ()
+
+
+def test_ownership_confirmation_enables_reporting_without_restarting_ma() -> None:
+    """Cloud ownership confirmation clears the request and reports current MA state."""
+    state = CanonicalState(
+        tracks=_refs(0),
+        current_id=900000,
+        playing=PlayingState.PLAYING,
+        own_rid=42,
+        active_rid=9,
+        activation_requested=True,
+    )
+
+    result = reduce(
+        state,
+        CloudActiveRendererChanged(now_ms=2, renderer_id=42),
+    )
+
+    assert result.state.active is True
+    assert result.state.activation_requested is False
+    assert result.state.active_rid == 42
+    assert result.effects == (ReportState(),)
+    assert not any(isinstance(effect, MaPlayTrack) for effect in result.effects)
+
+
+def test_repeated_cloud_activation_and_deactivation_are_idempotent() -> None:
+    """Duplicate SET_ACTIVE commands neither restart nor release twice."""
+    active = CanonicalState(active=True, own_rid=42, active_rid=42)
+
+    duplicate_on = reduce(active, CloudSetActive(now_ms=1, active=True))
+    first_off = reduce(active, CloudSetActive(now_ms=2, active=False))
+    duplicate_off = reduce(first_off.state, CloudSetActive(now_ms=3, active=False))
+
+    assert duplicate_on.effects == ()
+    assert len(first_off.effects) == 1
+    assert duplicate_off.effects == ()

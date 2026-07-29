@@ -96,6 +96,10 @@ class _FakeBridge:
         """Return the fixed queue-items list."""
         return self.items
 
+    def target_player_id(self) -> str:
+        """Return the fixed target used by activation/release tests."""
+        return "player"
+
     def qobuz_track_id_for(self, item: Any) -> str | None:
         """Return the fake item's Qobuz track id."""
         return item.get("track_id") if isinstance(item, dict) else None
@@ -519,6 +523,9 @@ async def test_submit_renderer_state_updated_maps_current_index() -> None:
 async def test_on_ma_transport_event() -> None:
     """on_ma_transport_event folds MA's state and reports it as a renderer (ReportState)."""
     coord, runner, bridge = _coordinator()
+    coord._state.active = True
+    coord._state.own_rid = 42
+    coord._state.active_rid = 42
     bridge.queue = _FakeQueue(current_item={"track_id": "100"}, state="paused", elapsed=12.5)
     await coord.on_ma_transport_event("player")
     assert coord.state.playing is PlayingState.PAUSED

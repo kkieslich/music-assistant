@@ -54,6 +54,7 @@ class CanonicalState:
     loop: LoopMode = LoopMode.OFF
     autoplay: bool = False
     active: bool = False
+    activation_requested: bool = False
     own_rid: int | None = None
     active_rid: int | None = None
     pending: tuple[Proposal, ...] = field(default_factory=tuple)
@@ -402,6 +403,7 @@ class MaTransportChanged:
     playing: PlayingState
     current_track_id: int | None  # Qobuz track ID.
     position_ms: int
+    target_player_id: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -617,6 +619,8 @@ class MaSetVolume:
 @dataclass(slots=True, frozen=True)
 class MaReleasePlayer:
     """Deactivation: instruct MA to stop and clear queue."""
+
+    player_id: str | None = None
 
 
 # ---- result container ----

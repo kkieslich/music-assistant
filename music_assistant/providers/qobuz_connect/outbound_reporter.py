@@ -101,7 +101,7 @@ class OutboundReporter:
     async def report_state(self) -> None:
         """Compose and emit a single ``RNDR_SRVR_STATE_UPDATED`` frame."""
         session = self._session_getter()
-        if session is None:
+        if session is None or not self._active_getter():
             return
         state = self._state_getter()
         current_item = self._current_item(state)

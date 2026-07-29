@@ -223,7 +223,7 @@ class EffectRunner:
             if (pid := self._target_player_id("MaSetVolume")) is not None:
                 await self._bridge.cmd_volume_set(pid, effect.volume)
         elif isinstance(effect, MaReleasePlayer):
-            await self._run_ma_release_player()
+            await self._run_ma_release_player(effect)
 
     # ---- MA effect helpers ------------------------------------------------
 
@@ -343,9 +343,9 @@ class EffectRunner:
             return
         self._bridge.set_repeat(pid, ma_value)
 
-    async def _run_ma_release_player(self) -> None:
+    async def _run_ma_release_player(self, effect: MaReleasePlayer) -> None:
         """Stop and clear the target player's queue — mirrors the old ``release_target_player``."""
-        pid = self._bridge.target_player_id()
+        pid = effect.player_id
         if pid is None:
             return
         try:
