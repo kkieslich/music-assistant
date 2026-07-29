@@ -156,6 +156,80 @@ async def test_snapshot_then_activate_takes_over() -> None:
     assert any(isinstance(e, MaPlayTrack) for e in runner.effects)
 
 
+async def test_new_queue_generation_reduces_while_resync_is_in_flight() -> None:
+    """Slow metadata cannot hold the reducer lock or apply dependent stale effects."""
+
+    class _BlockingRunner:
+        def __init__(self) -> None:
+            self.effects: list[Any] = []
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.block_once = True
+
+        async def run(self, effect: Any) -> None:
+            self.effects.append(effect)
+            if isinstance(effect, MaResyncQueue) and self.block_once:
+                self.block_once = False
+                self.started.set()
+                await self.release.wait()
+
+    runner = _BlockingRunner()
+    bridge = _FakeBridge()
+    coord = QobuzConnectCoordinator(
+        runner=runner,  # type: ignore[arg-type]
+        bridge=bridge,  # type: ignore[arg-type]
+        device_uuid=OUR_DEVICE_UUID,
+    )
+    await coord._submit(
+        CloudSnapshot(
+            now_ms=1,
+            version=QueueVersion(5, 1),
+            tracks=_refs(0, 1, 2),
+            autoplay_tracks=(),
+            shuffle=False,
+            autoplay=False,
+            track_index=3,
+        )
+    )
+    await coord._submit(
+        CloudSetState(
+            now_ms=2,
+            version=None,
+            playing=PlayingState.PLAYING,
+            position_ms=0,
+            current_ref=_refs(2)[0],
+        )
+    )
+
+    activation = asyncio.create_task(coord._submit(CloudSetActive(now_ms=3, active=True)))
+    await runner.started.wait()
+    newer = asyncio.create_task(
+        coord._submit(
+            CloudSnapshot(
+                now_ms=4,
+                version=QueueVersion(6, 1),
+                tracks=(QueueTrackRef(queue_item_id=20, track_id="200"),),
+                autoplay_tracks=(),
+                shuffle=False,
+                autoplay=False,
+                track_index=1,
+            )
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert tuple(ref.track_id for ref in coord.state.tracks) == ("200",)
+    runner.release.set()
+    await asyncio.gather(activation, newer)
+
+    resyncs = [effect for effect in runner.effects if isinstance(effect, MaResyncQueue)]
+    assert len(resyncs) == 2
+    assert resyncs[0].generation < resyncs[1].generation
+    assert not any(
+        isinstance(effect, MaPlayTrack) and effect.track_id == 102 for effect in runner.effects
+    )
+
+
 async def test_ma_append_pushes_add_and_cloud_echo_confirms() -> None:
     """An MA-origin append emits PushAdd; the matching cloud echo clears the pending proposal."""
     coord, runner, bridge = _coordinator()

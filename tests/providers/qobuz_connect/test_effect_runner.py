@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
 
 from music_assistant_models.media_items import Track
 
 from music_assistant.providers.qobuz_connect.effect_runner import EffectRunner
+from music_assistant.providers.qobuz_connect.metadata_resolver import MetadataBatchResult
 from music_assistant.providers.qobuz_connect.models import LoopMode, PlayingState, QueueVersion
 from music_assistant.providers.qobuz_connect.sync_types import (
     AskSnapshot,
@@ -420,6 +422,74 @@ async def test_ma_resync_empty_tracks_keeps_non_qobuz() -> None:
     assert items == [non_qobuz_item]
 
 
+async def test_ma_resync_empty_tracks_clears_qobuz_only_queue() -> None:
+    """An authoritative empty mirror commits an empty MA item list."""
+    session, bridge, metadata = _FakeSession(), _FakeBridge(), _FakeMetadata()
+    bridge.queue_items_result = [{"track_id": "900001"}]
+    runner = _runner(session, bridge, metadata=metadata)
+
+    await runner.run(MaResyncQueue(track_ids=(), current_track_id=None))
+
+    _, (_pid, items) = next(call for call in bridge.calls if call[0] == "update_items")
+    assert items == []
+
+
+async def test_ma_resync_transient_metadata_failure_is_atomic() -> None:
+    """One transient miss aborts the whole generation instead of applying a partial queue."""
+    session, bridge = _FakeSession(), _FakeBridge()
+    resolved = Track(
+        item_id="10",
+        provider="qobuz",
+        name="Track 10",
+        provider_mappings=set(),
+        duration=200,
+    )
+    metadata = MagicMock()
+    metadata.resolve_batch = AsyncMock(
+        return_value=MetadataBatchResult(
+            items=(resolved, None),
+            permanent_missing=frozenset(),
+            transient_failed=frozenset({"11"}),
+        )
+    )
+    runner = _runner(session, bridge, metadata=cast("Any", metadata))
+
+    await runner.run(MaResyncQueue(track_ids=(10, 11), current_track_id=10))
+
+    assert not any(call[0] == "update_items" for call in bridge.calls)
+
+
+async def test_stale_resync_generation_is_discarded() -> None:
+    """A newer canonical generation prevents an older metadata result from committing."""
+    session, bridge = _FakeSession(), _FakeBridge()
+    resolved = Track(
+        item_id="10",
+        provider="qobuz",
+        name="Track 10",
+        provider_mappings=set(),
+        duration=200,
+    )
+    metadata = MagicMock()
+    metadata.resolve_batch = AsyncMock(
+        return_value=MetadataBatchResult(
+            items=(resolved,),
+            permanent_missing=frozenset(),
+            transient_failed=frozenset(),
+        )
+    )
+    runner = EffectRunner(
+        session=cast("Any", session),
+        bridge=cast("Any", bridge),
+        metadata=cast("Any", metadata),
+        reporter=None,
+        generation_getter=lambda: 2,
+    )
+
+    await runner.run(MaResyncQueue(track_ids=(10,), current_track_id=10, generation=1))
+
+    assert not any(call[0] == "update_items" for call in bridge.calls)
+
+
 async def test_ma_set_loop_maps_to_ma_repeat_mode() -> None:
     """MaSetLoop maps Qobuz LoopMode to MA's RepeatMode string via bridge.set_repeat."""
     session, bridge = _FakeSession(), _FakeBridge()
@@ -490,6 +560,23 @@ class _SlowCountingMetadata:
             name=f"Track {track_id}",
             provider_mappings=set(),
             duration=200,
+        )
+
+    async def resolve_batch(
+        self, track_ids: tuple[str, ...], *, concurrency: int
+    ) -> MetadataBatchResult:
+        """Resolve a bounded concurrent batch like the production resolver."""
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def resolve(track_id: str) -> Any:
+            async with semaphore:
+                return await self.get_track_or_none(track_id)
+
+        items = await asyncio.gather(*(resolve(track_id) for track_id in track_ids))
+        return MetadataBatchResult(
+            items=tuple(items),
+            permanent_missing=frozenset(),
+            transient_failed=frozenset(),
         )
 
 

@@ -244,6 +244,7 @@ class QobuzConnectProvider(PluginProvider):
             metadata=self._metadata,
             reporter=self._reporter,
             own_rid_getter=lambda: self._coordinator.state.own_rid,
+            generation_getter=lambda: self._coordinator.queue_generation,
         )
         # Persistent diagnostics: bounded in-memory ring of reducer steps +
         # WARNING/ERROR logs, dumped to <storage_path>/qobuz_connect/<instance>

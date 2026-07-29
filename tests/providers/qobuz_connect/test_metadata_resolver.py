@@ -58,3 +58,24 @@ async def test_media_not_found_is_cached() -> None:
 
     assert provider.calls == 1
     assert resolver.unresolvable_track_ids == frozenset({"456"})
+
+
+async def test_resolve_batch_distinguishes_permanent_and_transient_misses() -> None:
+    """Batch callers can abort transient partial results without retrying definitive 404s."""
+
+    class _MixedProvider:
+        async def get_track(self, track_id: str) -> Any:
+            if track_id == "10":
+                return f"track-{track_id}"
+            if track_id == "11":
+                raise MediaNotFoundError("gone")
+            raise RuntimeError("temporary")
+
+    resolver = MetadataResolver(qobuz_provider_getter=_MixedProvider, logger=_LOGGER)
+
+    result = await resolver.resolve_batch(("10", "11", "12"))
+
+    assert result.items == ("track-10", None, None)
+    assert result.permanent_missing == frozenset({"11"})
+    assert result.transient_failed == frozenset({"12"})
+    assert resolver.unresolvable_track_ids == frozenset({"11"})

@@ -590,6 +590,7 @@ class MaResyncQueue:
 
     track_ids: tuple[int, ...]  # Qobuz track IDs.
     current_track_id: int | None  # Qobuz track ID.
+    generation: int = 0
 
 
 @dataclass(slots=True, frozen=True)

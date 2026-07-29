@@ -6,12 +6,10 @@ Inbound cloud events are already ``sync_types`` events (the codec parses frames
 straight into them); ``submit`` injects the little shell-only context they can't
 carry (own-renderer verdict, the snapshot's remembered track pointer, an error's
 version fallback) and MA subscription events are turned into ``Ma*Changed`` events
-by the ``on_ma_*`` entry points. Everything is serialized through
-:func:`.reducer.reduce` one at a time under an ``asyncio.Lock``. Each event is
-fully processed (state stored, every resulting effect awaited on the
-``EffectRunner``, in order) before the next event starts; that linear ordering is
-what makes the reducer's version-gated decisions correct — nothing ever observes
-a half-applied state.
+by the ``on_ma_*`` entry points. Reducer state transitions are serialized under
+one ``asyncio.Lock`` and effect sequences under another. This lets newer canonical
+queue events advance a generation while slow metadata resolution is in flight;
+the stale result and any dependent effects are then discarded before MA is mutated.
 
 Owns:
 - ``self._state`` (via the ``state`` property) — the single source of truth.
@@ -62,6 +60,7 @@ from .sync_types import (
     Event,
     MaModesChanged,
     MaQueueChanged,
+    MaResyncQueue,
     MaTransportChanged,
     MaVolumeChanged,
     ProposalTimeout,
@@ -147,6 +146,8 @@ class QobuzConnectCoordinator:
         self._timeout_tasks: set[asyncio.Task[None]] = set()
         self._state = CanonicalState()
         self._lock = asyncio.Lock()
+        self._effect_lock = asyncio.Lock()
+        self._queue_generation = 0
         self._last_track_index = 0
         self._timers: dict[bytes, asyncio.TimerHandle] = {}
         # Last (volume, muted) pair pushed to the cloud, so repeated
@@ -163,6 +164,11 @@ class QobuzConnectCoordinator:
     def own_rid_getter(self) -> int | None:
         """Return this renderer's own Qobuz renderer id, for ``EffectRunner``'s ``own_rid_getter``."""
         return self._state.own_rid
+
+    @property
+    def queue_generation(self) -> int:
+        """Return the newest canonical queue generation."""
+        return self._queue_generation
 
     def close(self) -> None:
         """
@@ -335,8 +341,9 @@ class QobuzConnectCoordinator:
     # ---- core intake --------------------------------------------------------
 
     async def _submit(self, event: Event) -> None:
-        """Serialize one event through ``reduce()``, store the result, run its effects in order."""
+        """Reduce one event, then execute its effects in serialized order."""
         async with self._lock:
+            previous_tracks = self._state.tracks
             try:
                 result = reduce(self._state, event)
             except Exception as err:
@@ -347,6 +354,14 @@ class QobuzConnectCoordinator:
                     self._recorder.record_reduce_failure(event, err)
                 raise
             self._state = result.state
+            if result.state.tracks != previous_tracks:
+                self._queue_generation += 1
+            effects = tuple(
+                dataclasses.replace(effect, generation=self._queue_generation)
+                if isinstance(effect, MaResyncQueue)
+                else effect
+                for effect in result.effects
+            )
             if self._recorder is not None:
                 self._recorder.record_reduce(event, result)
             if isinstance(event, Disconnected):
@@ -369,12 +384,22 @@ class QobuzConnectCoordinator:
                     len(state.tracks),
                     len(state.pending),
                 )
-            for effect in result.effects:
+            self._sync_proposal_timers()
+
+        # Metadata resolution may be slow. Keep reducer intake unlocked so a
+        # newer queue event can advance the generation while this batch is in
+        # flight; the runner discards the stale batch before committing it.
+        async with self._effect_lock:
+            resync_generation: int | None = None
+            for effect in effects:
+                if isinstance(effect, MaResyncQueue):
+                    resync_generation = effect.generation
                 try:
                     await self._runner.run(effect)
                 except Exception:
                     LOGGER.exception("Qobuz Connect effect %s failed", type(effect).__name__)
-            self._sync_proposal_timers()
+                if resync_generation is not None and resync_generation != self._queue_generation:
+                    break
 
     # ---- provider hooks (overridable) + lifecycle ---------------------------
 

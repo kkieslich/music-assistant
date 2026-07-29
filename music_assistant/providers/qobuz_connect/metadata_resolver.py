@@ -14,8 +14,10 @@ queue.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import TYPE_CHECKING, cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.errors import MediaNotFoundError
 
@@ -23,6 +25,15 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from music_assistant_models.media_items import Track
+
+
+@dataclass(slots=True, frozen=True)
+class MetadataBatchResult:
+    """Ordered metadata results plus definitive and retryable misses."""
+
+    items: tuple[Any | None, ...]
+    permanent_missing: frozenset[str]
+    transient_failed: frozenset[str]
 
 
 class MetadataResolver:
@@ -85,3 +96,44 @@ class MetadataResolver:
                 err,
             )
             return None
+
+    async def resolve_batch(
+        self, track_ids: tuple[str, ...], *, concurrency: int = 5
+    ) -> MetadataBatchResult:
+        """Resolve an ordered track batch while preserving failure semantics."""
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def resolve_one(track_id: str) -> tuple[Track | None, bool]:
+            if track_id in self._unresolvable_track_ids:
+                return None, False
+            try:
+                async with semaphore:
+                    return await self.get_track(track_id), False
+            except MediaNotFoundError:
+                self._unresolvable_track_ids.add(track_id)
+                self._logger.warning("Ignoring unresolved Qobuz Connect cloud track %s", track_id)
+                return None, False
+            except Exception as err:
+                self._logger.warning(
+                    "Qobuz Connect track %s temporarily unavailable (%s); will retry",
+                    track_id,
+                    err,
+                )
+                return None, True
+
+        resolved = await asyncio.gather(*(resolve_one(track_id) for track_id in track_ids))
+        transient_failed = frozenset(
+            track_id
+            for track_id, (_item, transient) in zip(track_ids, resolved, strict=True)
+            if transient
+        )
+        permanent_missing = frozenset(
+            track_id
+            for track_id, (item, transient) in zip(track_ids, resolved, strict=True)
+            if item is None and not transient
+        )
+        return MetadataBatchResult(
+            items=tuple(item for item, _transient in resolved),
+            permanent_missing=permanent_missing,
+            transient_failed=transient_failed,
+        )

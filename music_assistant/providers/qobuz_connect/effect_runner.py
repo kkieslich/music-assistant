@@ -24,7 +24,6 @@ verb) touches exactly one branch.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
 from collections.abc import Callable
@@ -69,10 +68,6 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
-# Resync runs while the coordinator lock is held, so metadata lookups for a
-# large queue must overlap — strictly sequential per-track HTTP fetches
-# stalled ALL event intake (including app pause/skip commands) for the whole
-# resolution. Bounded so a huge queue can't stampede the Qobuz API either.
 RESYNC_RESOLVE_CONCURRENCY = 5
 
 # Qobuz LoopMode -> MA RepeatMode string value. Kept local to this shell
@@ -95,6 +90,7 @@ class EffectRunner:
         metadata: MetadataResolver | None,
         reporter: OutboundReporter | None,
         own_rid_getter: Callable[[], int | None] = lambda: None,
+        generation_getter: Callable[[], int] = lambda: 0,
     ) -> None:
         """
         Bind the runner to the collaborators it dispatches effects to.
@@ -107,12 +103,14 @@ class EffectRunner:
             if the caller never routes that effect.
         :param own_rid_getter: Returns this renderer's own Qobuz renderer id, or ``None``
             if not yet known — consulted by ``PushSetActive``.
+        :param generation_getter: Returns the newest canonical queue generation.
         """
         self._session = session
         self._bridge = bridge
         self._metadata = metadata
         self._reporter = reporter
         self._own_rid_getter = own_rid_getter
+        self._generation_getter = generation_getter
 
     async def run(self, effect: Effect) -> None:
         """Execute a single reducer effect."""
@@ -308,19 +306,17 @@ class EffectRunner:
             slots.append(item)
 
         if missing:
-            semaphore = asyncio.Semaphore(RESYNC_RESOLVE_CONCURRENCY)
-            metadata = self._metadata
-
-            async def _resolve(track_id_str: str) -> Any | None:
-                async with semaphore:
-                    track = await metadata.get_track_or_none(track_id_str)
-                return None if track is None else QueueItem.from_media_item(pid, track)
-
-            resolved = await asyncio.gather(
-                *(_resolve(track_id_str) for _slot, track_id_str in missing)
+            batch = await self._metadata.resolve_batch(
+                tuple(track_id_str for _slot, track_id_str in missing),
+                concurrency=RESYNC_RESOLVE_CONCURRENCY,
             )
-            for (slot, _track_id_str), item in zip(missing, resolved, strict=True):
-                slots[slot] = item
+            if batch.transient_failed or effect.generation != self._generation_getter():
+                return
+            for (slot, _track_id_str), track in zip(missing, batch.items, strict=True):
+                slots[slot] = None if track is None else QueueItem.from_media_item(pid, track)
+
+        if effect.generation != self._generation_getter():
+            return
 
         final_items: list[Any] = []
         current_index: int | None = None
@@ -332,8 +328,6 @@ class EffectRunner:
             final_items.append(item)
 
         final_items.extend(non_qobuz_items)
-        if not final_items:
-            return
         if current_index is not None:
             self._bridge.set_current_index(pid, current_index)
         self._bridge.update_items(pid, final_items)
