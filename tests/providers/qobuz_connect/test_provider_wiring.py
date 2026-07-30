@@ -21,7 +21,6 @@ from music_assistant.providers.qobuz_connect import (
     CONF_TARGET_PLAYER,
     PLAYER_ID_AUTO,
     QobuzConnectProvider,
-    get_config_entries,
 )
 from music_assistant.providers.qobuz_connect import outbound_reporter as outbound_reporter_module
 from music_assistant.providers.qobuz_connect.coordinator import QobuzConnectCoordinator
@@ -34,6 +33,7 @@ from music_assistant.providers.qobuz_connect.models import (
     QueueVersion,
 )
 from music_assistant.providers.qobuz_connect.outbound_reporter import OutboundReporter
+from music_assistant.providers.qobuz_connect.setup_flow import build_setup_entries
 from music_assistant.providers.qobuz_connect.sync_types import (
     CanonicalState,
     CloudSetState,
@@ -105,6 +105,7 @@ def _make_provider(
     mass.player_queues.play_media = AsyncMock()
     mass.player_queues.play_index = AsyncMock()
     mass.player_queues.update_items = MagicMock()
+    mass.config.get_raw_provider_config_value.return_value = None
     qobuz_provider = _fake_qobuz_provider(native_quality)
     qobuz_provider.instance_id = qobuz_provider_id
     mass.get_provider.side_effect = lambda instance_id: (
@@ -153,9 +154,16 @@ async def test_config_entries_select_qobuz_instance_and_suggest_unused_port() ->
 
     mass.config.get_provider_configs = AsyncMock(side_effect=configs)
 
-    entries = await get_config_entries(mass)
+    entries = await build_setup_entries(mass)
     by_key = {entry.key: entry for entry in entries}
 
+    assert [entry.key for entry in entries] == [
+        CONF_QOBUZ_PROVIDER,
+        CONF_TARGET_PLAYER,
+        CONF_PUBLISH_NAME,
+        CONF_HTTP_PORT,
+        CONF_INITIAL_VOLUME,
+    ]
     assert [(option.value, option.title) for option in by_key[CONF_QOBUZ_PROVIDER].options] == [
         ("qobuz--one", "Qobuz One"),
         ("qobuz--two", "Qobuz Two"),
@@ -179,9 +187,38 @@ async def test_existing_instance_does_not_collide_with_itself_when_suggesting_po
 
     mass.config.get_provider_configs = AsyncMock(side_effect=configs)
 
-    entries = await get_config_entries(mass, instance_id="qobuz_connect--one")
+    entries = await build_setup_entries(mass, instance_id="qobuz_connect--one")
 
     assert next(entry for entry in entries if entry.key == CONF_HTTP_PORT).default_value == 8695
+
+
+async def test_loaded_provider_exposes_quality_as_runtime_option() -> None:
+    """Loaded providers expose only the dynamically editable quality option."""
+    provider, _mass = _make_provider()
+
+    entries = await provider.get_config_entries()
+
+    assert [entry.key for entry in entries] == [CONF_MAX_QUALITY]
+
+
+def test_setup_data_precedes_legacy_config_values() -> None:
+    """Setup-flow data wins over values stored by the retired config schema."""
+    provider, mass = _make_provider()
+    mass.config.get_provider_setup_value.side_effect = lambda _instance_id, key, default=None: {
+        CONF_PUBLISH_NAME: "Setup name",
+        CONF_HTTP_PORT: 8795,
+    }.get(key, default)
+    mass.config.decrypt_string.side_effect = lambda value: value
+    mass.config.get.side_effect = lambda key, default=None: {
+        f"providers/{provider.instance_id}/setup_data": {
+            CONF_PUBLISH_NAME: "Setup name",
+            CONF_HTTP_PORT: 8795,
+        }
+    }.get(key, default)
+    provider = QobuzConnectProvider(mass, provider.manifest, provider.config)
+
+    assert provider._publish_name == "Setup name"
+    assert provider._http_port == 8795
 
 
 def test_selected_qobuz_instance_is_used_for_streams() -> None:

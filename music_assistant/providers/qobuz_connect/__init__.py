@@ -113,78 +113,6 @@ async def setup(
     return QobuzConnectProvider(mass, manifest, config)
 
 
-async def get_config_entries(
-    mass: MusicAssistant,
-    instance_id: str | None = None,
-    action: str | None = None,  # noqa: ARG001
-    values: dict[str, ConfigValueType] | None = None,  # noqa: ARG001
-) -> tuple[ConfigEntry, ...]:
-    """Return config entries for this provider."""
-    qobuz_configs = await mass.config.get_provider_configs(provider_domain="qobuz")
-    default_qobuz_provider = qobuz_configs[0].instance_id if qobuz_configs else None
-    return (
-        ConfigEntry(
-            key=CONF_QOBUZ_PROVIDER,
-            type=ConfigEntryType.STRING,
-            default_value=default_qobuz_provider,
-            required=True,
-            options=[
-                ConfigValueOption(config.instance_id, title=config.name) for config in qobuz_configs
-            ],
-        ),
-        ConfigEntry(
-            key=CONF_TARGET_PLAYER,
-            type=ConfigEntryType.STRING,
-            default_value=PLAYER_ID_AUTO,
-            required=True,
-            options=[
-                # Static option title lives in strings.json; player names are
-                # dynamic data so their title is supplied inline.
-                ConfigValueOption(PLAYER_ID_AUTO),
-                *(
-                    ConfigValueOption(player.player_id, title=player.display_name)
-                    for player in sorted(
-                        mass.players.all_players(False, False), key=lambda x: x.display_name
-                    )
-                ),
-            ],
-        ),
-        ConfigEntry(
-            key=CONF_PUBLISH_NAME,
-            type=ConfigEntryType.STRING,
-            default_value="Music Assistant",
-            required=True,
-        ),
-        ConfigEntry(
-            key=CONF_HTTP_PORT,
-            type=ConfigEntryType.INTEGER,
-            default_value=await _suggest_http_port(mass, instance_id),
-            required=True,
-        ),
-        ConfigEntry(
-            key=CONF_MAX_QUALITY,
-            type=ConfigEntryType.STRING,
-            default_value="27",
-            required=True,
-            options=[
-                # Option titles are authored in strings.json (config_entries.
-                # max_quality.options.<value>); pass value-only here.
-                ConfigValueOption("27"),
-                ConfigValueOption("7"),
-                ConfigValueOption("6"),
-                ConfigValueOption("5"),
-                ConfigValueOption(str(AUTO_QUALITY)),
-            ],
-        ),
-        ConfigEntry(
-            key=CONF_INITIAL_VOLUME,
-            type=ConfigEntryType.INTEGER,
-            default_value=DEFAULT_INITIAL_VOLUME,
-            required=True,
-        ),
-    )
-
-
 class QobuzConnectProvider(PluginProvider):
     """Qobuz Connect provider that controls native MA queue playback."""
 
@@ -193,10 +121,18 @@ class QobuzConnectProvider(PluginProvider):
     ) -> None:
         """Initialize provider."""
         super().__init__(mass, manifest, config, set())
-        self._target_player_id = cast("str", config.get_value(CONF_TARGET_PLAYER)) or PLAYER_ID_AUTO
-        self._publish_name = cast("str", config.get_value(CONF_PUBLISH_NAME)) or self.name
-        self._http_port = int(cast("int | str", config.get_value(CONF_HTTP_PORT)) or 8695)
-        self._qobuz_provider_id = cast("str | None", config.get_value(CONF_QOBUZ_PROVIDER))
+        self._target_player_id = (
+            cast("str", self._get_setup_or_legacy_value(CONF_TARGET_PLAYER)) or PLAYER_ID_AUTO
+        )
+        self._publish_name = (
+            cast("str", self._get_setup_or_legacy_value(CONF_PUBLISH_NAME)) or self.name
+        )
+        self._http_port = int(
+            cast("int | str", self._get_setup_or_legacy_value(CONF_HTTP_PORT)) or 8695
+        )
+        self._qobuz_provider_id = cast(
+            "str | None", self._get_setup_or_legacy_value(CONF_QOBUZ_PROVIDER)
+        )
         self._configured_max_quality = int(cast("str", config.get_value(CONF_MAX_QUALITY)) or "27")
         self._max_quality = self._resolve_max_quality(self._configured_max_quality)
         self._initial_volume = max(
@@ -204,7 +140,10 @@ class QobuzConnectProvider(PluginProvider):
             min(
                 100,
                 int(
-                    cast("int | str | None", config.get_value(CONF_INITIAL_VOLUME))
+                    cast(
+                        "int | str | None",
+                        self._get_setup_or_legacy_value(CONF_INITIAL_VOLUME),
+                    )
                     or DEFAULT_INITIAL_VOLUME
                 ),
             ),
@@ -399,6 +338,10 @@ class QobuzConnectProvider(PluginProvider):
             await self._quality_reporter.report_current(self._max_quality)
             return
         await super().update_config(config, changed_keys)
+
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return dynamically editable provider options."""
+        return (_quality_config_entry(),)
 
     @property
     def qobuz_session(self) -> QobuzConnectSession | None:
@@ -798,6 +741,15 @@ class QobuzConnectProvider(PluginProvider):
             return
         await self._coordinator.on_ma_volume_event(player_id)
 
+    def _get_setup_or_legacy_value(
+        self, key: str, default: ConfigValueType = None
+    ) -> ConfigValueType:
+        """Return a setup-flow value, falling back to the legacy option value."""
+        setup_value = self.get_setup_value(key)
+        if setup_value is not None:
+            return setup_value
+        return self.config.get_value(key, default)
+
 
 class _LiveSessionProxy:
     """
@@ -835,19 +787,21 @@ class _LiveSessionProxy:
         return _noop
 
 
-async def _suggest_http_port(mass: MusicAssistant, instance_id: str | None) -> int:
-    """Return the first default HTTP port not used by another Connect instance."""
-    configs = await mass.config.get_provider_configs(provider_domain="qobuz_connect")
-    used_ports = {
-        int(cast("int | str", port))
-        for config in configs
-        if config.instance_id != instance_id
-        and (port := config.get_value(CONF_HTTP_PORT)) is not None
-    }
-    port = 8695
-    while port in used_ports:
-        port += 1
-    return port
+def _quality_config_entry() -> ConfigEntry:
+    """Build the runtime maximum-quality option."""
+    return ConfigEntry(
+        key=CONF_MAX_QUALITY,
+        type=ConfigEntryType.STRING,
+        default_value="27",
+        required=True,
+        options=[
+            ConfigValueOption("27"),
+            ConfigValueOption("7"),
+            ConfigValueOption("6"),
+            ConfigValueOption("5"),
+            ConfigValueOption(str(AUTO_QUALITY)),
+        ],
+    )
 
 
 def _normalize_quality_id(value: int) -> int | None:
