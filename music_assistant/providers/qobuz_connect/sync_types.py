@@ -55,6 +55,12 @@ class CanonicalState:
     autoplay: bool = False
     active: bool = False
     activation_requested: bool = False
+    release_pending: bool = False
+    """
+    True after cloud ownership loss until MA confirms the released player
+    stopped. Delayed PLAYING events from that release must not reacquire the
+    renderer; a later user-originated play can acquire after STOPPED clears it.
+    """
     own_rid: int | None = None
     active_rid: int | None = None
     pending: tuple[Proposal, ...] = field(default_factory=tuple)

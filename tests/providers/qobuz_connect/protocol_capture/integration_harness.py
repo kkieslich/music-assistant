@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
@@ -125,6 +126,8 @@ class SafetyPreflight:
         ma_query_func: Callable[[str, dict[str, object]], Awaitable[object]],
         connect_target: str,
         managed_pid: int | None,
+        managed_config_func: Callable[[], dict[str, object] | None] | None = None,
+        managed_ports_owned_func: Callable[[], bool] | None = None,
     ) -> None:
         """Store preflight dependencies."""
         self._qobuz = qobuz
@@ -132,6 +135,8 @@ class SafetyPreflight:
         self._ma_query = ma_query_func
         self._connect_target = connect_target
         self._managed_pid = managed_pid
+        self._managed_config = managed_config_func
+        self._managed_ports_owned = managed_ports_owned_func
 
     async def run(self) -> PreflightResult:
         """Run every mandatory safety check."""
@@ -139,38 +144,16 @@ class SafetyPreflight:
         failures: list[str] = []
         if self._managed_pid is None:
             failures.append("No identified managed MA process is available")
+        elif self._managed_ports_owned is not None and not self._managed_ports_owned():
+            failures.append(
+                f"Managed MA process pid={self._managed_pid} does not own harness ports"
+            )
         else:
             checks.append(f"managed MA process pid={self._managed_pid}")
 
-        provider_result = await self._ma_query(
-            "config/providers",
-            {"provider_domain": "qobuz_connect", "include_values": True},
-        )
-        providers = provider_result if isinstance(provider_result, list) else []
-        matching_providers = [
-            provider
-            for provider in providers
-            if isinstance(provider, dict)
-            and provider.get("domain") == "qobuz_connect"
-            and isinstance(provider.get("values"), dict)
-            and _provider_config_value(provider, "publish_name") == self._connect_target
-        ]
-        if len(matching_providers) != 1:
-            failures.append(
-                f"Expected exactly one loaded MA provider named {self._connect_target!r}"
-            )
-        else:
-            provider = matching_providers[0]
-            target = _provider_config_value(provider, "target_player")
-            if target != BLACKHOLE_PLAYER_ID:
-                failures.append(
-                    f"Qobuz Connect target player is {target!r}, expected BlackHole "
-                    f"{BLACKHOLE_PLAYER_ID!r}"
-                )
-            else:
-                checks.append(f"provider target={BLACKHOLE_PLAYER_ID}")
-            if provider.get("last_error"):
-                failures.append(f"Qobuz Connect provider error: {provider['last_error']}")
+        provider_checks, provider_failures = await self._check_provider()
+        checks.extend(provider_checks)
+        failures.extend(provider_failures)
 
         player_result = await self._ma_query(
             "players/all",
@@ -231,6 +214,69 @@ class SafetyPreflight:
                         f"client {label} browser-local output=default-audio-output ({selected})"
                     )
         return PreflightResult(checks=tuple(checks), failures=tuple(failures))
+
+    async def _check_provider(self) -> tuple[list[str], list[str]]:
+        """Validate the exact managed Qobuz Connect provider and target."""
+        checks: list[str] = []
+        failures: list[str] = []
+        provider_result = await self._ma_query(
+            "config/providers",
+            {"provider_domain": "qobuz_connect", "include_values": True},
+        )
+        providers = provider_result if isinstance(provider_result, list) else []
+        managed_config = self._managed_config() if self._managed_config is not None else None
+        if managed_config is None:
+            matching_providers = [
+                provider
+                for provider in providers
+                if isinstance(provider, dict)
+                and provider.get("domain") == "qobuz_connect"
+                and isinstance(provider.get("values"), dict)
+                and _provider_config_value(provider, "publish_name") == self._connect_target
+            ]
+        else:
+            matching_providers = [
+                provider
+                for provider in providers
+                if isinstance(provider, dict)
+                and provider.get("domain") == "qobuz_connect"
+                and provider.get("instance_id") == managed_config.get("instance_id")
+            ]
+        if len(matching_providers) != 1:
+            failures.append(
+                f"Expected exactly one loaded MA provider named {self._connect_target!r}"
+            )
+        else:
+            provider = matching_providers[0]
+            publish_name = (
+                managed_config.get("publish_name")
+                if managed_config is not None
+                else _provider_config_value(provider, "publish_name")
+            )
+            if publish_name != self._connect_target:
+                failures.append(
+                    f"Qobuz Connect publish name is {publish_name!r}, "
+                    f"expected {self._connect_target!r}"
+                )
+            target = (
+                managed_config.get("target_player")
+                if managed_config is not None
+                else _provider_config_value(provider, "target_player")
+            )
+            if target != BLACKHOLE_PLAYER_ID:
+                failures.append(
+                    f"Qobuz Connect target player is {target!r}, expected BlackHole "
+                    f"{BLACKHOLE_PLAYER_ID!r}"
+                )
+            else:
+                checks.append(f"provider target={BLACKHOLE_PLAYER_ID}")
+            if provider.get("last_error"):
+                failures.append(f"Qobuz Connect provider error: {provider['last_error']}")
+            if provider.get("status") != "loaded":
+                failures.append(
+                    f"Qobuz Connect provider is not loaded: status={provider.get('status')!r}"
+                )
+        return checks, failures
 
 
 class IntegrationSession:
@@ -629,6 +675,8 @@ async def open_session(
         ma_query_func=ma_query,
         connect_target=CONNECT_TARGET,
         managed_pid=ma.managed_pid,
+        managed_config_func=ma.managed_connect_config,
+        managed_ports_owned_func=ma.owns_managed_ports,
     )
     session = IntegrationSession(client, ma, preflight, observer)
     return session, (pw, browser)
@@ -643,15 +691,25 @@ async def close_session(handle: tuple[Playwright, Browser]) -> None:
 
 def default_probe() -> MAProbe:
     """
-    Build a probe that manages an MA process on the local playground dirs.
+    Build a probe that manages MA from disposable playground copies.
 
-    Writes MA's log to a temp file. The ``.mass-data`` provider config must
+    The source ``.mass-data`` provider config must
     have qobuz + qobuz_connect set up and the Connect target pinned to a
     silent player (e.g. BlackHole) so integration runs make no audible sound.
     """
-    log_path = Path(tempfile.gettempdir()) / "ma_integration_run.log"
-    return MAProbe(
-        log_path=log_path,
-        data_dir=Path(".mass-data").resolve(),
-        cache_dir=Path(".mass-cache").resolve(),
-    )
+    source_data = Path(".mass-data").resolve()
+    source_cache = Path(".mass-cache").resolve()
+    run_dir = tempfile.TemporaryDirectory(prefix="ma-qobuz-connect-")
+    run_root = Path(run_dir.name)
+    try:
+        data_dir = shutil.copytree(source_data, run_root / "mass-data")
+        cache_dir = shutil.copytree(source_cache, run_root / "mass-cache")
+        return MAProbe(
+            log_path=Path(tempfile.gettempdir()) / "ma_integration_run.log",
+            data_dir=data_dir,
+            cache_dir=cache_dir,
+            run_dir=run_dir,
+        )
+    except BaseException:
+        run_dir.cleanup()
+        raise

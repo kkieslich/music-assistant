@@ -22,11 +22,18 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import psutil
+from cryptography.fernet import Fernet
+
+from music_assistant.constants import CONF_ENCRYPTION_KEY, ENCRYPT_SUFFIX
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -39,6 +46,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 _BLACKHOLE = "b97b9910-b8fe-5ff0-946c-ef06b0d44273"
 MANAGED_CONNECT_TARGET = "Local Dev Hardening prnMvCkz"
 _MANAGED_CONNECT_PORT = 8695
+_MANAGED_PORTS = (8095, _MANAGED_CONNECT_PORT)
 
 # Strip terminal colour codes MA emits so the regexes match cleanly.
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -193,52 +201,88 @@ class MAProbe:
     :param cache_dir: MA ``--cache-dir``.
     """
 
-    def __init__(self, log_path: Path, data_dir: Path, cache_dir: Path) -> None:
+    def __init__(
+        self,
+        log_path: Path,
+        data_dir: Path,
+        cache_dir: Path,
+        run_dir: tempfile.TemporaryDirectory[str] | None = None,
+    ) -> None:
         """Bind the probe to an MA log/data/cache location (does not start MA)."""
         self.log_path = log_path
         self.data_dir = data_dir
         self.cache_dir = cache_dir
+        self._run_dir = run_dir
         self._proc: subprocess.Popen[bytes] | None = None
-        self._saved_connect_values: dict[str, object] | None = None
+        self._saved_connect_config: (
+            tuple[str, dict[str, object], dict[str, object] | None] | None
+        ) = None
+        self._managed_connect_instance_id: str | None = None
 
     def start(self, *, connect_timeout: float = 90.0) -> None:
         """Launch MA (Connect target pinned to BlackHole) and block until it connects."""
-        self._pin_target(_BLACKHOLE)
-        self.log_path.write_bytes(b"")
-        log_fh = self.log_path.open("wb")
-        self._proc = subprocess.Popen(  # noqa: S603 - fixed argv launching our own venv python
-            [
-                str(REPO_ROOT / ".venv/bin/python"),
-                "-m",
-                "music_assistant",
-                "--data-dir",
-                str(self.data_dir),
-                "--cache-dir",
-                str(self.cache_dir),
-                "--log-level",
-                "debug",
-            ],
-            cwd=str(REPO_ROOT),
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-        )
-        self.wait_for("Qobuz Connect WebSocket connected", timeout=connect_timeout)
+        try:
+            occupied = _listening_port_owners(_MANAGED_PORTS)
+            if occupied:
+                details = ", ".join(f"{port} (pid={pid})" for port, pid in sorted(occupied.items()))
+                raise RuntimeError(f"Managed integration ports are occupied: {details}")
+            self._pin_target(_BLACKHOLE)
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open("wb") as log_fh:
+                self._proc = subprocess.Popen(  # noqa: S603 - fixed argv
+                    [
+                        str(REPO_ROOT / ".venv/bin/python"),
+                        "-m",
+                        "music_assistant",
+                        "--data-dir",
+                        str(self.data_dir),
+                        "--cache-dir",
+                        str(self.cache_dir),
+                        "--log-level",
+                        "debug",
+                    ],
+                    cwd=str(REPO_ROOT),
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                )
+            self._wait_until_ready(connect_timeout)
+            if not self.owns_managed_ports():
+                raise RuntimeError("Managed MA process does not own ports 8095 and 8695")
+        except BaseException:
+            self.stop()
+            raise
 
     @property
     def managed_pid(self) -> int | None:
         """Return the PID of the MA process started by this probe."""
-        return self._proc.pid if self._proc is not None else None
+        if self._proc is None or self._proc.poll() is not None:
+            return None
+        return self._proc.pid
+
+    def owns_managed_ports(self) -> bool:
+        """Return whether the live managed child owns both harness listeners."""
+        pid = self.managed_pid
+        if pid is None:
+            return False
+        owners = _process_listening_port_owners(pid, _MANAGED_PORTS)
+        return all(owners.get(port) == pid for port in _MANAGED_PORTS)
 
     def stop(self) -> None:
         """Terminate MA if this probe started it, then restore the target player."""
-        if self._proc is not None:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-            self._proc = None
-        self._restore_target()
+        try:
+            if self._proc is not None:
+                if self._proc.poll() is None:
+                    self._proc.terminate()
+                    try:
+                        self._proc.wait(timeout=20)
+                    except subprocess.TimeoutExpired:
+                        self._proc.kill()
+                self._proc = None
+        finally:
+            self._restore_target()
+            if self._run_dir is not None:
+                self._run_dir.cleanup()
+                self._run_dir = None
 
     def cursor(self) -> int:
         """Return the current byte length of the log; pass to :meth:`events_since`."""
@@ -299,6 +343,27 @@ class MAProbe:
             time.sleep(poll)
         return events
 
+    def managed_connect_config(self) -> dict[str, object] | None:
+        """Return the non-secret managed setup fields currently pinned on disk."""
+        if self._managed_connect_instance_id is None:
+            return None
+        settings = self.data_dir / "settings.json"
+        data = json.loads(settings.read_text())
+        provider = data.get("providers", {}).get(self._managed_connect_instance_id)
+        if not isinstance(provider, dict):
+            return None
+        setup_data = provider.get("setup_data")
+        if not isinstance(setup_data, dict):
+            return None
+        return {
+            "instance_id": self._managed_connect_instance_id,
+            "target_player": _decrypt_setup_string(data, setup_data.get("target_player")),
+            "publish_name": _decrypt_setup_string(data, setup_data.get("publish_name")),
+            "http_port": setup_data.get("http_port"),
+            "qobuz_provider": _decrypt_setup_string(data, setup_data.get("qobuz_provider")),
+            "initial_volume": setup_data.get("initial_volume"),
+        }
+
     def _has(self, needle: str, cursor: int) -> bool:
         if not self.log_path.exists():
             return False
@@ -306,37 +371,137 @@ class MAProbe:
             fh.seek(cursor)
             return needle in fh.read().decode("utf-8", errors="replace")
 
+    def _wait_until_ready(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._proc is None:
+                raise RuntimeError("Managed MA process was not started")
+            if (status := self._proc.poll()) is not None:
+                raise RuntimeError(f"Managed MA process exited with status {status}")
+            if self._has("Qobuz Connect WebSocket connected", 0):
+                return
+            time.sleep(0.3)
+        raise TimeoutError("Managed MA did not connect to Qobuz before startup timeout")
+
     def _pin_target(self, player_id: str) -> None:
         settings = self.data_dir / "settings.json"
         data = json.loads(settings.read_text())
+        providers = data.get("providers", {})
+        if not isinstance(providers, dict):
+            raise TypeError("Managed integration data has no provider configuration")
         qobuz_instance = next(
             (
                 key
-                for key, value in data.get("providers", {}).items()
+                for key, value in providers.items()
                 if isinstance(value, dict) and value.get("domain") == "qobuz"
             ),
             None,
         )
         if qobuz_instance is None:
             raise RuntimeError("Managed integration data has no native Qobuz provider")
-        for value in data.get("providers", {}).values():
-            if isinstance(value, dict) and value.get("domain") == "qobuz_connect":
-                self._saved_connect_values = dict(value["values"])
-                value["values"]["target_player"] = player_id
-                value["values"]["publish_name"] = MANAGED_CONNECT_TARGET
-                value["values"]["http_port"] = _MANAGED_CONNECT_PORT
-                value["values"]["qobuz_provider"] = qobuz_instance
-                value["values"].setdefault("max_quality", "27")
-                value["values"].setdefault("initial_volume", 25)
+        connect_providers = [
+            (key, value)
+            for key, value in providers.items()
+            if isinstance(value, dict) and value.get("domain") == "qobuz_connect"
+        ]
+        if len(connect_providers) != 1:
+            raise RuntimeError(
+                "Managed integration data must have exactly one Qobuz Connect provider"
+            )
+        instance_id, provider = connect_providers[0]
+        values = provider.get("values")
+        if not isinstance(values, dict):
+            raise TypeError("Managed Qobuz Connect provider has invalid option values")
+        setup_data = provider.get("setup_data")
+        if setup_data is not None and not isinstance(setup_data, dict):
+            raise TypeError("Managed Qobuz Connect provider has invalid setup data")
+        self._saved_connect_config = (
+            instance_id,
+            dict(values),
+            dict(setup_data) if setup_data is not None else None,
+        )
+        managed_setup = dict(setup_data or {})
+        managed_setup.update(
+            {
+                "target_player": _encrypt_setup_string(data, player_id),
+                "publish_name": _encrypt_setup_string(data, MANAGED_CONNECT_TARGET),
+                "http_port": _MANAGED_CONNECT_PORT,
+                "qobuz_provider": _encrypt_setup_string(data, qobuz_instance),
+                "initial_volume": 25,
+            }
+        )
+        provider["setup_data"] = managed_setup
+        values.setdefault("max_quality", "27")
+        self._managed_connect_instance_id = instance_id
         settings.write_text(json.dumps(data, indent=1))
 
     def _restore_target(self) -> None:
-        if self._saved_connect_values is None:
+        if self._saved_connect_config is None:
             return
         settings = self.data_dir / "settings.json"
         data = json.loads(settings.read_text())
-        for value in data.get("providers", {}).values():
-            if isinstance(value, dict) and value.get("domain") == "qobuz_connect":
-                value["values"] = self._saved_connect_values
+        instance_id, saved_values, saved_setup_data = self._saved_connect_config
+        provider = data.get("providers", {}).get(instance_id)
+        if isinstance(provider, dict):
+            provider["values"] = saved_values
+            if saved_setup_data is None:
+                provider.pop("setup_data", None)
+            else:
+                provider["setup_data"] = saved_setup_data
         settings.write_text(json.dumps(data, indent=1))
-        self._saved_connect_values = None
+        self._saved_connect_config = None
+        self._managed_connect_instance_id = None
+
+
+def _encrypt_setup_string(data: dict[str, object], value: str) -> str:
+    """Encrypt one managed setup string with the copied MA server key."""
+    encryption_key = data.get(CONF_ENCRYPTION_KEY)
+    if not isinstance(encryption_key, str) or not encryption_key:
+        raise RuntimeError("Managed integration data has no encryption key")
+    return ENCRYPT_SUFFIX + Fernet(encryption_key.encode()).encrypt(value.encode()).decode()
+
+
+def _decrypt_setup_string(data: dict[str, object], value: object) -> object:
+    """Decrypt one whitelisted managed setup string for preflight comparison."""
+    if not isinstance(value, str) or not value.startswith(ENCRYPT_SUFFIX):
+        return value
+    encryption_key = data.get(CONF_ENCRYPTION_KEY)
+    if not isinstance(encryption_key, str) or not encryption_key:
+        raise RuntimeError("Managed integration data has no encryption key")
+    token = value.removeprefix(ENCRYPT_SUFFIX)
+    return Fernet(encryption_key.encode()).decrypt(token.encode()).decode()
+
+
+def _listening_port_owners(ports: tuple[int, ...]) -> dict[int, int | None]:
+    """Return each requested port accepting loopback TCP connections."""
+    owners: dict[int, int | None] = {}
+    for port in ports:
+        for host in ("127.0.0.1", "::1"):
+            try:
+                with socket.create_connection((host, port), timeout=0.2):
+                    owners[port] = None
+                    break
+            except OSError:
+                continue
+    return owners
+
+
+def _process_listening_port_owners(
+    process_id: int,
+    ports: tuple[int, ...],
+) -> dict[int, int]:
+    """Return requested TCP listeners owned by one managed process."""
+    requested = set(ports)
+    try:
+        connections = psutil.Process(process_id).net_connections(kind="tcp")
+    except psutil.Error:
+        return {}
+    return {
+        connection.laddr.port: process_id
+        for connection in connections
+        if (
+            connection.status == psutil.CONN_LISTEN
+            and connection.laddr
+            and connection.laddr.port in requested
+        )
+    }

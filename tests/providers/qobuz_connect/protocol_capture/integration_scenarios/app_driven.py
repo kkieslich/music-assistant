@@ -41,6 +41,7 @@ async def scenario_handoff_fresh(session: IntegrationSession) -> ScenarioResult:
         detail=f"streams={[s.track_id for s in ev.streams]}",
     )
     session.assert_sound(result, "audio is actually playing")
+    await session.assert_in_sync(result, "both clients and MA show track 0")
     return result
 
 
@@ -318,6 +319,7 @@ async def scenario_queue_reorder(session: IntegrationSession) -> ScenarioResult:
         detail=f"effects={ev.effects()}",
     )
     session.assert_sound(result, "audio continues after reorder")
+    await session.assert_in_sync(result, "both clients and MA remain on the reordered current")
     return result
 
 

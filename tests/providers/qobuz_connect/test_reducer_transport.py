@@ -25,6 +25,7 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     Disconnected,
     MaPause,
     MaPlayTrack,
+    MaReleasePlayer,
     MaResume,
     MaResyncQueue,
     MaSeek,
@@ -423,6 +424,70 @@ def test_load_ack_reanchors_settling_window_for_stale_ma_position() -> None:
     )
     assert stale.state.position_ms == 0
     assert stale.state.settling_position is True
+
+
+def test_load_ack_does_not_settle_on_transient_new_track_position() -> None:
+    """
+    A fleeting low position must not expose a stale high position for the new track.
+
+    MA can briefly report the new queue item near zero, then reuse the previous
+    stream's elapsed time for that same item before the replacement stream
+    stabilizes. The first near-zero report must not end the settling guard.
+    """
+    loaded = reduce(
+        CanonicalState(
+            cloud_version=QueueVersion(5, 1),
+            tracks=_refs(0, 1),
+            current_id=900000,
+            playing=PlayingState.PLAYING,
+            position_ms=28000,
+            position_anchor_ms=1000,
+            active=True,
+        ),
+        CloudLoadAck(
+            now_ms=40000,
+            version=QueueVersion(6, 1),
+            action_uuid=b"\xcc" * 16,
+            tracks=_refs(0, 1, 2, 3, 4),
+            queue_position=4,
+        ),
+    )
+
+    transient_low = reduce(
+        loaded.state,
+        MaTransportChanged(
+            now_ms=40420,
+            playing=PlayingState.PLAYING,
+            current_track_id=900004,
+            position_ms=6,
+        ),
+    )
+    assert transient_low.state.position_ms == 0
+    assert transient_low.state.settling_position is True
+
+    stale_high = reduce(
+        transient_low.state,
+        MaTransportChanged(
+            now_ms=40422,
+            playing=PlayingState.PLAYING,
+            current_track_id=900004,
+            position_ms=28252,
+        ),
+    )
+    assert stale_high.state.position_ms == 0
+    assert stale_high.state.settling_position is True
+
+    stable = reduce(
+        stale_high.state,
+        MaTransportChanged(
+            now_ms=41500,
+            playing=PlayingState.PLAYING,
+            current_track_id=900004,
+            position_ms=2400,
+        ),
+    )
+    assert stable.state.position_ms == 2400
+    assert stable.state.settling_position is False
 
 
 def test_load_ack_same_current_does_not_restart() -> None:
@@ -963,6 +1028,92 @@ def test_inactive_ma_play_requests_ownership_once_without_reporting() -> None:
     assert first.state.activation_requested is True
     assert first.effects == (PushSetActive(),)
     assert second.effects == ()
+
+
+def test_cloud_deactivation_does_not_reacquire_on_stale_ma_playing() -> None:
+    """A stale PLAYING event from player release must not undo cloud deactivation."""
+    active = CanonicalState(
+        tracks=_refs(0),
+        current_id=900000,
+        playing=PlayingState.PLAYING,
+        active=True,
+        own_rid=42,
+        active_rid=42,
+    )
+    deactivated = reduce(active, CloudSetActive(now_ms=1, active=False))
+    ownership_changed = reduce(
+        deactivated.state,
+        CloudActiveRendererChanged(now_ms=2, renderer_id=9),
+    )
+
+    stale_playing = reduce(
+        ownership_changed.state,
+        MaTransportChanged(
+            now_ms=3,
+            playing=PlayingState.PLAYING,
+            current_track_id=900000,
+            position_ms=1000,
+            target_player_id="p1",
+        ),
+    )
+
+    assert stale_playing.state.activation_requested is False
+    assert stale_playing.effects == ()
+
+    stopped = reduce(
+        stale_playing.state,
+        MaTransportChanged(
+            now_ms=4,
+            playing=PlayingState.STOPPED,
+            current_track_id=900000,
+            position_ms=1000,
+            target_player_id="p1",
+        ),
+    )
+    genuine_play = reduce(
+        stopped.state,
+        MaTransportChanged(
+            now_ms=5,
+            playing=PlayingState.PLAYING,
+            current_track_id=900000,
+            position_ms=1000,
+            target_player_id="p1",
+        ),
+    )
+    assert genuine_play.effects == (PushSetActive(),)
+
+
+def test_active_renderer_loss_releases_before_ignoring_stale_ma_playing() -> None:
+    """Ownership-change-first ordering must release MA without reacquiring."""
+    active = CanonicalState(
+        tracks=_refs(0),
+        current_id=900000,
+        playing=PlayingState.PLAYING,
+        active=True,
+        own_rid=42,
+        active_rid=42,
+    )
+
+    ownership_changed = reduce(
+        active,
+        CloudActiveRendererChanged(now_ms=1, renderer_id=9),
+    )
+    deactivated = reduce(ownership_changed.state, CloudSetActive(now_ms=2, active=False))
+    stale_playing = reduce(
+        deactivated.state,
+        MaTransportChanged(
+            now_ms=3,
+            playing=PlayingState.PLAYING,
+            current_track_id=900000,
+            position_ms=1000,
+            target_player_id="p1",
+        ),
+    )
+
+    assert ownership_changed.effects == (MaReleasePlayer(),)
+    assert deactivated.effects == ()
+    assert stale_playing.state.activation_requested is False
+    assert stale_playing.effects == ()
 
 
 def test_ownership_confirmation_enables_reporting_without_restarting_ma() -> None:

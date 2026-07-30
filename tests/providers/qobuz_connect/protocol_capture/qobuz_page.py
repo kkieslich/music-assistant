@@ -21,11 +21,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from music_assistant.providers.qobuz_connect.models import PlayingState
+from music_assistant.providers.qobuz_connect.protocol import QobuzConnectCodec
+
 if TYPE_CHECKING:
-    from playwright.async_api import BrowserContext, Locator, Page
+    from playwright.async_api import BrowserContext, Page
 
 LOGGER = logging.getLogger(__name__)
 
@@ -105,10 +109,17 @@ class QobuzPage:
 
     async def play(self) -> None:
         """Press the player's play/pause button (toggles state)."""
-        await self._play_pause_locator().click()
+        await self._click_transport_control(
+            ".player__action-pause, .player__action-play", "play/pause"
+        )
 
-    pause = play  # The same element is clicked to pause when playing.
-    resume = play  # ...and to resume when paused.
+    async def pause(self) -> None:
+        """Send the Web Client's explicit controller pause command."""
+        await self._set_playing_state(PlayingState.PAUSED)
+
+    async def resume(self) -> None:
+        """Send the Web Client's explicit controller resume command."""
+        await self._set_playing_state(PlayingState.PLAYING)
 
     async def current_track_name(self) -> str:
         """
@@ -692,12 +703,28 @@ class QobuzPage:
         )
         return snapshot if isinstance(snapshot, dict) else {}
 
-    def _play_pause_locator(self) -> Locator:
+    async def _click_transport_control(self, selector: str, action: str) -> None:
         """
-        Locate the play/pause toggle.
+        Click one transport control, reloading once if the player UI is missing.
 
-        The class flips between ``player__action-pause`` (currently
-        playing) and ``player__action-play`` (currently paused). We
-        accept either via a comma-selector — first match wins.
+        :param selector: CSS selector for the required player state.
+        :param action: Human-readable action name for diagnostics.
         """
-        return self.page.locator(".player__action-pause, .player__action-play").first
+        control = self.page.locator(selector).first
+        try:
+            await control.wait_for(state="visible", timeout=3_000)
+        except Exception:
+            LOGGER.warning("[%s] %s control missing; reloading Qobuz", self.label, action)
+            await self.open()
+            control = self.page.locator(selector).first
+            await control.wait_for(state="visible", timeout=15_000)
+        await control.click(timeout=5_000)
+
+    async def _set_playing_state(self, state: PlayingState) -> None:
+        """
+        Send an explicit transport state through the authenticated Web Client.
+
+        :param state: Qobuz controller playback state to request.
+        """
+        codec = QobuzConnectCodec(uuid.uuid4().bytes)
+        await self.send_qconnect_frame(codec.encode_ctrl_set_player_state(playing_state=state))

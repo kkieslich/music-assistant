@@ -66,6 +66,7 @@ async def scenario_actual_quality(session: IntegrationSession) -> ScenarioResult
         session.ma_current_track_id() == QUALITY_TRACK_ID,
         detail=f"expected={QUALITY_TRACK_ID} actual={session.ma_current_track_id()}",
     )
+    session.assert_sound(result, "quality test track produces BlackHole audio")
     maximums = [
         report for report in session.ma.events_since(0).qualities if report.kind == "maximum"
     ]
@@ -81,7 +82,11 @@ async def scenario_quality_change(session: IntegrationSession) -> ScenarioResult
     """Verify an app quality change reaches both Connect and native Qobuz configs."""
     result = ScenarioResult(scenario="quality_change")
     await session.reset_to_clean_state()
+    cursor = session.ma.cursor()
     await session.handoff_to_ma()
+    session.wait_for_playing(cursor, timeout=25.0)
+    session.assert_sound(result, "audio continues during quality changes")
+    await session.assert_in_sync(result, "both clients and MA agree before quality changes")
     renderer_id = session.client.recorder.renderer_id(session.connect_target)
     result.check(
         "cloud advertised the exact managed renderer",
@@ -99,6 +104,8 @@ async def scenario_quality_change(session: IntegrationSession) -> ScenarioResult
         connect_quality == native_quality == "6",
         detail=f"connect={connect_quality!r} native={native_quality!r}",
     )
+    session.assert_sound(result, "audio continues after applying CD quality")
+    await session.assert_in_sync(result, "both clients and MA agree after applying CD quality")
 
     await session.q.send_qconnect_frame(codec.encode_ctrl_set_max_quality(renderer_id, 27))
     connect_quality, native_quality = await _wait_for_provider_qualities("27")
@@ -107,6 +114,8 @@ async def scenario_quality_change(session: IntegrationSession) -> ScenarioResult
         connect_quality == native_quality == "27",
         detail=f"connect={connect_quality!r} native={native_quality!r}",
     )
+    session.assert_sound(result, "audio continues after restoring 24/192 quality")
+    await session.assert_in_sync(result, "both clients and MA agree after restoring 24/192")
     return result
 
 

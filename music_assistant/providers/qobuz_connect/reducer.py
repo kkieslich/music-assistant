@@ -96,8 +96,14 @@ _TRANSPORT_INBOUND = (
 _SEEK_THRESHOLD_MS = 1500
 
 # After a cloud-commanded seek/track-change, MA's reported position is
-# considered caught up once it lands within this of the commanded target.
+# considered caught up once it lands within this of the live commanded
+# position.
 _POSITION_CONVERGE_MS = 2000
+
+# MA can briefly report a new queue item near zero before its corrected
+# elapsed time falls back to the previous stream's position. Keep the
+# settling guard through that transient handover.
+_POSITION_SETTLE_GRACE_MS = 1000
 
 # Hard cap on how long the transport lane holds the commanded target while
 # MA catches up. Bounds suppression so a genuinely divergent MA can never
@@ -388,6 +394,7 @@ def _reduce_transport(state: CanonicalState, event: Event) -> ReduceResult:
             state,
             active=False,
             activation_requested=False,
+            release_pending=False,
             own_rid=None,
             active_rid=None,
             pending=(),
@@ -569,7 +576,12 @@ def _apply_transport(
 
 def _takeover(state: CanonicalState, now_ms: int) -> ReduceResult:
     """Activate this renderer and adopt canonical current, playing it once if it's live."""
-    active = dataclasses.replace(state, active=True, activation_requested=False)
+    active = dataclasses.replace(
+        state,
+        active=True,
+        activation_requested=False,
+        release_pending=False,
+    )
     if state.current_id is not None and state.playing is PlayingState.PLAYING:
         # A handoff from phone/web hands us a position anchored at
         # position_anchor_ms; while PLAYING it has advanced since. Resume at the
@@ -603,7 +615,12 @@ def _deactivate(state: CanonicalState) -> ReduceResult:
     if not state.active:
         return ReduceResult(state, ())
     return ReduceResult(
-        dataclasses.replace(state, active=False, activation_requested=False),
+        dataclasses.replace(
+            state,
+            active=False,
+            activation_requested=False,
+            release_pending=True,
+        ),
         (MaReleasePlayer(),),
     )
 
@@ -643,14 +660,20 @@ def _ma_transport(state: CanonicalState, event: MaTransportChanged) -> ReduceRes
     # user hit on 2026-07-11. Hold the commanded target until MA converges to
     # it (or the settle window expires as a safety cap).
     elif state.settling_position and state.active and event.playing is PlayingState.PLAYING:
+        settle_elapsed_ms = max(0, event.now_ms - state.position_anchor_ms)
+        expected_position_ms = state.position_ms + settle_elapsed_ms
         converged = (
-            event.current_track_id == state.current_id
-            and abs(event.position_ms - state.position_ms) <= _POSITION_CONVERGE_MS
+            settle_elapsed_ms >= _POSITION_SETTLE_GRACE_MS
+            and event.current_track_id == state.current_id
+            and abs(event.position_ms - expected_position_ms) <= _POSITION_CONVERGE_MS
         )
-        timed_out = event.now_ms - state.position_anchor_ms > _POSITION_SETTLE_TIMEOUT_MS
+        timed_out = settle_elapsed_ms > _POSITION_SETTLE_TIMEOUT_MS
         if not converged and not timed_out:
             return ReduceResult(state, (ReportState(),))
     current_id = event.current_track_id if event.current_track_id is not None else state.current_id
+    release_pending = state.release_pending
+    if not state.active and event.playing is PlayingState.STOPPED:
+        release_pending = False
     # Buffer tracks settling: BUFFERING while a transition is still settling
     # (transient stop mid-transition), back to OK once MA has converged/timed
     # out. This ReduceResult already emits ReportState, so the transition
@@ -663,6 +686,7 @@ def _ma_transport(state: CanonicalState, event: MaTransportChanged) -> ReduceRes
         position_anchor_ms=position_anchor_ms,
         settling_position=settling,
         buffer_state=BufferState.BUFFERING if settling else BufferState.OK,
+        release_pending=release_pending,
     )
     # MA is the RENDERER: it reports its live state via rndrSrvrStateUpdated
     # (the ReportState effect), NOT ctrlSrvrSetPlayerState. The latter is a
@@ -676,7 +700,9 @@ def _ma_transport(state: CanonicalState, event: MaTransportChanged) -> ReduceRes
         if (
             playing is PlayingState.PLAYING
             and state.own_rid is not None
+            and state.active_rid != state.own_rid
             and not state.activation_requested
+            and not state.release_pending
         ):
             return ReduceResult(
                 dataclasses.replace(new, activation_requested=True),
@@ -694,13 +720,23 @@ def _active_renderer_changed(
     is_own = state.own_rid is not None and event.renderer_id == state.own_rid
     if is_own:
         return ReduceResult(
-            dataclasses.replace(new, active=True, activation_requested=False),
+            dataclasses.replace(
+                new,
+                active=True,
+                activation_requested=False,
+                release_pending=False,
+            ),
             (ReportState(),),
         )
     if state.active:
         return ReduceResult(
-            dataclasses.replace(new, active=False, activation_requested=False),
-            (),
+            dataclasses.replace(
+                new,
+                active=False,
+                activation_requested=False,
+                release_pending=True,
+            ),
+            (MaReleasePlayer(),),
         )
     return ReduceResult(new, ())
 
