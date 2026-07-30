@@ -36,6 +36,7 @@ from music_assistant.providers.qobuz_connect.outbound_reporter import OutboundRe
 from music_assistant.providers.qobuz_connect.setup_flow import build_setup_entries
 from music_assistant.providers.qobuz_connect.sync_types import (
     CanonicalState,
+    CloudActiveRendererChanged,
     CloudSetState,
     CloudSnapshot,
     PushVolume,
@@ -292,14 +293,14 @@ def test_setup_constructs_coordinator_and_effect_runner() -> None:
 
 
 def test_build_session_callbacks_delegates_to_coordinator() -> None:
-    """Events flow through the coordinator's submit; on_set_active/on_quality are overridden."""
+    """Provider callbacks wrap coordinator intake where lifecycle work is required."""
     provider, _mass = _make_provider()
     callbacks = provider._build_session_callbacks()
 
-    assert callbacks.submit == provider._coordinator.submit
+    assert callbacks.submit == provider._submit_cloud_event
     assert callbacks.on_disconnected == provider._on_session_disconnected
 
-    # Provider-level overrides that do strictly more than the reducer.
+    # Provider-level overrides that do strictly more than direct coordinator callbacks.
     assert callbacks.on_set_active == provider._on_set_active
     assert callbacks.on_quality == provider._on_quality_change
     assert callbacks.on_connected == provider._on_session_connected
@@ -411,6 +412,39 @@ async def test_repeated_activation_does_not_overwrite_restore_value() -> None:
     assert queue.autoplay_enabled is True
 
 
+async def test_repeated_activation_does_not_suppress_replacement_player() -> None:
+    """A vanished leased player cannot redirect suppression to its replacement."""
+    p1 = _fake_player("p1")
+    p2 = _fake_player("p2")
+    provider, mass = _make_provider(p1)
+    players = {"p1": p1, "p2": p2}
+    queues = {
+        "p1": SimpleNamespace(autoplay_enabled=True),
+        "p2": SimpleNamespace(autoplay_enabled=True),
+    }
+    mass.players.all_players.return_value = [p1, p2]
+    mass.players.get_player.side_effect = players.get
+    mass.player_queues.get.side_effect = queues.get
+    mass.player_queues.set_autoplay.side_effect = lambda player_id, enabled: setattr(
+        queues[player_id], "autoplay_enabled", enabled
+    )
+
+    def autoplay_enabled(player_id: str) -> bool:
+        return bool(queues[player_id].autoplay_enabled)
+
+    await provider._on_set_active(True)
+    assert autoplay_enabled("p1") is False
+
+    players.pop("p1")
+    mass.players.all_players.return_value = [p2]
+    await provider._on_set_active(True)
+
+    await provider._on_set_active(False)
+
+    assert autoplay_enabled("p1") is True
+    assert autoplay_enabled("p2") is True
+
+
 async def test_unload_restores_autoplay_on_the_captured_player_only() -> None:
     """Unload restores autoplay only on the player captured by the lease."""
     provider, mass = _make_provider()
@@ -430,6 +464,100 @@ async def test_unload_restores_autoplay_on_the_captured_player_only() -> None:
 
     assert original.autoplay_enabled is True
     assert replacement.autoplay_enabled is False
+
+
+async def test_unload_prevents_in_flight_activation_from_suppressing_autoplay() -> None:
+    """Activation awaiting setup work cannot acquire a lease after unload starts."""
+    provider, mass = _make_provider()
+    queue = SimpleNamespace(autoplay_enabled=True)
+    mass.player_queues.get.return_value = queue
+    mass.player_queues.set_autoplay.side_effect = lambda _player_id, enabled: setattr(
+        queue, "autoplay_enabled", enabled
+    )
+    activation_waiting = asyncio.Event()
+    resume_activation = asyncio.Event()
+
+    async def wait_during_activation(_quality: int) -> None:
+        activation_waiting.set()
+        await resume_activation.wait()
+
+    provider._quality_reporter = MagicMock()
+    provider._quality_reporter.report_current = AsyncMock(side_effect=wait_during_activation)
+    cast("Any", provider._flight_recorder).stop = AsyncMock()
+
+    activation = asyncio.create_task(provider._on_set_active(True))
+    await asyncio.wait_for(activation_waiting.wait(), timeout=1)
+    await provider.unload()
+    resume_activation.set()
+    await activation
+
+    assert queue.autoplay_enabled is True
+    assert provider._ma_autoplay_lease is None
+
+
+async def test_active_renderer_change_restores_ma_autoplay() -> None:
+    """Losing cloud renderer ownership through submit restores MA autoplay."""
+    provider, mass = _make_provider()
+    queue = SimpleNamespace(autoplay_enabled=True)
+    mass.player_queues.get.return_value = queue
+    mass.player_queues.set_autoplay.side_effect = lambda _player_id, enabled: setattr(
+        queue, "autoplay_enabled", enabled
+    )
+    callbacks = provider._build_session_callbacks()
+
+    await callbacks.on_set_active(True)
+    assert queue.autoplay_enabled is False
+
+    await callbacks.submit(CloudActiveRendererChanged(now_ms=2, renderer_id=99))
+
+    assert provider._coordinator.state.active is False
+    assert queue.autoplay_enabled is True
+
+
+async def test_disconnect_restores_ma_autoplay() -> None:
+    """Disconnecting restores MA autoplay when canonical ownership is dropped."""
+    provider, mass = _make_provider()
+    queue = SimpleNamespace(autoplay_enabled=True)
+    mass.player_queues.get.return_value = queue
+    mass.player_queues.set_autoplay.side_effect = lambda _player_id, enabled: setattr(
+        queue, "autoplay_enabled", enabled
+    )
+    callbacks = provider._build_session_callbacks()
+
+    await callbacks.on_set_active(True)
+    assert queue.autoplay_enabled is False
+    assert callbacks.on_disconnected is not None
+
+    await callbacks.on_disconnected()
+
+    assert provider._coordinator.state.active is False
+    assert queue.autoplay_enabled is True
+
+
+async def test_queue_update_reasserts_autoplay_suppression_while_active() -> None:
+    """MA queue updates reassert suppression without replacing the lease."""
+    provider, mass = _make_provider()
+    queue = SimpleNamespace(
+        autoplay_enabled=True,
+        state=SimpleNamespace(value="idle"),
+        current_item=None,
+        corrected_elapsed_time=0,
+        repeat_mode=SimpleNamespace(value="off"),
+    )
+    mass.player_queues.get.return_value = queue
+    mass.player_queues.set_autoplay.side_effect = lambda _player_id, enabled: setattr(
+        queue, "autoplay_enabled", enabled
+    )
+
+    await provider._on_set_active(True)
+    assert queue.autoplay_enabled is False
+
+    queue.autoplay_enabled = True
+    await provider._on_ma_queue_event(_fake_event("player_1"))
+    assert queue.autoplay_enabled is False
+
+    await provider._on_set_active(False)
+    assert queue.autoplay_enabled is True
 
 
 async def test_deactivation_releases_the_player_captured_at_activation() -> None:

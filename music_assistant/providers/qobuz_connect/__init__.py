@@ -76,7 +76,7 @@ from .models import (
 from .outbound_reporter import OutboundReporter
 from .quality_reporter import QualityReporter
 from .session import QobuzConnectSession, SessionCallbacks
-from .sync_types import CloudSetActive
+from .sync_types import CloudSetActive, Event
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
@@ -506,11 +506,21 @@ class QobuzConnectProvider(PluginProvider):
         callbacks = self._coordinator.build_session_callbacks()
         return dataclasses.replace(
             callbacks,
+            submit=self._submit_cloud_event,
             on_set_active=self._on_set_active,
             on_quality=self._on_quality_change,
             on_connected=self._on_session_connected,
             on_disconnected=self._on_session_disconnected,
         )
+
+    async def _submit_cloud_event(self, event: Event) -> None:
+        """Submit a cloud event and reconcile any resulting ownership loss."""
+        was_active = self._coordinator.state.active
+        try:
+            await self._coordinator.submit(event)
+        finally:
+            if was_active and not self._coordinator.state.active:
+                self._restore_ma_autoplay()
 
     async def _on_session_connected(self) -> None:
         """Log a confirmed Qobuz websocket connection."""
@@ -522,7 +532,10 @@ class QobuzConnectProvider(PluginProvider):
         """Reset connection-scoped reporting state."""
         self._last_sent_muted = None
         self._quality_reporter.reset()
-        await self._coordinator._on_disconnected()
+        try:
+            await self._coordinator._on_disconnected()
+        finally:
+            self._restore_ma_autoplay()
 
     async def _on_quality_change(self, new_quality: int) -> None:
         """Remember quality selected in Qobuz app."""
@@ -632,10 +645,14 @@ class QobuzConnectProvider(PluginProvider):
         would have done, since that field is overridden here to add the
         volume/quality broadcast first.
         """
+        if self._unload_started():
+            return
         if active:
             self.logger.info("Qobuz Connect activated")
             await self._broadcast_current_volume()
             await self._quality_reporter.report_current(self._max_quality)
+            if self._unload_started():
+                return
             self._suppress_ma_autoplay()
             await self._coordinator.submit(
                 CloudSetActive(now_ms=int(time.time() * 1000), active=True)
@@ -651,14 +668,21 @@ class QobuzConnectProvider(PluginProvider):
 
     def _suppress_ma_autoplay(self) -> None:
         """Suppress MA autoplay while Qobuz Connect owns the target queue."""
-        player_id = self.get_target_player_id()
-        if not player_id:
-            return
-        queue = self._bridge.get_queue(player_id)
-        if queue is None:
+        if self._unloaded:
             return
         if self._ma_autoplay_lease is None:
+            player_id = self.get_target_player_id()
+            if not player_id:
+                return
+            queue = self._bridge.get_queue(player_id)
+            if queue is None:
+                return
             self._ma_autoplay_lease = (player_id, bool(queue.autoplay_enabled))
+        else:
+            player_id, _enabled = self._ma_autoplay_lease
+            queue = self._bridge.get_queue(player_id)
+            if queue is None:
+                return
         if queue.autoplay_enabled:
             self._bridge.set_autoplay(player_id, False)
 
@@ -670,6 +694,10 @@ class QobuzConnectProvider(PluginProvider):
         player_id, enabled = lease
         if self._bridge.get_queue(player_id) is not None:
             self._bridge.set_autoplay(player_id, enabled)
+
+    def _unload_started(self) -> bool:
+        """Return whether provider unload has started."""
+        return self._unloaded
 
     async def _broadcast_current_volume(self) -> None:
         """Report current MA player volume to Qobuz."""
@@ -747,6 +775,8 @@ class QobuzConnectProvider(PluginProvider):
         player_id = self.get_target_player_id()
         if not player_id or event.object_id != player_id:
             return
+        if self._coordinator.state.active:
+            self._suppress_ma_autoplay()
         await self._coordinator.on_ma_transport_event(player_id)
         await self._coordinator.on_ma_modes_event(player_id)
         await self._quality_reporter.report_file(self._current_file_quality())
