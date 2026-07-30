@@ -445,25 +445,25 @@ git commit -m "test(qobuz_connect): clean partial browser sessions"
 - Consumes: all completed implementation tasks.
 - Produces: reproducible deterministic and real-cloud evidence.
 
-- [ ] **Step 1: Run targeted provider suites**
+- [x] **Step 1: Run targeted provider suites**
 
 Run: `pytest tests/providers/qobuz_connect tests/providers/qobuz tests/controllers/player_queues tests/controllers/players tests/providers/local_audio -q`
 
 Expected: all pass.
 
-- [ ] **Step 2: Run static validation**
+- [x] **Step 2: Run static validation**
 
 Run: `.venv/bin/mypy music_assistant/providers/qobuz_connect tests/providers/qobuz_connect`
 
 Expected: success with no errors.
 
-- [ ] **Step 3: Run full pre-commit**
+- [x] **Step 3: Run full pre-commit**
 
 Run: `pre-commit run --all-files`
 
 Expected: all hooks pass.
 
-- [ ] **Step 4: Run the disposable 27-scenario real-cloud suite**
+- [x] **Step 4: Run the disposable 27-scenario real-cloud suite**
 
 Record SHA-256 hashes of `.mass-data` and `.mass-cache`, verify the managed config
 targets the exact unique BlackHole player, run the repository's integration command
@@ -472,7 +472,7 @@ for all scenarios, and verify the same hashes afterward.
 Expected: 27/27 pass, seed hashes unchanged, no managed MA/Chromium/ffmpeg process,
 owned port, or temporary run directory remains.
 
-- [ ] **Step 5: Append evidence and commit any verification-only updates**
+- [x] **Step 5: Append evidence and commit any verification-only updates**
 
 Append a `Whole-branch review fix round 1` section with commit range, focused RED/GREEN
 commands, deterministic results, live result, before/after hashes, and cleanup
