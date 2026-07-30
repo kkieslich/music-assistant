@@ -627,6 +627,24 @@ def _deactivate(state: CanonicalState) -> ReduceResult:
 
 def _ma_transport(state: CanonicalState, event: MaTransportChanged) -> ReduceResult:
     """Fold MA's own transport into canonical and REPORT it as a renderer (not a command)."""
+    if event.current_item_unmappable:
+        if not state.active:
+            return ReduceResult(state, ())
+        return ReduceResult(
+            dataclasses.replace(
+                state,
+                current_id=None,
+                playing=PlayingState.STOPPED,
+                position_ms=0,
+                position_anchor_ms=event.now_ms,
+                settling_position=False,
+                buffer_state=BufferState.OK,
+                active=False,
+                activation_requested=False,
+                release_pending=True,
+            ),
+            (MaReleasePlayer(),),
+        )
     playing = event.playing
     position_ms = event.position_ms
     position_anchor_ms = event.now_ms

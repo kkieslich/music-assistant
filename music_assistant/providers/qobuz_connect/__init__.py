@@ -805,11 +805,15 @@ class QobuzConnectProvider(PluginProvider):
         player_id = self.get_target_player_id()
         if not player_id or event.object_id != player_id:
             return
+        was_active = self._coordinator.state.active
         if self._coordinator.state.active:
             self._suppress_ma_autoplay()
         await self._coordinator.on_ma_transport_event(player_id)
+        if was_active and not self._coordinator.state.active:
+            self._release_active_target()
         await self._coordinator.on_ma_modes_event(player_id)
-        await self._quality_reporter.report_file(self._current_file_quality())
+        current_quality = self._current_file_quality() if self._coordinator.state.active else None
+        await self._quality_reporter.report_file(current_quality)
 
     async def _on_ma_queue_items_event(self, event: MassEvent) -> None:
         """Forward MA queue-item mutations (``QUEUE_ITEMS_UPDATED``) into the coordinator."""

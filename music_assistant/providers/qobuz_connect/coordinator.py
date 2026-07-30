@@ -311,6 +311,9 @@ class QobuzConnectCoordinator:
                 current_track_id=current_track_id,
                 position_ms=int(queue.corrected_elapsed_time * 1000),
                 target_player_id=player_id,
+                current_item_unmappable=(
+                    queue.current_item is not None and current_track_id is None
+                ),
             )
         )
 

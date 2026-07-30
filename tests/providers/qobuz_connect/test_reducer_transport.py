@@ -639,6 +639,35 @@ def test_genuine_stop_on_empty_queue_reports_stopped() -> None:
     assert result.state.playing is PlayingState.STOPPED
 
 
+def test_foreign_current_item_releases_active_qobuz_ownership() -> None:
+    """A non-Qobuz current item cannot inherit the prior track's identity or position."""
+    state = CanonicalState(
+        cloud_version=QueueVersion(5, 1),
+        tracks=_refs(0, 1),
+        current_id=900000,
+        playing=PlayingState.PLAYING,
+        position_ms=45_000,
+        active=True,
+    )
+
+    result = reduce(
+        state,
+        MaTransportChanged(
+            now_ms=50_000,
+            playing=PlayingState.PLAYING,
+            current_track_id=None,
+            position_ms=90_000,
+            current_item_unmappable=True,
+        ),
+    )
+
+    assert result.state.current_id is None
+    assert result.state.playing is PlayingState.STOPPED
+    assert result.state.position_ms == 0
+    assert result.state.active is False
+    assert result.effects == (MaReleasePlayer(),)
+
+
 def test_empty_load_ack_keeps_tracks() -> None:
     """A load ack with no tracks just bumps the version (doesn't wipe the queue)."""
     state = CanonicalState(

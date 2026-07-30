@@ -741,6 +741,55 @@ async def test_ma_queue_event_delegates_to_transport_and_modes() -> None:
     provider._quality_reporter.report_file.assert_awaited_once_with(None)
 
 
+async def test_foreign_current_item_stops_reporting_and_releases_owned_player() -> None:
+    """A foreign queue tail cannot be reported with the prior Qobuz id and its duration."""
+    player = _fake_player("player_1")
+    provider, mass = _make_provider(player)
+    foreign_item = SimpleNamespace(
+        duration=999,
+        media_item=SimpleNamespace(
+            media_type="track",
+            provider="local",
+            item_id="foreign",
+            provider_mappings=(),
+        ),
+    )
+    queue = SimpleNamespace(
+        autoplay_enabled=True,
+        state=SimpleNamespace(value="playing"),
+        current_item=foreign_item,
+        corrected_elapsed_time=90,
+        repeat_mode=SimpleNamespace(value="off"),
+    )
+    mass.player_queues.get.return_value = queue
+    mass.player_queues.set_autoplay.side_effect = lambda _player_id, enabled: setattr(
+        queue, "autoplay_enabled", enabled
+    )
+    mass.player_queues.stop = AsyncMock()
+    mass.player_queues.clear = MagicMock()
+    provider._coordinator._state = CanonicalState(
+        tracks=(QueueTrackRef(queue_item_id=3, track_id="3879020"),),
+        current_id=3879020,
+        playing=PlayingState.PLAYING,
+        position_ms=45_000,
+        active=True,
+    )
+    provider._coordinator.transfer_target(player.player_id)
+    provider._pinned_target_id = player.player_id
+    provider._quality_reporter = MagicMock()
+    provider._quality_reporter.report_file = AsyncMock()
+
+    await provider._on_ma_queue_event(_fake_event(player.player_id))
+
+    assert provider._coordinator.state.current_id is None
+    assert provider._coordinator.state.position_ms == 0
+    assert provider._coordinator.state.active is False
+    mass.player_queues.stop.assert_awaited_once_with(player.player_id)
+    mass.player_queues.clear.assert_called_once_with(player.player_id, skip_stop=True)
+    assert queue.autoplay_enabled is True
+    assert provider._pinned_target_id is None
+
+
 async def test_ma_queue_items_event_delegates_to_queue_event() -> None:
     """QUEUE_ITEMS_UPDATED delegates to the coordinator's queue entry point."""
     provider, _mass = _make_provider()

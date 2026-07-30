@@ -26,6 +26,7 @@ from music_assistant.providers.qobuz_connect.sync_types import (
     Disconnected,
     MaPlayTrack,
     MaQueueChanged,
+    MaReleasePlayer,
     MaResyncQueue,
     PushAdd,
     PushLoad,
@@ -157,6 +158,26 @@ async def test_ma_events_prefer_alias_matching_canonical_track() -> None:
 
     assert [type(effect) for effect in runner.effects] == [ReportState]
     assert coord._state.current_id == 3879020
+
+
+async def test_ma_foreign_current_item_is_explicitly_released() -> None:
+    """Coordinator distinguishes a foreign current item from an empty current item."""
+    coord, runner, bridge = _coordinator()
+    bridge.queue = _FakeQueue(current_item={"local_id": "foreign"}, elapsed=90.0)
+    coord._state = CanonicalState(
+        tracks=(QueueTrackRef(queue_item_id=3, track_id="3879020"),),
+        current_id=3879020,
+        playing=PlayingState.PLAYING,
+        position_ms=45_000,
+        active=True,
+    )
+    coord.transfer_target("player")
+
+    await coord.on_ma_transport_event("player")
+
+    assert coord.state.current_id is None
+    assert coord.state.active is False
+    assert runner.effects == [MaReleasePlayer(player_id="player")]
 
 
 async def test_snapshot_then_activate_takes_over() -> None:

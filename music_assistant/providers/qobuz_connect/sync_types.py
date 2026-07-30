@@ -410,6 +410,7 @@ class MaTransportChanged:
     current_track_id: int | None  # Qobuz track ID.
     position_ms: int
     target_player_id: str | None = None
+    current_item_unmappable: bool = False
 
 
 @dataclass(slots=True, frozen=True)

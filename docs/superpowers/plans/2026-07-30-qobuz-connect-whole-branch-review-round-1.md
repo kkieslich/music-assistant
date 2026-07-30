@@ -217,7 +217,7 @@ git commit -m "fix(qobuz_connect): reconcile active receiver quality"
 - Consumes: `MaTransportChanged`.
 - Produces: `MaTransportChanged.current_item_unmappable: bool`.
 
-- [ ] **Step 1: Write failing pure and coordinator tests**
+- [x] **Step 1: Write failing pure and coordinator tests**
 
 ```python
 def test_foreign_current_releases_owned_renderer() -> None:
@@ -231,13 +231,13 @@ def test_foreign_current_releases_owned_renderer() -> None:
     assert result.effects == (MaReleasePlayer(),)
 ```
 
-- [ ] **Step 2: Run focused tests and confirm RED**
+- [x] **Step 2: Run focused tests and confirm RED**
 
 Run: `pytest tests/providers/qobuz_connect/test_reducer_transport.py tests/providers/qobuz_connect/test_coordinator.py tests/providers/qobuz_connect/test_provider_wiring.py -q`
 
 Expected: the event has no unmappable marker and stale current id remains.
 
-- [ ] **Step 3: Implement explicit foreign-current transition**
+- [x] **Step 3: Implement explicit foreign-current transition**
 
 ```python
 if event.current_item_unmappable and state.active:
@@ -252,13 +252,13 @@ Set the marker only when MA has a current item and selected-Qobuz mapping return
 `None`. Ensure duration/report getters cannot read a foreign item after ownership is
 released.
 
-- [ ] **Step 4: Run focused tests and confirm GREEN**
+- [x] **Step 4: Run focused tests and confirm GREEN**
 
 Run: `pytest tests/providers/qobuz_connect/test_reducer_transport.py tests/providers/qobuz_connect/test_coordinator.py tests/providers/qobuz_connect/test_provider_wiring.py -q`
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add music_assistant/providers/qobuz_connect/{sync_types.py,coordinator.py,reducer.py,__init__.py} tests/providers/qobuz_connect/{test_coordinator.py,test_reducer_transport.py,test_provider_wiring.py}
