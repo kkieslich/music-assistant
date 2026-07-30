@@ -157,6 +157,7 @@ async def test_config_entries_select_qobuz_instance_and_suggest_unused_port() ->
         return []
 
     mass.config.get_provider_configs = AsyncMock(side_effect=configs)
+    mass.config.get_raw_provider_config_value.return_value = 8695
 
     entries = await build_setup_entries(mass)
     by_key = {entry.key: entry for entry in entries}

@@ -25,6 +25,14 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models.setup_flow import SetupSession
 
+_SETUP_KEYS = (
+    CONF_QOBUZ_PROVIDER,
+    CONF_TARGET_PLAYER,
+    CONF_PUBLISH_NAME,
+    CONF_HTTP_PORT,
+    CONF_INITIAL_VOLUME,
+)
+
 
 async def run_setup(session: SetupSession) -> None:
     """
@@ -48,7 +56,7 @@ async def run_setup(session: SetupSession) -> None:
         )
         setup_data.update(submitted)
         try:
-            await session.finish(setup_data)
+            await session.finish({key: setup_data[key] for key in _SETUP_KEYS})
             return
         except SetupFlowError as err:
             errors = {"base": err.translation_key or str(err)}
@@ -127,7 +135,7 @@ async def _suggest_http_port(mass: MusicAssistant, instance_id: str | None) -> i
         int(cast("int | str", port))
         for config in configs
         if config.instance_id != instance_id
-        and (port := _get_setup_or_legacy_value(config, CONF_HTTP_PORT)) is not None
+        and (port := _get_setup_or_legacy_value(mass, config, CONF_HTTP_PORT)) is not None
     }
     port = 8695
     while port in used_ports:
@@ -135,9 +143,11 @@ async def _suggest_http_port(mass: MusicAssistant, instance_id: str | None) -> i
     return port
 
 
-def _get_setup_or_legacy_value(config: ProviderConfig, key: str) -> ConfigValueType:
+def _get_setup_or_legacy_value(
+    mass: MusicAssistant, config: ProviderConfig, key: str
+) -> ConfigValueType:
     """Return setup data first, then a legacy provider option value."""
     setup_data = getattr(config, "setup_data", {}) or {}
     if (setup_value := setup_data.get(key)) is not None:
         return cast("ConfigValueType", setup_value)
-    return config.get_value(key)
+    return mass.config.get_raw_provider_config_value(config.instance_id, key)

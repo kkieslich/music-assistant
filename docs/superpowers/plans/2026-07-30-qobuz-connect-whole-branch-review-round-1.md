@@ -275,7 +275,7 @@ git commit -m "fix(qobuz_connect): release foreign queue ownership"
 - Consumes: `ConfigController.get_raw_provider_config_value(instance_id, key)`.
 - Produces: `_get_setup_or_legacy_value(mass, config, key)`.
 
-- [ ] **Step 1: Write failing current/legacy port and finish-filter tests**
+- [x] **Step 1: Write failing current/legacy port and finish-filter tests**
 
 ```python
 async def test_finish_excludes_runtime_values() -> None:
@@ -288,13 +288,13 @@ async def test_legacy_raw_sibling_port_is_reserved() -> None:
     assert await _suggest_http_port(mass, None) == 8696
 ```
 
-- [ ] **Step 2: Run setup tests and confirm RED**
+- [x] **Step 2: Run setup tests and confirm RED**
 
 Run: `pytest tests/providers/qobuz_connect/test_setup_flow.py -q`
 
 Expected: runtime values leak into finish and legacy raw port is ignored.
 
-- [ ] **Step 3: Implement setup-only persistence and raw fallback**
+- [x] **Step 3: Implement setup-only persistence and raw fallback**
 
 ```python
 finish_data = {key: setup_data[key] for key in SETUP_KEYS}
@@ -304,13 +304,13 @@ await session.finish(finish_data)
 Use sibling `setup_data` first, then
 `mass.config.get_raw_provider_config_value(config.instance_id, key)`.
 
-- [ ] **Step 4: Run setup tests and confirm GREEN**
+- [x] **Step 4: Run setup tests and confirm GREEN**
 
 Run: `pytest tests/providers/qobuz_connect/test_setup_flow.py -q`
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add music_assistant/providers/qobuz_connect/setup_flow.py tests/providers/qobuz_connect/test_setup_flow.py

@@ -4,17 +4,18 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from music_assistant.models.setup_flow import SetupFlowError
 from music_assistant.providers.qobuz_connect import (
     CONF_HTTP_PORT,
     CONF_INITIAL_VOLUME,
+    CONF_MAX_QUALITY,
     CONF_PUBLISH_NAME,
     CONF_QOBUZ_PROVIDER,
     CONF_TARGET_PLAYER,
 )
-from music_assistant.providers.qobuz_connect.setup_flow import run_setup
+from music_assistant.providers.qobuz_connect.setup_flow import _suggest_http_port, run_setup
 
 if TYPE_CHECKING:
     from music_assistant.models.setup_flow import SetupSession
@@ -93,3 +94,59 @@ async def test_setup_flow_retries_with_submitted_values_after_finish_error() -> 
     assert {
         entry.key: entry.value for entry in session.form_calls[1]["entries"]
     } == session.submitted
+
+
+async def test_setup_flow_finish_excludes_runtime_provider_values() -> None:
+    """Reconfigure prefills runtime options but persists only setup-owned fields."""
+    session = FakeSetupSession(
+        submitted={
+            CONF_QOBUZ_PROVIDER: "qobuz--one",
+            CONF_TARGET_PLAYER: "__auto__",
+            CONF_PUBLISH_NAME: "Living room",
+            CONF_HTTP_PORT: 8695,
+            CONF_INITIAL_VOLUME: 25,
+        }
+    )
+    session.context.values = {
+        CONF_MAX_QUALITY: "7",
+        "log_level": "debug",
+    }
+
+    await run_setup(cast("SetupSession", session))
+
+    assert session.finished_values == session.submitted
+
+
+async def test_suggest_http_port_prefers_current_setup_data() -> None:
+    """Current-format sibling setup data reserves its configured port."""
+    mass = MagicMock()
+    sibling = SimpleNamespace(
+        instance_id="qobuz_connect--one",
+        setup_data={CONF_HTTP_PORT: 8695},
+    )
+    mass.config.get_provider_configs = AsyncMock(return_value=[sibling])
+    mass.config.get_raw_provider_config_value.return_value = 8795
+
+    port = await _suggest_http_port(mass, instance_id=None)
+
+    assert port == 8696
+    mass.config.get_raw_provider_config_value.assert_not_called()
+
+
+async def test_suggest_http_port_reads_legacy_raw_provider_value() -> None:
+    """Legacy sibling values are read from storage when list responses omit values."""
+    mass = MagicMock()
+    sibling = SimpleNamespace(
+        instance_id="qobuz_connect--legacy",
+        setup_data={},
+    )
+    mass.config.get_provider_configs = AsyncMock(return_value=[sibling])
+    mass.config.get_raw_provider_config_value.return_value = 8695
+
+    port = await _suggest_http_port(mass, instance_id=None)
+
+    assert port == 8696
+    mass.config.get_raw_provider_config_value.assert_called_once_with(
+        "qobuz_connect--legacy",
+        CONF_HTTP_PORT,
+    )
