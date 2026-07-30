@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import tempfile
@@ -9,6 +10,7 @@ from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -17,6 +19,9 @@ from music_assistant.providers.qobuz_connect.models import (
     QConnectMessageType,
 )
 from music_assistant.providers.qobuz_connect.protocol import QobuzConnectCodec
+from tests.providers.qobuz_connect.protocol_capture import (
+    integration_harness as integration_harness_module,
+)
 from tests.providers.qobuz_connect.protocol_capture import ma_probe as ma_probe_module
 from tests.providers.qobuz_connect.protocol_capture.integration_harness import (
     BLACKHOLE_PLAYER_ID,
@@ -24,7 +29,9 @@ from tests.providers.qobuz_connect.protocol_capture.integration_harness import (
     SafetyPreflight,
     ScenarioResult,
     ScenarioStatus,
+    close_session,
     default_probe,
+    open_session,
 )
 from tests.providers.qobuz_connect.protocol_capture.ma_probe import (
     MANAGED_CONNECT_TARGET,
@@ -62,6 +69,110 @@ class FakeQobuzPage:
     async def play_album_by_url(self, url: str) -> None:
         """Record attempted playback."""
         self.played_urls.append(url)
+
+
+def _mock_playwright(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any]:
+    """Install a minimal async Playwright factory and return its driver/browser."""
+    browser = MagicMock()
+    browser.close = AsyncMock()
+    playwright = MagicMock()
+    playwright.chromium.launch = AsyncMock(return_value=browser)
+    playwright.stop = AsyncMock()
+    starter = MagicMock()
+    starter.start = AsyncMock(return_value=playwright)
+    monkeypatch.setattr("playwright.async_api.async_playwright", lambda: starter)
+    return playwright, browser
+
+
+async def test_open_session_stops_playwright_when_browser_launch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Chromium launch failure cannot leak the Playwright driver."""
+    playwright, _browser = _mock_playwright(monkeypatch)
+    playwright.chromium.launch.side_effect = RuntimeError("launch failed")
+
+    with pytest.raises(RuntimeError, match="launch failed"):
+        await open_session(cast("MAProbe", MagicMock()))
+
+    playwright.stop.assert_awaited_once()
+
+
+async def test_open_session_cancels_pending_sibling_after_client_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One failed client opener cancels and awaits the other before returning."""
+    playwright, browser = _mock_playwright(monkeypatch)
+    observer_started = asyncio.Event()
+    observer_task: asyncio.Task[Any] | None = None
+
+    async def open_client(
+        _browser: Any,
+        *,
+        label: str,
+        **_kwargs: Any,
+    ) -> Any:
+        nonlocal observer_task
+        if label == "A":
+            await observer_started.wait()
+            raise RuntimeError("client failed")
+        observer_task = asyncio.current_task()
+        observer_started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(integration_harness_module, "_open_client", open_client)
+
+    with pytest.raises(RuntimeError, match="client failed"):
+        await open_session(cast("MAProbe", MagicMock()))
+
+    assert observer_task is not None
+    sibling_was_awaited = observer_task.done()
+    if not sibling_was_awaited:
+        observer_task.cancel()
+        await asyncio.gather(observer_task, return_exceptions=True)
+    assert sibling_was_awaited
+    browser.close.assert_awaited_once()
+    playwright.stop.assert_awaited_once()
+
+
+async def test_open_session_closes_browser_after_one_client_opened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A context opened before its sibling fails is owned by browser cleanup."""
+    playwright, browser = _mock_playwright(monkeypatch)
+    client_opened = asyncio.Event()
+
+    async def open_client(
+        _browser: Any,
+        *,
+        label: str,
+        **_kwargs: Any,
+    ) -> Any:
+        if label == "A":
+            client_opened.set()
+            return MagicMock()
+        await client_opened.wait()
+        raise RuntimeError("observer failed")
+
+    monkeypatch.setattr(integration_harness_module, "_open_client", open_client)
+
+    with pytest.raises(RuntimeError, match="observer failed"):
+        await open_session(cast("MAProbe", MagicMock()))
+
+    browser.close.assert_awaited_once()
+    playwright.stop.assert_awaited_once()
+
+
+async def test_close_session_stops_playwright_when_browser_close_fails() -> None:
+    """Normal teardown stops the driver even if Chromium close raises."""
+    playwright = MagicMock()
+    playwright.stop = AsyncMock()
+    browser = MagicMock()
+    browser.close = AsyncMock(side_effect=RuntimeError("close failed"))
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        await close_session(cast("Any", (playwright, browser)))
+
+    playwright.stop.assert_awaited_once()
 
 
 def _provider(target: str, name: str = "Local Dev Hardening abc123") -> dict[str, Any]:

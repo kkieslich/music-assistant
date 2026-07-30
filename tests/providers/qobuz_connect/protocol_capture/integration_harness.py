@@ -654,21 +654,45 @@ async def open_session(
     from playwright.async_api import async_playwright  # noqa: PLC0415
 
     pw = await async_playwright().start()
-    browser = await pw.chromium.launch(headless=True, args=["--mute-audio"])
-    client, observer = await asyncio.gather(
+    try:
+        browser = await pw.chromium.launch(headless=True, args=["--mute-audio"])
+    except BaseException:
+        try:
+            await pw.stop()
+        except BaseException:
+            LOGGER.exception("Failed to stop Playwright after Chromium launch failure")
+        raise
+    client_task = asyncio.create_task(
         _open_client(
             browser,
             label="A",
             storage_state_path=AUTH_DIR / "client_a.json",
             headed=False,
-        ),
+        )
+    )
+    observer_task = asyncio.create_task(
         _open_client(
             browser,
             label="B",
             storage_state_path=AUTH_DIR / "client_b.json",
             headed=False,
-        ),
+        )
     )
+    try:
+        client, observer = await asyncio.gather(client_task, observer_task)
+    except BaseException:
+        for task in (client_task, observer_task):
+            task.cancel()
+        await asyncio.gather(client_task, observer_task, return_exceptions=True)
+        try:
+            await browser.close()
+        except BaseException:
+            LOGGER.exception("Failed to close Chromium after Qobuz client setup failure")
+        try:
+            await pw.stop()
+        except BaseException:
+            LOGGER.exception("Failed to stop Playwright after Qobuz client setup failure")
+        raise
     preflight = SafetyPreflight(
         qobuz=client.qobuz,
         qobuz_observer=observer.qobuz,
@@ -685,8 +709,10 @@ async def open_session(
 async def close_session(handle: tuple[Playwright, Browser]) -> None:
     """Close the Playwright browser + driver opened by :func:`open_session`."""
     pw, browser = handle
-    await browser.close()
-    await pw.stop()
+    try:
+        await browser.close()
+    finally:
+        await pw.stop()
 
 
 def default_probe() -> MAProbe:

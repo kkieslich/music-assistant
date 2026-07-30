@@ -381,7 +381,7 @@ git commit -m "test(qobuz_connect): fail closed on invalid audio capture"
 - Consumes: `async_playwright().start()`, `_open_client()`.
 - Produces: leak-free `open_session()` failure handling.
 
-- [ ] **Step 1: Write failing launch and partial-client tests**
+- [x] **Step 1: Write failing launch and partial-client tests**
 
 ```python
 async def test_open_session_stops_playwright_when_launch_fails() -> None:
@@ -398,13 +398,13 @@ async def test_open_session_cancels_sibling_and_closes_all_owners() -> None:
     pw.stop.assert_awaited_once()
 ```
 
-- [ ] **Step 2: Run harness-safety tests and confirm RED**
+- [x] **Step 2: Run harness-safety tests and confirm RED**
 
 Run: `pytest tests/providers/qobuz_connect/test_integration_harness_safety.py -q`
 
 Expected: Playwright/browser/sibling client resources remain live on failures.
 
-- [ ] **Step 3: Implement nested transactional cleanup**
+- [x] **Step 3: Implement nested transactional cleanup**
 
 ```python
 tasks = [asyncio.create_task(_open_client(...)), asyncio.create_task(_open_client(...))]
@@ -423,13 +423,13 @@ except BaseException:
 
 Wrap browser launch separately so launch failure still stops Playwright.
 
-- [ ] **Step 4: Run harness-safety tests and confirm GREEN**
+- [x] **Step 4: Run harness-safety tests and confirm GREEN**
 
 Run: `pytest tests/providers/qobuz_connect/test_integration_harness_safety.py -q`
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/providers/qobuz_connect/{protocol_capture/integration_harness.py,test_integration_harness_safety.py}
