@@ -107,3 +107,21 @@ def test_measure_raises_when_capture_has_no_samples(monkeypatch: pytest.MonkeyPa
 
     with pytest.raises(RuntimeError, match="no audio samples"):
         probe.measure(0.1)
+
+
+def test_measure_accepts_final_positive_sample_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ffmpeg's provisional zero-sample filter must not override its final count."""
+    stderr = """
+[Parsed_volumedetect_0 @ 0x1] n_samples: 0
+[Parsed_volumedetect_0 @ 0x2] n_samples: 44032
+[Parsed_volumedetect_0 @ 0x2] mean_volume: -91.0 dB
+[Parsed_volumedetect_0 @ 0x2] max_volume: -91.0 dB
+"""
+    monkeypatch.setattr(
+        _SUBPROCESS_RUN,
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", stderr),
+    )
+    probe = AudioProbe()
+    probe._device = "1"
+
+    assert probe.measure(0.1) == AudioLevel(mean_db=-91.0, max_db=-91.0)

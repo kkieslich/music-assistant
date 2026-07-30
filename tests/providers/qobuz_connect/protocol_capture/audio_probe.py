@@ -114,7 +114,8 @@ class AudioProbe:
         )
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg BlackHole capture failed with exit code {proc.returncode}")
-        if (samples := _SAMPLES.search(proc.stderr)) is not None and int(samples.group(1)) == 0:
+        sample_counts = [int(value) for value in _SAMPLES.findall(proc.stderr)]
+        if sample_counts and max(sample_counts) == 0:
             raise RuntimeError("ffmpeg BlackHole capture produced no audio samples")
         return parse_volumedetect(proc.stderr)
 
