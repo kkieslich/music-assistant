@@ -46,15 +46,30 @@ class AudioLevel:
 
 def parse_volumedetect(stderr: str) -> AudioLevel:
     """
-    Parse ffmpeg ``volumedetect`` output into an :class:`AudioLevel`.
+    Parse ffmpeg's final complete ``volumedetect`` measurement.
 
     :param stderr: The combined ffmpeg stderr text from a volumedetect run.
     """
-    mean = _MEAN.search(stderr)
-    mx = _MAX.search(stderr)
-    if mean is None or mx is None:
+    sample_count: int | None = None
+    mean_db: float | None = None
+    max_db: float | None = None
+    for line in stderr.splitlines():
+        if samples := _SAMPLES.search(line):
+            sample_count = int(samples.group(1))
+            mean_db = None
+            max_db = None
+            continue
+        if sample_count is None:
+            continue
+        if mean := _MEAN.search(line):
+            mean_db = float(mean.group(1))
+        if maximum := _MAX.search(line):
+            max_db = float(maximum.group(1))
+    if sample_count is None or mean_db is None or max_db is None:
         raise RuntimeError("ffmpeg capture did not produce mean/max volume metrics")
-    return AudioLevel(mean_db=float(mean.group(1)), max_db=float(mx.group(1)))
+    if sample_count == 0:
+        raise RuntimeError("ffmpeg BlackHole capture produced no audio samples")
+    return AudioLevel(mean_db=mean_db, max_db=max_db)
 
 
 class AudioProbe:
@@ -114,9 +129,6 @@ class AudioProbe:
         )
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg BlackHole capture failed with exit code {proc.returncode}")
-        sample_counts = [int(value) for value in _SAMPLES.findall(proc.stderr)]
-        if sample_counts and max(sample_counts) == 0:
-            raise RuntimeError("ffmpeg BlackHole capture produced no audio samples")
         return parse_volumedetect(proc.stderr)
 
     def is_playing(self, seconds: float = 2.0, threshold_db: float = -80.0) -> bool:

@@ -391,8 +391,16 @@ class QobuzConnectProvider(PluginProvider):
         """Return the configured Music Assistant Qobuz music provider."""
         if not self._qobuz_provider_id:
             raise InvalidDataError("A specific Qobuz music provider instance must be selected")
-        provider = self.mass.get_provider(self._qobuz_provider_id)
-        if provider is None or provider.domain != "qobuz":
+        provider = self.mass.get_provider(
+            self._qobuz_provider_id,
+            return_unavailable=True,
+        )
+        if (
+            provider is None
+            or provider.instance_id != self._qobuz_provider_id
+            or provider.domain != "qobuz"
+            or provider.available is not True
+        ):
             raise InvalidDataError(
                 f"The selected Qobuz music provider {self._qobuz_provider_id!r} "
                 "must be configured and loaded"

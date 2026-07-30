@@ -14,6 +14,7 @@ from music_assistant_models.enums import PlaybackState as MAPlaybackState
 from music_assistant_models.errors import InvalidDataError
 from music_assistant_models.media_items import Track
 
+from music_assistant.mass import MusicAssistant
 from music_assistant.providers import qobuz_connect as provider_module
 from music_assistant.providers.qobuz_connect import (
     CONF_HTTP_PORT,
@@ -80,8 +81,10 @@ def _fake_qobuz_provider(native_quality: str = "27") -> SimpleNamespace:
     config = MagicMock()
     config.get_value.return_value = native_quality
     return SimpleNamespace(
+        available=True,
         domain="qobuz",
         instance_id="qobuz",
+        is_streaming_provider=True,
         config=config,
         get_track=_get_track,
     )
@@ -112,8 +115,10 @@ def _make_provider(
     mass.config.get_raw_provider_config_value.return_value = None
     qobuz_provider = _fake_qobuz_provider(native_quality)
     qobuz_provider.instance_id = qobuz_provider_id
-    mass.get_provider.side_effect = lambda instance_id: (
-        qobuz_provider if instance_id == qobuz_provider_id else None
+    mass.get_provider.side_effect = lambda instance_id, return_unavailable=False: (
+        qobuz_provider
+        if instance_id == qobuz_provider_id and (return_unavailable or qobuz_provider.available)
+        else None
     )
 
     manifest = MagicMock()
@@ -231,7 +236,40 @@ def test_selected_qobuz_instance_is_used_for_streams() -> None:
     provider, mass = _make_provider(qobuz_provider_id="qobuz--selected")
 
     assert provider.get_qobuz_provider().instance_id == "qobuz--selected"
-    mass.get_provider.assert_called_with("qobuz--selected")
+    mass.get_provider.assert_called_with("qobuz--selected", return_unavailable=True)
+
+
+def test_unavailable_selected_qobuz_instance_does_not_fallback_to_other_account() -> None:
+    """An unavailable selected account cannot silently route through another account."""
+    provider, mass = _make_provider(qobuz_provider_id="qobuz--a")
+    selected = _fake_qobuz_provider()
+    selected.instance_id = "qobuz--a"
+    selected.available = False
+    other = _fake_qobuz_provider()
+    other.instance_id = "qobuz--b"
+    mass._providers = {
+        selected.instance_id: selected,
+        other.instance_id: other,
+    }
+    mass.get_provider = MusicAssistant.get_provider.__get__(mass, MusicAssistant)
+
+    assert mass.get_provider("qobuz--a") is other
+    with pytest.raises(InvalidDataError, match="qobuz--a"):
+        provider.get_qobuz_provider()
+
+
+def test_wrong_domain_selected_qobuz_instance_is_rejected() -> None:
+    """An exact instance from another provider domain cannot satisfy selection."""
+    provider, mass = _make_provider(qobuz_provider_id="qobuz--selected")
+    mass.get_provider.side_effect = None
+    mass.get_provider.return_value = SimpleNamespace(
+        available=True,
+        domain="tidal",
+        instance_id="qobuz--selected",
+    )
+
+    with pytest.raises(InvalidDataError, match="qobuz--selected"):
+        provider.get_qobuz_provider()
 
 
 def test_missing_selected_qobuz_instance_has_actionable_error() -> None:
@@ -262,7 +300,14 @@ def test_manifest_declares_native_qobuz_dependency() -> None:
     ("selected_provider", "message"),
     [
         (None, "qobuz--selected"),
-        (SimpleNamespace(domain="tidal"), "qobuz--selected"),
+        (
+            SimpleNamespace(
+                available=True,
+                domain="tidal",
+                instance_id="qobuz--selected",
+            ),
+            "qobuz--selected",
+        ),
     ],
 )
 async def test_handle_async_init_rejects_invalid_selected_qobuz_provider(

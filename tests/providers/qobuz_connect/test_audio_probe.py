@@ -13,11 +13,13 @@ from tests.providers.qobuz_connect.protocol_capture.audio_probe import (
 )
 
 _SILENCE = """
+[Parsed_volumedetect_0 @ 0x145f76880] n_samples: 44032
 [Parsed_volumedetect_0 @ 0x145f76880] mean_volume: -91.0 dB
 [Parsed_volumedetect_0 @ 0x145f76880] max_volume: -91.0 dB
 """
 
 _MUSIC = """
+[Parsed_volumedetect_0 @ 0x1] n_samples: 44032
 [Parsed_volumedetect_0 @ 0x1] mean_volume: -24.3 dB
 [Parsed_volumedetect_0 @ 0x1] max_volume: -3.1 dB
 """
@@ -125,3 +127,44 @@ def test_measure_accepts_final_positive_sample_count(monkeypatch: pytest.MonkeyP
     probe._device = "1"
 
     assert probe.measure(0.1) == AudioLevel(mean_db=-91.0, max_db=-91.0)
+
+
+def test_measure_rejects_final_zero_sample_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stale positive block cannot override a final zero-sample measurement."""
+    stderr = """
+[Parsed_volumedetect_0 @ 0x1] n_samples: 44032
+[Parsed_volumedetect_0 @ 0x1] mean_volume: -24.3 dB
+[Parsed_volumedetect_0 @ 0x1] max_volume: -3.1 dB
+[Parsed_volumedetect_0 @ 0x2] n_samples: 0
+[Parsed_volumedetect_0 @ 0x2] mean_volume: -91.0 dB
+[Parsed_volumedetect_0 @ 0x2] max_volume: -91.0 dB
+"""
+    monkeypatch.setattr(
+        _SUBPROCESS_RUN,
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", stderr),
+    )
+    probe = AudioProbe()
+    probe._device = "1"
+
+    with pytest.raises(RuntimeError, match="no audio samples"):
+        probe.measure(0.1)
+
+
+def test_measure_uses_final_complete_metric_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mean and max must come from the final block's matching positive count."""
+    stderr = """
+[Parsed_volumedetect_0 @ 0x1] n_samples: 44032
+[Parsed_volumedetect_0 @ 0x1] mean_volume: -24.3 dB
+[Parsed_volumedetect_0 @ 0x1] max_volume: -3.1 dB
+[Parsed_volumedetect_0 @ 0x2] n_samples: 88200
+[Parsed_volumedetect_0 @ 0x2] mean_volume: -18.5 dB
+[Parsed_volumedetect_0 @ 0x2] max_volume: -1.2 dB
+"""
+    monkeypatch.setattr(
+        _SUBPROCESS_RUN,
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", stderr),
+    )
+    probe = AudioProbe()
+    probe._device = "1"
+
+    assert probe.measure(0.1) == AudioLevel(mean_db=-18.5, max_db=-1.2)
