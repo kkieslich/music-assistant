@@ -379,6 +379,59 @@ async def test_on_set_active_false_releases_without_broadcast() -> None:
     assert provider._coordinator.state.active is False
 
 
+async def test_activation_suppresses_and_deactivation_restores_ma_autoplay() -> None:
+    """Activation leases and suppresses MA autoplay until deactivation."""
+    provider, mass = _make_provider()
+    queue = SimpleNamespace(autoplay_enabled=True)
+    mass.player_queues.get.return_value = queue
+    mass.player_queues.set_autoplay.side_effect = lambda _player_id, enabled: setattr(
+        queue, "autoplay_enabled", enabled
+    )
+
+    await provider._on_set_active(True)
+    assert queue.autoplay_enabled is False
+
+    await provider._on_set_active(False)
+    assert queue.autoplay_enabled is True
+
+
+async def test_repeated_activation_does_not_overwrite_restore_value() -> None:
+    """Repeated activation preserves the autoplay value captured initially."""
+    provider, mass = _make_provider()
+    queue = SimpleNamespace(autoplay_enabled=True)
+    mass.player_queues.get.return_value = queue
+    mass.player_queues.set_autoplay.side_effect = lambda _player_id, enabled: setattr(
+        queue, "autoplay_enabled", enabled
+    )
+
+    await provider._on_set_active(True)
+    await provider._on_set_active(True)
+    await provider._on_set_active(False)
+
+    assert queue.autoplay_enabled is True
+
+
+async def test_unload_restores_autoplay_on_the_captured_player_only() -> None:
+    """Unload restores autoplay only on the player captured by the lease."""
+    provider, mass = _make_provider()
+    original = SimpleNamespace(autoplay_enabled=True)
+    replacement = SimpleNamespace(autoplay_enabled=False)
+    queues = {"player_1": original, "player_2": replacement}
+    mass.player_queues.get.side_effect = queues.get
+    mass.player_queues.set_autoplay.side_effect = lambda player_id, enabled: setattr(
+        queues[player_id], "autoplay_enabled", enabled
+    )
+    cast("Any", provider._flight_recorder).stop = AsyncMock()
+
+    await provider._on_set_active(True)
+    provider._ma_autoplay_lease = ("player_1", True)
+    provider._pinned_target_id = "player_2"
+    await provider.unload()
+
+    assert original.autoplay_enabled is True
+    assert replacement.autoplay_enabled is False
+
+
 async def test_deactivation_releases_the_player_captured_at_activation() -> None:
     """Auto target changes cannot redirect a delayed release to another player."""
     p1 = _fake_player("p1")

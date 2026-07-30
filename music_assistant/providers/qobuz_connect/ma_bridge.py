@@ -89,6 +89,10 @@ class MABridge:
             return None
         return self._provider.mass.player_queues.get(player_id)
 
+    def set_autoplay(self, player_id: str, enabled: bool) -> None:
+        """Set autoplay on the target player's queue."""
+        self._provider.mass.player_queues.set_autoplay(player_id, enabled)
+
     def queue_items(self, player_id: str) -> list[Any]:
         """Return the full ordered ``QueueItem`` list for ``player_id``."""
         # items() defaults to limit=500; the sync core diffs MA's queue

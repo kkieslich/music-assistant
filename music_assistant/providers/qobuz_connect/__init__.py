@@ -232,6 +232,7 @@ class QobuzConnectProvider(PluginProvider):
         # pinned player, since target resolution runs on every MA event.
         self._pinned_target_id: str | None = None
         self._warned_missing_target: str | None = None
+        self._ma_autoplay_lease: tuple[str, bool] | None = None
 
     async def loaded_in_mass(self) -> None:
         """Start Qobuz Connect discovery after provider load."""
@@ -300,6 +301,7 @@ class QobuzConnectProvider(PluginProvider):
         # under the setup lock and bails instead of spawning a zombie session
         # that would fight the next provider instance for the cloud session.
         self._unloaded = True
+        self._restore_ma_autoplay()
         if self._unsubscribe_queue_events is not None:
             self._unsubscribe_queue_events()
             self._unsubscribe_queue_events = None
@@ -634,11 +636,40 @@ class QobuzConnectProvider(PluginProvider):
             self.logger.info("Qobuz Connect activated")
             await self._broadcast_current_volume()
             await self._quality_reporter.report_current(self._max_quality)
+            self._suppress_ma_autoplay()
+            await self._coordinator.submit(
+                CloudSetActive(now_ms=int(time.time() * 1000), active=True)
+            )
         else:
             self.logger.info("Qobuz Connect deactivated by cloud; releasing MA player")
-        await self._coordinator.submit(
-            CloudSetActive(now_ms=int(time.time() * 1000), active=active)
-        )
+            try:
+                await self._coordinator.submit(
+                    CloudSetActive(now_ms=int(time.time() * 1000), active=False)
+                )
+            finally:
+                self._restore_ma_autoplay()
+
+    def _suppress_ma_autoplay(self) -> None:
+        """Suppress MA autoplay while Qobuz Connect owns the target queue."""
+        player_id = self.get_target_player_id()
+        if not player_id:
+            return
+        queue = self._bridge.get_queue(player_id)
+        if queue is None:
+            return
+        if self._ma_autoplay_lease is None:
+            self._ma_autoplay_lease = (player_id, bool(queue.autoplay_enabled))
+        if queue.autoplay_enabled:
+            self._bridge.set_autoplay(player_id, False)
+
+    def _restore_ma_autoplay(self) -> None:
+        """Restore MA autoplay on the queue captured during activation."""
+        lease, self._ma_autoplay_lease = self._ma_autoplay_lease, None
+        if lease is None:
+            return
+        player_id, enabled = lease
+        if self._bridge.get_queue(player_id) is not None:
+            self._bridge.set_autoplay(player_id, enabled)
 
     async def _broadcast_current_volume(self) -> None:
         """Report current MA player volume to Qobuz."""
