@@ -172,6 +172,11 @@ class QobuzConnectCoordinator:
         """Return the newest canonical queue generation."""
         return self._queue_generation
 
+    def transfer_target(self, player_id: str | None) -> None:
+        """Move release ownership to the provider's authoritative active target."""
+        if self._state.active:
+            self._owned_target_player_id = player_id
+
     def close(self) -> None:
         """
         Stop all timer activity — call on provider unload.

@@ -98,7 +98,7 @@ git commit -m "fix(qobuz_connect): make provider startup transactional"
 - Consumes: `QobuzConnectProvider.get_target_player_id()`.
 - Produces: `QobuzConnectCoordinator.transfer_target(player_id)`, active pin/autoplay transfer.
 
-- [ ] **Step 1: Write failing migration/return/release tests**
+- [x] **Step 1: Write failing migration/return/release tests**
 
 ```python
 async def test_active_target_disappearance_transfers_release_and_autoplay() -> None:
@@ -116,13 +116,13 @@ def test_configured_target_return_waits_for_active_release() -> None:
     assert provider.get_target_player_id() == "fallback"
 ```
 
-- [ ] **Step 2: Run target-focused tests and confirm RED**
+- [x] **Step 2: Run target-focused tests and confirm RED**
 
 Run: `pytest tests/providers/qobuz_connect/test_provider_wiring.py tests/providers/qobuz_connect/test_coordinator.py -q`
 
 Expected: release/autoplay ownership remains on the vanished target or redirects on configured return.
 
-- [ ] **Step 3: Implement the single active lease**
+- [x] **Step 3: Implement the single active lease**
 
 ```python
 def transfer_target(self, player_id: str | None) -> None:
@@ -134,13 +134,13 @@ Resolve a valid active pin before consulting configured-target preference. When 
 pin disappears, move the coordinator target and autoplay lease to the replacement.
 Clear the pin and lease on deactivation, disconnect, ownership loss, and unload.
 
-- [ ] **Step 4: Run target-focused tests and confirm GREEN**
+- [x] **Step 4: Run target-focused tests and confirm GREEN**
 
 Run: `pytest tests/providers/qobuz_connect/test_provider_wiring.py tests/providers/qobuz_connect/test_coordinator.py -q`
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add music_assistant/providers/qobuz_connect/{__init__.py,coordinator.py} tests/providers/qobuz_connect/{test_provider_wiring.py,test_coordinator.py}

@@ -526,8 +526,8 @@ async def test_repeated_activation_does_not_overwrite_restore_value() -> None:
     assert queue.autoplay_enabled is True
 
 
-async def test_repeated_activation_does_not_suppress_replacement_player() -> None:
-    """A vanished leased player cannot redirect suppression to its replacement."""
+async def test_repeated_activation_transfers_autoplay_lease_to_replacement_player() -> None:
+    """A vanished active target restores its lease before suppressing the replacement."""
     p1 = _fake_player("p1")
     p2 = _fake_player("p2")
     provider, mass = _make_provider(p1)
@@ -553,10 +553,36 @@ async def test_repeated_activation_does_not_suppress_replacement_player() -> Non
     mass.players.all_players.return_value = [p2]
     await provider._on_set_active(True)
 
+    assert autoplay_enabled("p1") is True
+    assert autoplay_enabled("p2") is False
+    assert provider._coordinator._owned_target_player_id == "p2"
+
     await provider._on_set_active(False)
 
     assert autoplay_enabled("p1") is True
     assert autoplay_enabled("p2") is True
+
+
+async def test_deactivation_releases_replacement_when_active_target_disappeared() -> None:
+    """Deactivation reconciles a vanished pin before choosing the release target."""
+    p1 = _fake_player("p1")
+    p2 = _fake_player("p2")
+    provider, mass = _make_provider(p1)
+    players = {"p1": p1, "p2": p2}
+    mass.players.all_players.return_value = [p1, p2]
+    mass.players.get_player.side_effect = players.get
+    mass.player_queues.stop = AsyncMock()
+    mass.player_queues.clear = MagicMock()
+
+    await provider._on_set_active(True)
+    players.pop("p1")
+    mass.players.all_players.return_value = [p2]
+
+    await provider._on_set_active(False)
+
+    mass.player_queues.stop.assert_awaited_once_with("p2")
+    mass.player_queues.clear.assert_called_once_with("p2", skip_stop=True)
+    assert provider._pinned_target_id is None
 
 
 async def test_unload_restores_autoplay_on_the_captured_player_only() -> None:
@@ -645,7 +671,8 @@ async def test_disconnect_restores_ma_autoplay() -> None:
     await callbacks.on_disconnected()
 
     assert provider._coordinator.state.active is False
-    assert queue.autoplay_enabled is True
+    assert vars(queue)["autoplay_enabled"] is True
+    assert vars(provider)["_pinned_target_id"] is None
 
 
 async def test_queue_update_reasserts_autoplay_suppression_while_active() -> None:
@@ -1098,6 +1125,28 @@ def test_auto_target_repins_when_pinned_player_disappears() -> None:
     del players["p1"]
     mass.players.all_players.return_value = [other]
     assert provider.get_target_player_id() == "p2"
+
+
+def test_configured_target_return_waits_until_active_fallback_releases() -> None:
+    """A recovered configured target cannot redirect a live fallback session."""
+    configured = _fake_player("configured")
+    fallback = _fake_player("fallback")
+    provider, mass = _make_provider(fallback)
+    provider._target_player_id = configured.player_id
+    players = {"fallback": fallback}
+    mass.players.all_players.return_value = [fallback]
+    mass.players.get_player.side_effect = players.get
+
+    assert provider.get_target_player_id() == "fallback"
+    provider._coordinator._state = CanonicalState(active=True)
+    players["configured"] = configured
+    mass.players.all_players.return_value = [configured, fallback]
+
+    assert provider.get_target_player_id() == "fallback"
+
+    provider._coordinator._state = CanonicalState(active=False)
+    provider._pinned_target_id = None
+    assert provider.get_target_player_id() == "configured"
 
 
 def test_missing_configured_player_falls_back_to_auto_and_warns_once() -> None:

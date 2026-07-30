@@ -305,7 +305,7 @@ class QobuzConnectProvider(PluginProvider):
         # under the setup lock and bails instead of spawning a zombie session
         # that would fight the next provider instance for the cloud session.
         self._unloaded = True
-        self._restore_ma_autoplay()
+        self._release_active_target()
         self._coordinator.close()
         async with self._ws_setup_lock:
             if self._session:
@@ -342,10 +342,20 @@ class QobuzConnectProvider(PluginProvider):
 
     def get_target_player_id(self) -> str | None:
         """Resolve configured target player, falling back to auto if a pinned one is gone."""
+        active = self._coordinator.state.active
+        pinned = self._pinned_target_id
+        resolved: str | None
+        if pinned is not None and active and self.mass.players.get_player(pinned):
+            return pinned
+
         if self._target_player_id != PLAYER_ID_AUTO:
             if self.mass.players.get_player(self._target_player_id):
                 self._warned_missing_target = None
-                return self._target_player_id
+                resolved = self._target_player_id
+                self._pinned_target_id = resolved
+                if active and resolved != pinned:
+                    self._transfer_active_target(resolved)
+                return resolved
             # A pinned target that no longer resolves must NOT silently kill
             # playback: a stale saved id (e.g. MA's player-id scheme drifted, or
             # the player is briefly offline) previously returned None, so every
@@ -367,20 +377,14 @@ class QobuzConnectProvider(PluginProvider):
         # pause from the app (target no longer PLAYING) or another player
         # starting playback silently redirected commands and state sync to a
         # different player mid-session. Only a vanished pin re-resolves.
-        pinned = self._pinned_target_id
-        if (
-            pinned is not None
-            and self._coordinator.state.active
-            and self.mass.players.get_player(pinned)
-        ):
-            return pinned
-
         players = list(self.mass.players.all_players(False, False))
         resolved = next(
             (p.player_id for p in players if p.state.playback_state == MAPlaybackState.PLAYING),
             players[0].player_id if players else None,
         )
         self._pinned_target_id = resolved
+        if active and resolved != pinned:
+            self._transfer_active_target(resolved)
         return resolved
 
     def get_qobuz_provider(self) -> QobuzProvider:
@@ -510,7 +514,7 @@ class QobuzConnectProvider(PluginProvider):
             await self._coordinator.submit(event)
         finally:
             if was_active and not self._coordinator.state.active:
-                self._restore_ma_autoplay()
+                self._release_active_target()
 
     async def _on_session_connected(self) -> None:
         """Log a confirmed Qobuz websocket connection."""
@@ -525,7 +529,7 @@ class QobuzConnectProvider(PluginProvider):
         try:
             await self._coordinator._on_disconnected()
         finally:
-            self._restore_ma_autoplay()
+            self._release_active_target()
 
     async def _on_quality_change(self, new_quality: int) -> None:
         """Remember quality selected in Qobuz app."""
@@ -650,11 +654,13 @@ class QobuzConnectProvider(PluginProvider):
         else:
             self.logger.info("Qobuz Connect deactivated by cloud; releasing MA player")
             try:
+                if self._coordinator.state.active:
+                    self.get_target_player_id()
                 await self._coordinator.submit(
                     CloudSetActive(now_ms=int(time.time() * 1000), active=False)
                 )
             finally:
-                self._restore_ma_autoplay()
+                self._release_active_target()
 
     def _suppress_ma_autoplay(self) -> None:
         """Suppress MA autoplay while Qobuz Connect owns the target queue."""
@@ -684,6 +690,28 @@ class QobuzConnectProvider(PluginProvider):
         player_id, enabled = lease
         if self._bridge.get_queue(player_id) is not None:
             self._bridge.set_autoplay(player_id, enabled)
+
+    def _transfer_active_target(self, player_id: str | None) -> None:
+        """Move coordinator and autoplay ownership to a replacement target."""
+        self._coordinator.transfer_target(player_id)
+        if self._ma_autoplay_lease is not None:
+            leased_player_id, _enabled = self._ma_autoplay_lease
+            if leased_player_id == player_id:
+                return
+            self._restore_ma_autoplay()
+        if player_id is None:
+            return
+        queue = self._bridge.get_queue(player_id)
+        if queue is None:
+            return
+        self._ma_autoplay_lease = (player_id, bool(queue.autoplay_enabled))
+        if queue.autoplay_enabled:
+            self._bridge.set_autoplay(player_id, False)
+
+    def _release_active_target(self) -> None:
+        """Restore the active target's autoplay setting and clear its pin."""
+        self._restore_ma_autoplay()
+        self._pinned_target_id = None
 
     def _unload_started(self) -> bool:
         """Return whether provider unload has started."""
