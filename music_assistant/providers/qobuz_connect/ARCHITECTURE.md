@@ -570,6 +570,13 @@ details. It does not fabricate device quality from the ceiling. A quality
 command persists both this Connect instance and its explicitly selected
 native Qobuz provider independently.
 
+The selected native provider is shared state when multiple Connect receivers
+point to the same Qobuz account. An explicit receiver ceiling is reconciled
+when that receiver becomes active, so the last active explicit receiver owns
+native stream quality. An `AUTO` receiver never writes shared quality; it
+refreshes its advertised ceiling from the native provider each time it becomes
+active.
+
 The current web protocol's controller quality command is
 `{rendererId: field 1, maxAudioQuality: field 2}`. Server quality broadcasts
 likewise put `rendererId` first. The committed `.proto` definitions and

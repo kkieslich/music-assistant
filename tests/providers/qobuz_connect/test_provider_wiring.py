@@ -1254,6 +1254,72 @@ def test_auto_quality_resolves_native_provider_config() -> None:
     assert provider._device_config.max_quality == 7
 
 
+async def test_activation_reconciles_explicit_quality_after_restart() -> None:
+    """An explicit persisted ceiling becomes native stream quality on activation."""
+    provider, mass = _make_provider(max_quality="6", native_quality="27")
+    mass.config.save_provider_config = AsyncMock()
+
+    await provider._on_set_active(True)
+
+    mass.config.save_provider_config.assert_awaited_once_with(
+        "qobuz",
+        {"quality": "6"},
+        "qobuz",
+    )
+
+
+async def test_auto_quality_does_not_write_native_quality_on_activation() -> None:
+    """AUTO follows the native provider without claiming shared quality ownership."""
+    provider, mass = _make_provider(max_quality="0", native_quality="7")
+    mass.config.save_provider_config = AsyncMock()
+
+    await provider._on_set_active(True)
+
+    mass.config.save_provider_config.assert_not_awaited()
+
+
+async def test_auto_quality_refreshes_from_shared_native_quality_on_activation() -> None:
+    """AUTO observes a quality changed by another receiver since this one loaded."""
+    provider, mass = _make_provider(max_quality="0", native_quality="7")
+    native = provider.get_qobuz_provider()
+    cast("Any", native.config.get_value).return_value = "6"
+    mass.config.save_provider_config = AsyncMock()
+
+    await provider._on_set_active(True)
+
+    assert provider._max_quality == 6
+    assert provider._device_config.max_quality == 6
+    mass.config.save_provider_config.assert_not_awaited()
+
+
+async def test_last_active_explicit_receiver_owns_shared_native_quality() -> None:
+    """Two receivers sharing one account reconcile in activation order."""
+    receiver_a, mass = _make_provider(max_quality="6", native_quality="27")
+    receiver_b, _other_mass = _make_provider(max_quality="27", native_quality="27")
+    receiver_b.mass = mass
+    native = receiver_a.get_qobuz_provider()
+    current_quality = "27"
+    cast("Any", native.config.get_value).side_effect = lambda _key: current_quality
+    saved_qualities: list[str] = []
+
+    async def save(
+        domain: str,
+        values: dict[str, Any],
+        _instance_id: str,
+    ) -> None:
+        nonlocal current_quality
+        if domain == "qobuz":
+            current_quality = cast("str", values["quality"])
+            saved_qualities.append(current_quality)
+
+    mass.config.save_provider_config = AsyncMock(side_effect=save)
+
+    await receiver_a._on_set_active(True)
+    await receiver_b._on_set_active(True)
+
+    assert saved_qualities == ["6", "27"]
+
+
 async def test_unload_blocks_late_websocket_setup_and_reaps_timers(
     tmp_path: Any,
 ) -> None:

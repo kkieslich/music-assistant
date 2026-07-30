@@ -643,6 +643,10 @@ class QobuzConnectProvider(PluginProvider):
             return
         if active:
             self.logger.info("Qobuz Connect activated")
+            try:
+                await self._reconcile_active_quality()
+            except Exception as err:
+                self.logger.warning("Failed to reconcile active Qobuz quality: %s", err)
             await self._broadcast_current_volume()
             await self._quality_reporter.report_current(self._max_quality)
             if self._unload_started():
@@ -712,6 +716,14 @@ class QobuzConnectProvider(PluginProvider):
         """Restore the active target's autoplay setting and clear its pin."""
         self._restore_ma_autoplay()
         self._pinned_target_id = None
+
+    async def _reconcile_active_quality(self) -> None:
+        """Apply this active receiver's documented native-quality ownership."""
+        if self._configured_max_quality == AUTO_QUALITY:
+            self._max_quality = self._resolve_max_quality(AUTO_QUALITY)
+            self._device_config.max_quality = self._max_quality
+            return
+        await self._update_qobuz_stream_quality(self._max_quality)
 
     def _unload_started(self) -> bool:
         """Return whether provider unload has started."""

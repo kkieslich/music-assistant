@@ -158,7 +158,7 @@ git commit -m "fix(qobuz_connect): keep active target ownership coherent"
 - Consumes: `_configured_max_quality`, `_update_qobuz_stream_quality()`.
 - Produces: `_reconcile_active_quality()`.
 
-- [ ] **Step 1: Write failing restart and shared-native tests**
+- [x] **Step 1: Write failing restart and shared-native tests**
 
 ```python
 async def test_activation_reconciles_explicit_quality_after_restart() -> None:
@@ -173,13 +173,13 @@ async def test_last_active_explicit_receiver_owns_shared_native_quality() -> Non
     assert saved_native_qualities == ["6", "27"]
 ```
 
-- [ ] **Step 2: Run focused tests and confirm RED**
+- [x] **Step 2: Run focused tests and confirm RED**
 
 Run: `pytest tests/providers/qobuz_connect/test_provider_wiring.py -q`
 
 Expected: activation never writes the persisted explicit ceiling.
 
-- [ ] **Step 3: Implement and document last-active ownership**
+- [x] **Step 3: Implement and document last-active ownership**
 
 ```python
 async def _reconcile_active_quality(self) -> None:
@@ -190,13 +190,13 @@ async def _reconcile_active_quality(self) -> None:
 Call it during activation with warning-only persistence failure. Document that AUTO
 reads native and the last active explicit receiver writes shared native quality.
 
-- [ ] **Step 4: Run focused tests and confirm GREEN**
+- [x] **Step 4: Run focused tests and confirm GREEN**
 
 Run: `pytest tests/providers/qobuz_connect/test_provider_wiring.py -q`
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add music_assistant/providers/qobuz_connect/{__init__.py,ARCHITECTURE.md} tests/providers/qobuz_connect/test_provider_wiring.py
