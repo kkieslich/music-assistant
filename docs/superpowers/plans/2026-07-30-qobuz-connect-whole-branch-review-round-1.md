@@ -33,7 +33,7 @@
 - Consumes: `MusicAssistant.get_provider(instance_id)`, `Provider.handle_async_init()`.
 - Produces: `QobuzConnectProvider.handle_async_init()`, transactional `QobuzConnectDiscovery.start()` and `stop()`.
 
-- [ ] **Step 1: Write failing exact-dependency and lifecycle tests**
+- [x] **Step 1: Write failing exact-dependency and lifecycle tests**
 
 ```python
 async def test_handle_async_init_rejects_unavailable_selected_qobuz() -> None:
@@ -51,13 +51,13 @@ async def test_handle_async_init_rolls_back_after_discovery_failure() -> None:
     assert provider._unsubscribe_queue_events is None
 ```
 
-- [ ] **Step 2: Run focused tests and confirm RED**
+- [x] **Step 2: Run focused tests and confirm RED**
 
 Run: `pytest tests/providers/qobuz_connect/test_provider_wiring.py tests/providers/qobuz_connect/test_discovery.py -q`
 
 Expected: new validation/rollback assertions fail against `loaded_in_mass()` startup.
 
-- [ ] **Step 3: Implement awaited transactional startup**
+- [x] **Step 3: Implement awaited transactional startup**
 
 ```python
 async def handle_async_init(self) -> None:
@@ -73,13 +73,13 @@ Add `"depends_on": "qobuz"` to the manifest. Make discovery `start()` call
 exception-safe `stop()` on failure, and make `stop()` attempt mDNS, TCP site,
 runner, and private Zeroconf cleanup independently before clearing references.
 
-- [ ] **Step 4: Run focused tests and confirm GREEN**
+- [x] **Step 4: Run focused tests and confirm GREEN**
 
 Run: `pytest tests/providers/qobuz_connect/test_provider_wiring.py tests/providers/qobuz_connect/test_discovery.py -q`
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add music_assistant/providers/qobuz_connect/{manifest.json,__init__.py,discovery.py} tests/providers/qobuz_connect/{test_provider_wiring.py,test_discovery.py}

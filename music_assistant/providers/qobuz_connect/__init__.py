@@ -160,6 +160,8 @@ class QobuzConnectProvider(PluginProvider):
         )
         self._discovery: QobuzConnectDiscovery | None = None
         self._session: QobuzConnectSession | None = None
+        self._flight_recorder_started = False
+        self._reporter_started = False
         # Sync core: a pure reducer (reducer.py/sync_types.py) driving an
         # impure coordinator + effect runner. MABridge is the single seam to
         # MA; MetadataResolver and OutboundReporter take explicit getters for
@@ -234,54 +236,53 @@ class QobuzConnectProvider(PluginProvider):
         self._warned_missing_target: str | None = None
         self._ma_autoplay_lease: tuple[str, bool] | None = None
 
-    async def loaded_in_mass(self) -> None:
-        """Start Qobuz Connect discovery after provider load."""
+    async def handle_async_init(self) -> None:
+        """Validate dependencies and start availability-critical services."""
+        self.get_qobuz_provider()
         logging.getLogger("websockets.client").setLevel(logging.WARNING)
         logging.getLogger("websockets.protocol").setLevel(logging.WARNING)
-        # Started first so it captures anything that goes wrong in the rest
-        # of the load sequence (discovery port conflicts, mDNS failures, ...).
-        await self._flight_recorder.start(extra_logger=self.logger)
-        await self._reporter.start()
-        self._unsubscribe_queue_events = self.mass.subscribe(
-            self._on_ma_queue_event,
-            EventType.QUEUE_UPDATED,
-        )
-        # QUEUE_ITEMS_UPDATED carries user-driven queue mutations (drag-
-        # reorder, remove, add) — feed those into the MA→Qobuz outbound
-        # differ so cloud sees them.
-        self._unsubscribe_queue_items_events = self.mass.subscribe(
-            self._on_ma_queue_items_event,
-            EventType.QUEUE_ITEMS_UPDATED,
-        )
-        # PLAYER_UPDATED carries volume + mute changes from MA's UI. Without
-        # this subscription, MA-side slider drags never propagate to the
-        # Qobuz app and its volume display drifts away from MA's actual
-        # level — the cloud's view stays pinned at whatever we last sent
-        # via ``_broadcast_current_volume`` (only fired on connect /
-        # SET_ACTIVE). The result is the "huge volume drop" the user
-        # reported: cloud thinks MA is at 25, user moves Qobuz slider to
-        # 30, MA snaps from 75 to 30.
-        self._unsubscribe_player_events = self.mass.subscribe(
-            self._on_ma_player_updated,
-            EventType.PLAYER_UPDATED,
-        )
-        self._discovery = QobuzConnectDiscovery(
-            device=self._device_config,
-            on_connect=self._on_app_connected,
-            quality_getter=lambda: self._max_quality,
-            zeroconf=self._shared_zeroconf(),
-        )
         try:
+            # Started first so it captures anything that goes wrong in the rest
+            # of the load sequence (discovery port conflicts, mDNS failures, ...).
+            self._flight_recorder_started = True
+            await self._flight_recorder.start(extra_logger=self.logger)
+            self._reporter_started = True
+            await self._reporter.start()
+            self._unsubscribe_queue_events = self.mass.subscribe(
+                self._on_ma_queue_event,
+                EventType.QUEUE_UPDATED,
+            )
+            # QUEUE_ITEMS_UPDATED carries user-driven queue mutations (drag-
+            # reorder, remove, add) — feed those into the MA→Qobuz outbound
+            # differ so cloud sees them.
+            self._unsubscribe_queue_items_events = self.mass.subscribe(
+                self._on_ma_queue_items_event,
+                EventType.QUEUE_ITEMS_UPDATED,
+            )
+            # PLAYER_UPDATED carries volume + mute changes from MA's UI. Without
+            # this subscription, MA-side slider drags never propagate to the
+            # Qobuz app and its volume display drifts away from MA's actual
+            # level — the cloud's view stays pinned at whatever we last sent
+            # via ``_broadcast_current_volume`` (only fired on connect /
+            # SET_ACTIVE).
+            self._unsubscribe_player_events = self.mass.subscribe(
+                self._on_ma_player_updated,
+                EventType.PLAYER_UPDATED,
+            )
+            self._discovery = QobuzConnectDiscovery(
+                device=self._device_config,
+                on_connect=self._on_app_connected,
+                quality_getter=lambda: self._max_quality,
+                zeroconf=self._shared_zeroconf(),
+            )
             await self._discovery.start()
-        except Exception:
-            # loaded_in_mass runs in a fire-and-forget task whose exception
-            # MA only logs at DEBUG — surface the failure (port conflict,
-            # mDNS error) at ERROR so it's visible and flight-recorded.
+        except BaseException:
             self.logger.exception(
-                "Qobuz Connect discovery failed to start — the device will not be "
+                "Qobuz Connect initialization failed — the device will not be "
                 "reachable (is port %s already in use, e.g. by another instance?)",
                 self._http_port,
             )
+            await self._stop_runtime()
             raise
         self.logger.info(
             "Qobuz Connect target '%s' listening on %s:%s",
@@ -289,6 +290,9 @@ class QobuzConnectProvider(PluginProvider):
             self.mass.streams.bind_ip,
             self._http_port,
         )
+
+    async def loaded_in_mass(self) -> None:
+        """Start the cloud session after the initialized provider is registered."""
         # Connect to the cloud eagerly, self-minting the websocket token via
         # qws/createToken. Waiting for the app's local handshake would lose the
         # FIRST handoff: the phone's SET_ACTIVE races our connect+join and the
@@ -302,26 +306,12 @@ class QobuzConnectProvider(PluginProvider):
         # that would fight the next provider instance for the cloud session.
         self._unloaded = True
         self._restore_ma_autoplay()
-        if self._unsubscribe_queue_events is not None:
-            self._unsubscribe_queue_events()
-            self._unsubscribe_queue_events = None
-        if self._unsubscribe_queue_items_events is not None:
-            self._unsubscribe_queue_items_events()
-            self._unsubscribe_queue_items_events = None
-        if self._unsubscribe_player_events is not None:
-            self._unsubscribe_player_events()
-            self._unsubscribe_player_events = None
-        await self._reporter.stop()
         self._coordinator.close()
         async with self._ws_setup_lock:
             if self._session:
                 await self._session.stop()
                 self._session = None
-        if self._discovery:
-            await self._discovery.stop()
-            self._discovery = None
-        # Last, so the final rolling dump includes any shutdown warnings.
-        await self._flight_recorder.stop()
+        await self._stop_runtime()
 
     async def update_config(self, config: ProviderConfig, changed_keys: set[str]) -> None:
         """Handle dynamic provider config updates."""
@@ -810,6 +800,39 @@ class QobuzConnectProvider(PluginProvider):
         if setup_value is not None:
             return setup_value
         return self.config.get_value(key, default)
+
+    async def _stop_runtime(self) -> None:
+        """Stop availability-critical services without skipping later owners."""
+        if self._discovery is not None:
+            discovery, self._discovery = self._discovery, None
+            try:
+                await discovery.stop()
+            except Exception as err:
+                self.logger.warning("Failed to stop Qobuz Connect discovery: %s", err)
+        for attribute in (
+            "_unsubscribe_player_events",
+            "_unsubscribe_queue_items_events",
+            "_unsubscribe_queue_events",
+        ):
+            if unsubscribe := getattr(self, attribute):
+                setattr(self, attribute, None)
+                try:
+                    unsubscribe()
+                except Exception as err:
+                    self.logger.warning("Failed to unsubscribe Qobuz Connect event: %s", err)
+        if self._reporter_started:
+            self._reporter_started = False
+            try:
+                await self._reporter.stop()
+            except Exception as err:
+                self.logger.warning("Failed to stop Qobuz Connect reporter: %s", err)
+        if self._flight_recorder_started:
+            self._flight_recorder_started = False
+            try:
+                # Last, so the final rolling dump includes any shutdown warnings.
+                await self._flight_recorder.stop()
+            except Exception as err:
+                self.logger.warning("Failed to stop Qobuz Connect flight recorder: %s", err)
 
 
 class _LiveSessionProxy:

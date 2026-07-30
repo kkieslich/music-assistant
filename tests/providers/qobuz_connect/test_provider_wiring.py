@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -12,6 +14,7 @@ from music_assistant_models.enums import PlaybackState as MAPlaybackState
 from music_assistant_models.errors import InvalidDataError
 from music_assistant_models.media_items import Track
 
+from music_assistant.providers import qobuz_connect as provider_module
 from music_assistant.providers.qobuz_connect import (
     CONF_HTTP_PORT,
     CONF_INITIAL_VOLUME,
@@ -238,6 +241,117 @@ def test_missing_selected_qobuz_instance_has_actionable_error() -> None:
 
     with pytest.raises(InvalidDataError, match="qobuz--missing"):
         provider.get_qobuz_provider()
+
+
+def test_manifest_declares_native_qobuz_dependency() -> None:
+    """MA delays receiver loading until a native Qobuz provider is available."""
+    manifest_path = (
+        Path(provider_module.__file__).with_name("manifest.json")
+        if provider_module.__file__
+        else None
+    )
+    assert manifest_path is not None
+
+    manifest = json.loads(manifest_path.read_text())
+
+    assert manifest["depends_on"] == "qobuz"
+
+
+@pytest.mark.parametrize(
+    ("selected_provider", "message"),
+    [
+        (None, "qobuz--selected"),
+        (SimpleNamespace(domain="tidal"), "qobuz--selected"),
+    ],
+)
+async def test_handle_async_init_rejects_invalid_selected_qobuz_provider(
+    selected_provider: SimpleNamespace | None,
+    message: str,
+) -> None:
+    """Availability-critical init validates the exact selected native instance."""
+    provider, mass = _make_provider(qobuz_provider_id="qobuz--selected")
+    mass.get_provider.side_effect = None
+    mass.get_provider.return_value = selected_provider
+
+    with pytest.raises(InvalidDataError, match=message):
+        await provider.handle_async_init()
+
+
+async def test_handle_async_init_rejects_disabled_selected_qobuz_provider() -> None:
+    """A configured but disabled native instance is unavailable to the receiver."""
+    provider, mass = _make_provider(qobuz_provider_id="qobuz--disabled")
+    disabled = SimpleNamespace(domain="qobuz", instance_id="qobuz--disabled", available=False)
+
+    def get_provider(instance_id: str, return_unavailable: bool = False) -> Any:
+        assert instance_id == "qobuz--disabled"
+        return disabled if return_unavailable else None
+
+    mass.get_provider.side_effect = get_provider
+
+    with pytest.raises(InvalidDataError, match="qobuz--disabled"):
+        await provider.handle_async_init()
+
+
+async def test_handle_async_init_retries_cleanly_after_selected_qobuz_loads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delayed selected instance can initialize on MA's dependency-triggered retry."""
+    provider, mass = _make_provider(qobuz_provider_id="qobuz--selected")
+    native = _fake_qobuz_provider()
+    native.instance_id = "qobuz--selected"
+    mass.get_provider.side_effect = None
+    mass.get_provider.return_value = None
+
+    with pytest.raises(InvalidDataError):
+        await provider.handle_async_init()
+
+    discovery = MagicMock()
+    discovery.start = AsyncMock()
+    monkeypatch.setattr(provider_module, "QobuzConnectDiscovery", lambda **_kwargs: discovery)
+    provider._flight_recorder = MagicMock()
+    provider._flight_recorder.start = AsyncMock()
+    provider._flight_recorder.stop = AsyncMock()
+    provider._reporter = MagicMock()
+    provider._reporter.start = AsyncMock()
+    provider._reporter.stop = AsyncMock()
+    mass.subscribe.side_effect = [MagicMock(), MagicMock(), MagicMock()]
+    mass.get_provider.return_value = native
+
+    await provider.handle_async_init()
+
+    discovery.start.assert_awaited_once()
+
+
+async def test_handle_async_init_rolls_back_partial_runtime_on_discovery_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A discovery error cannot leave reporters, subscriptions, or partial state running."""
+    provider, mass = _make_provider()
+    unsubs = [MagicMock(), MagicMock(), MagicMock()]
+    mass.subscribe.side_effect = unsubs
+    provider._flight_recorder = MagicMock()
+    provider._flight_recorder.start = AsyncMock()
+    provider._flight_recorder.stop = AsyncMock()
+    provider._reporter = MagicMock()
+    provider._reporter.start = AsyncMock()
+    provider._reporter.stop = AsyncMock()
+    discovery = MagicMock()
+    discovery.start = AsyncMock(side_effect=OSError("occupied"))
+    discovery.stop = AsyncMock()
+    monkeypatch.setattr(provider_module, "QobuzConnectDiscovery", lambda **_kwargs: discovery)
+
+    with pytest.raises(OSError, match="occupied"):
+        await provider.handle_async_init()
+
+    for unsubscribe in unsubs:
+        unsubscribe.assert_called_once_with()
+    provider._reporter.stop.assert_awaited_once()
+    provider._flight_recorder.stop.assert_awaited_once()
+    discovery.stop.assert_awaited_once()
+    assert provider._discovery is None
+    assert provider._unsubscribe_queue_events is None
+    assert provider._unsubscribe_queue_items_events is None
+    assert provider._unsubscribe_player_events is None
 
 
 def test_queue_mapping_does_not_require_selected_provider_to_be_loaded_yet() -> None:

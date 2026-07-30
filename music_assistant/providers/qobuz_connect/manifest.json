@@ -7,5 +7,6 @@
   "codeowners": ["@local-dev"],
   "requirements": [],
   "documentation": "https://github.com/music-assistant/server",
+  "depends_on": "qobuz",
   "multi_instance": true
 }

@@ -82,24 +82,46 @@ class QobuzConnectDiscovery:
 
     async def start(self) -> None:
         """Start HTTP endpoints and register mDNS service."""
-        self._app = web.Application()
-        self._app.router.add_get("/", self._handle_root)
-        self._app.router.add_get("/streamcore/get-display-info", self._handle_display_info)
-        self._app.router.add_get("/streamcore/get-connect-info", self._handle_connect_info)
-        self._app.router.add_post("/streamcore/connect-to-qconnect", self._handle_connect)
-        self._runner = web.AppRunner(self._app)
-        await self._runner.setup()
-        self._site = web.TCPSite(self._runner, self.device.bind_address, self.device.http_port)
-        await self._site.start()
-        await self._register_mdns()
+        try:
+            self._app = web.Application()
+            self._app.router.add_get("/", self._handle_root)
+            self._app.router.add_get("/streamcore/get-display-info", self._handle_display_info)
+            self._app.router.add_get("/streamcore/get-connect-info", self._handle_connect_info)
+            self._app.router.add_post("/streamcore/connect-to-qconnect", self._handle_connect)
+            self._runner = web.AppRunner(self._app)
+            await self._runner.setup()
+            self._site = web.TCPSite(self._runner, self.device.bind_address, self.device.http_port)
+            await self._site.start()
+            await self._register_mdns()
+        except BaseException:
+            try:
+                await self.stop()
+            except BaseException:
+                LOGGER.exception("Failed to roll back Qobuz Connect discovery startup")
+            raise
 
     async def stop(self) -> None:
         """Stop discovery."""
-        await self._unregister_mdns()
+        first_error: BaseException | None = None
+        try:
+            await self._unregister_mdns()
+        except BaseException as err:
+            first_error = err
         if self._site:
-            await self._site.stop()
+            try:
+                await self._site.stop()
+            except BaseException as err:
+                first_error = first_error or err
         if self._runner:
-            await self._runner.cleanup()
+            try:
+                await self._runner.cleanup()
+            except BaseException as err:
+                first_error = first_error or err
+        self._app = None
+        self._runner = None
+        self._site = None
+        if first_error is not None:
+            raise first_error
 
     async def _handle_root(self, request: web.Request) -> web.Response:
         return web.Response(text=f"Music Assistant Qobuz Connect - {self.device.name}")
@@ -203,12 +225,26 @@ class QobuzConnectDiscovery:
             )
 
     async def _unregister_mdns(self) -> None:
-        if self._zeroconf and self._service_info:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._zeroconf.unregister_service, self._service_info)
-            # A shared instance belongs to MA — only close a private one.
-            if self._zeroconf is not self._shared_zeroconf:
-                await loop.run_in_executor(None, self._zeroconf.close)
+        zeroconf, service_info = self._zeroconf, self._service_info
+        self._zeroconf = None
+        self._service_info = None
+        if zeroconf is None:
+            return
+        loop = asyncio.get_event_loop()
+        first_error: BaseException | None = None
+        if service_info is not None:
+            try:
+                await loop.run_in_executor(None, zeroconf.unregister_service, service_info)
+            except BaseException as err:
+                first_error = err
+        # A shared instance belongs to MA — only close a private one.
+        if zeroconf is not self._shared_zeroconf:
+            try:
+                await loop.run_in_executor(None, zeroconf.close)
+            except BaseException as err:
+                first_error = first_error or err
+        if first_error is not None:
+            raise first_error
 
     @staticmethod
     def _get_local_ip() -> str | None:
