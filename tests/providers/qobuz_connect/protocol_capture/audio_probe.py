@@ -12,16 +12,17 @@ Assumes nothing else on the machine routes audio to BlackHole during a run.
 
 from __future__ import annotations
 
-import math
 import re
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
 
-_MEAN = re.compile(r"mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB")
-_MAX = re.compile(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB")
-_AVF_DEVICE = re.compile(r"\[(\d+)\]\s*BlackHole", re.IGNORECASE)
+_VOLUME_VALUE = r"(-?(?:\d+(?:\.\d+)?|inf))"
+_MEAN = re.compile(rf"mean_volume:\s*{_VOLUME_VALUE}\s*dB")
+_MAX = re.compile(rf"max_volume:\s*{_VOLUME_VALUE}\s*dB")
+_SAMPLES = re.compile(r"n_samples:\s*(\d+)")
+_AVF_DEVICE = re.compile(r"\[(\d+)\]\s*BlackHole 2ch[ \t]*$", re.IGNORECASE | re.MULTILINE)
 # Resolve ffmpeg to an absolute path so subprocess uses a full executable path
 # (a fixed, trusted binary — never user input).
 _FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
@@ -37,7 +38,7 @@ _FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 
 @dataclass(slots=True)
 class AudioLevel:
-    """Measured loudness of a capture window, in dBFS (-inf == silence/no data)."""
+    """Measured loudness of a capture window in dBFS."""
 
     mean_db: float
     max_db: float
@@ -51,10 +52,9 @@ def parse_volumedetect(stderr: str) -> AudioLevel:
     """
     mean = _MEAN.search(stderr)
     mx = _MAX.search(stderr)
-    return AudioLevel(
-        mean_db=float(mean.group(1)) if mean else -math.inf,
-        max_db=float(mx.group(1)) if mx else -math.inf,
-    )
+    if mean is None or mx is None:
+        raise RuntimeError("ffmpeg capture did not produce mean/max volume metrics")
+    return AudioLevel(mean_db=float(mean.group(1)), max_db=float(mx.group(1)))
 
 
 class AudioProbe:
@@ -78,10 +78,12 @@ class AudioProbe:
             text=True,
             check=False,
         )
-        match = _AVF_DEVICE.search(proc.stderr)
-        if match is None:
-            raise RuntimeError("BlackHole audio device not found in avfoundation device list")
-        self._device = match.group(1)
+        matches = _AVF_DEVICE.findall(proc.stderr)
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"Expected exactly one BlackHole 2ch avfoundation input, found {len(matches)}"
+            )
+        self._device = matches[0]
         return self._device
 
     def measure(self, seconds: float) -> AudioLevel:
@@ -110,6 +112,10 @@ class AudioProbe:
             text=True,
             check=False,
         )
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg BlackHole capture failed with exit code {proc.returncode}")
+        if (samples := _SAMPLES.search(proc.stderr)) is not None and int(samples.group(1)) == 0:
+            raise RuntimeError("ffmpeg BlackHole capture produced no audio samples")
         return parse_volumedetect(proc.stderr)
 
     def is_playing(self, seconds: float = 2.0, threshold_db: float = -80.0) -> bool:

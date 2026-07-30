@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-import math
+import subprocess
+
+import pytest
 
 from tests.providers.qobuz_connect.protocol_capture.audio_probe import (
     AudioLevel,
+    AudioProbe,
     parse_volumedetect,
 )
 
@@ -18,6 +21,8 @@ _MUSIC = """
 [Parsed_volumedetect_0 @ 0x1] mean_volume: -24.3 dB
 [Parsed_volumedetect_0 @ 0x1] max_volume: -3.1 dB
 """
+
+_SUBPROCESS_RUN = "tests.providers.qobuz_connect.protocol_capture.audio_probe.subprocess.run"
 
 
 def test_parse_silence() -> None:
@@ -33,8 +38,72 @@ def test_parse_music() -> None:
     assert lvl.max_db == -3.1
 
 
-def test_parse_missing_returns_negative_inf() -> None:
-    """Output with no volume lines yields -inf (treated as silence)."""
-    lvl = parse_volumedetect("no volume lines here")
-    assert lvl.mean_db == -math.inf
-    assert lvl.max_db == -math.inf
+def test_parse_missing_metrics_raises_capture_failure() -> None:
+    """Output with no volume metrics is invalid capture evidence, not silence."""
+    with pytest.raises(RuntimeError, match="volume metrics"):
+        parse_volumedetect("no volume lines here")
+
+
+def test_device_index_requires_exact_blackhole_2ch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prefix competitor cannot shadow the exact silent loopback."""
+    stderr = """
+[AVFoundation indev @ 0x1] [0] BlackHole 16ch
+[AVFoundation indev @ 0x1] [1] BlackHole 2ch
+[AVFoundation indev @ 0x1] [2] BlackHole 2ch Clone
+"""
+    monkeypatch.setattr(
+        _SUBPROCESS_RUN,
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", stderr),
+    )
+
+    assert AudioProbe().device_index() == "1"
+
+
+def test_device_index_rejects_duplicate_exact_blackhole_2ch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambiguous exact devices abort instead of selecting the first one."""
+    stderr = """
+[AVFoundation indev @ 0x1] [1] BlackHole 2ch
+[AVFoundation indev @ 0x1] [2] BlackHole 2ch
+"""
+    monkeypatch.setattr(
+        _SUBPROCESS_RUN,
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", stderr),
+    )
+
+    with pytest.raises(RuntimeError, match="exactly one"):
+        AudioProbe().device_index()
+
+
+def test_measure_raises_when_ffmpeg_capture_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A nonzero ffmpeg exit cannot satisfy a silence check."""
+    monkeypatch.setattr(
+        _SUBPROCESS_RUN,
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 1, "", "input failed"),
+    )
+    probe = AudioProbe()
+    probe._device = "1"
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        probe.measure(0.1)
+
+
+def test_measure_raises_when_capture_has_no_samples(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Zero captured samples are not evidence of silence."""
+    stderr = """
+[Parsed_volumedetect_0 @ 0x1] n_samples: 0
+[Parsed_volumedetect_0 @ 0x1] mean_volume: -91.0 dB
+[Parsed_volumedetect_0 @ 0x1] max_volume: -91.0 dB
+"""
+    monkeypatch.setattr(
+        _SUBPROCESS_RUN,
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", stderr),
+    )
+    probe = AudioProbe()
+    probe._device = "1"
+
+    with pytest.raises(RuntimeError, match="no audio samples"):
+        probe.measure(0.1)

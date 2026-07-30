@@ -327,7 +327,7 @@ git commit -m "fix(qobuz_connect): isolate setup-owned configuration"
 - Consumes: avfoundation device-list stderr and ffmpeg volumedetect stderr.
 - Produces: exact unique device selection and exception-based capture failures.
 
-- [ ] **Step 1: Write failing device/capture tests**
+- [x] **Step 1: Write failing device/capture tests**
 
 ```python
 def test_device_index_ignores_prefix_competitor(monkeypatch) -> None:
@@ -340,13 +340,13 @@ def test_missing_metrics_is_capture_failure() -> None:
         parse_volumedetect("n_samples: 0")
 ```
 
-- [ ] **Step 2: Run audio-probe tests and confirm RED**
+- [x] **Step 2: Run audio-probe tests and confirm RED**
 
 Run: `pytest tests/providers/qobuz_connect/test_audio_probe.py -q`
 
 Expected: prefix can be selected and missing metrics become `-inf`.
 
-- [ ] **Step 3: Implement exact unique selection and strict capture validation**
+- [x] **Step 3: Implement exact unique selection and strict capture validation**
 
 ```python
 _AVF_DEVICE = re.compile(r"^\\[(\\d+)\\]\\s*BlackHole 2ch\\s*$", re.IGNORECASE | re.MULTILINE)
@@ -358,13 +358,13 @@ if len(matches) != 1:
 Raise for nonzero capture return code, explicit zero samples, and absent mean/max
 metrics.
 
-- [ ] **Step 4: Run audio-probe tests and confirm GREEN**
+- [x] **Step 4: Run audio-probe tests and confirm GREEN**
 
 Run: `pytest tests/providers/qobuz_connect/test_audio_probe.py -q`
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/providers/qobuz_connect/{protocol_capture/audio_probe.py,test_audio_probe.py}
