@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import subprocess
+import tempfile
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -463,6 +465,75 @@ def test_managed_probe_requires_live_child_to_own_both_ports(
     owned_ports.pop(8695)
 
     assert not probe.owns_managed_ports()
+
+
+def test_managed_probe_removes_disposable_copy_when_restore_fails(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restore error must not leave copied credential-bearing state behind."""
+    run_dir = tempfile.TemporaryDirectory(dir=tmp_path)
+    run_root = Path(run_dir.name)
+    probe = MAProbe(
+        log_path=tmp_path / "ma.log",
+        data_dir=run_root / "data",
+        cache_dir=run_root / "cache",
+        run_dir=run_dir,
+    )
+
+    def fail_restore() -> None:
+        raise RuntimeError("restore failed")
+
+    monkeypatch.setattr(probe, "_restore_target", fail_restore)
+
+    with pytest.raises(RuntimeError, match="restore failed"):
+        probe.stop()
+
+    assert not run_root.exists()
+
+
+def test_managed_probe_reaps_process_after_forced_kill(tmp_path: Any) -> None:
+    """A child ignoring graceful termination must be reaped after forced kill."""
+
+    class HungProcess:
+        """Minimal process that exits only after a forced kill."""
+
+        pid = 4321
+
+        def __init__(self) -> None:
+            self.killed = False
+            self.reaped = False
+
+        def poll(self) -> None:
+            """Report that the child is still running."""
+
+        def terminate(self) -> None:
+            """Ignore graceful termination."""
+
+        def wait(self, timeout: float) -> int:
+            """Time out until killed, then reap the child."""
+            assert timeout == 20
+            if not self.killed:
+                raise subprocess.TimeoutExpired(cmd="managed-ma", timeout=timeout)
+            self.reaped = True
+            return -9
+
+        def kill(self) -> None:
+            """Make the child available for reaping."""
+            self.killed = True
+
+    process = HungProcess()
+    probe = MAProbe(
+        log_path=tmp_path / "ma.log",
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+    )
+    probe._proc = cast("Any", process)
+
+    probe.stop()
+
+    assert process.reaped
+    assert probe.managed_pid is None
 
 
 def test_default_probe_uses_disposable_data_and_cache_copies(

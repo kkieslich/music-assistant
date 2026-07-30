@@ -277,12 +277,15 @@ class MAProbe:
                         self._proc.wait(timeout=20)
                     except subprocess.TimeoutExpired:
                         self._proc.kill()
+                        self._proc.wait(timeout=20)
                 self._proc = None
         finally:
-            self._restore_target()
-            if self._run_dir is not None:
-                self._run_dir.cleanup()
-                self._run_dir = None
+            try:
+                self._restore_target()
+            finally:
+                if self._run_dir is not None:
+                    self._run_dir.cleanup()
+                    self._run_dir = None
 
     def cursor(self) -> int:
         """Return the current byte length of the log; pass to :meth:`events_since`."""
