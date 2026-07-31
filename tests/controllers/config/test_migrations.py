@@ -391,6 +391,41 @@ def test_migrate_receiver_and_connect_setup_values() -> None:
     }
 
 
+def test_migrate_legacy_qobuz_connect_setup_values() -> None:
+    """Legacy Qobuz Connect setup values move without changing its runtime quality option."""
+    data: dict[str, Any] = {
+        "providers": {
+            "qobuz_connect--legacy": {
+                "domain": "qobuz_connect",
+                "values": {
+                    "qobuz_provider": "qobuz--only",
+                    "target_player": "living-room",
+                    "publish_name": "Legacy receiver name",
+                    "http_port": 8795,
+                    "initial_volume": 35,
+                    "max_quality": "6",
+                },
+                "setup_data": {
+                    "publish_name": ENCRYPT_SUFFIX + "Stored receiver name",
+                },
+            }
+        }
+    }
+
+    assert migrate_provider_setup_data(data, _fake_encrypt) is True
+
+    config = data["providers"]["qobuz_connect--legacy"]
+    assert config["values"] == {"max_quality": "6"}
+    assert config["setup_data"] == {
+        "qobuz_provider": ENCRYPT_SUFFIX + "qobuz--only",
+        "target_player": ENCRYPT_SUFFIX + "living-room",
+        "publish_name": ENCRYPT_SUFFIX + "Stored receiver name",
+        "http_port": 8795,
+        "initial_volume": 35,
+    }
+    assert migrate_provider_setup_data(data, _fake_encrypt) is False
+
+
 def test_migrate_default_airplay_receiver_name_once() -> None:
     """The implicit receiver name is persisted so ghost cleanup cannot rerun later."""
     data: dict[str, Any] = {

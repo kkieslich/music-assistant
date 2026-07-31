@@ -133,6 +133,13 @@ PROVIDER_SETUP_FLOW_KEYS: dict[str, tuple[str, ...]] = {
     "podcast_index": ("api_key", "api_secret"),
     "podcastfeed": ("feed_url",),
     "qobuz": ("username", "password"),
+    "qobuz_connect": (
+        "qobuz_provider",
+        "target_player",
+        "publish_name",
+        "http_port",
+        "initial_volume",
+    ),
     "qqmusic": ("uin", "musicid", "musickey", "login_type", "credential_json"),
     "siriusxm": ("sxm_email_address", "sxm_password", "sxm_region"),
     "soundcloud": ("client_id", "authorization"),

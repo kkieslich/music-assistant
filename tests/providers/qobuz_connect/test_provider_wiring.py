@@ -95,7 +95,7 @@ def _make_provider(
     *,
     max_quality: str = "27",
     native_quality: str = "27",
-    qobuz_provider_id: str = "qobuz",
+    qobuz_provider_id: str | None = "qobuz",
 ) -> tuple[QobuzConnectProvider, MagicMock]:
     """Build a real ``QobuzConnectProvider`` against a mocked ``mass``; returns both."""
     player = target_player or _fake_player()
@@ -114,10 +114,11 @@ def _make_provider(
     mass.player_queues.update_items = MagicMock()
     mass.config.get_raw_provider_config_value.return_value = None
     qobuz_provider = _fake_qobuz_provider(native_quality)
-    qobuz_provider.instance_id = qobuz_provider_id
+    qobuz_provider.instance_id = qobuz_provider_id or "qobuz--only"
     mass.get_provider.side_effect = lambda instance_id, return_unavailable=False: (
         qobuz_provider
-        if instance_id == qobuz_provider_id and (return_unavailable or qobuz_provider.available)
+        if instance_id == qobuz_provider.instance_id
+        and (return_unavailable or qobuz_provider.available)
         else None
     )
 
@@ -130,12 +131,15 @@ def _make_provider(
         CONF_HTTP_PORT: 8695,
         CONF_MAX_QUALITY: max_quality,
         CONF_INITIAL_VOLUME: 25,
-        CONF_QOBUZ_PROVIDER: qobuz_provider_id,
     }
+    if qobuz_provider_id is not None:
+        values[CONF_QOBUZ_PROVIDER] = qobuz_provider_id
     config = MagicMock()
     config.instance_id = "qobuz_connect--test"
     config.name = "Test Qobuz Connect"
-    config.get_value.side_effect = lambda key, *_a, **_k: values.get(key, "GLOBAL")
+    config.get_value.side_effect = lambda key, *_a, **_k: values.get(
+        key, None if key == CONF_QOBUZ_PROVIDER else "GLOBAL"
+    )
 
     return QobuzConnectProvider(mass, manifest, config), mass
 
@@ -294,6 +298,118 @@ def test_manifest_declares_native_qobuz_dependency() -> None:
     manifest = json.loads(manifest_path.read_text())
 
     assert manifest["depends_on"] == "qobuz"
+
+
+def _prepare_successful_init(
+    provider: QobuzConnectProvider, mass: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replace runtime services unrelated to Qobuz provider selection."""
+    discovery = MagicMock()
+    discovery.start = AsyncMock()
+    monkeypatch.setattr(provider_module, "QobuzConnectDiscovery", lambda **_kwargs: discovery)
+    provider._flight_recorder = MagicMock()
+    provider._flight_recorder.start = AsyncMock()
+    provider._flight_recorder.stop = AsyncMock()
+    provider._reporter = MagicMock()
+    provider._reporter.start = AsyncMock()
+    provider._reporter.stop = AsyncMock()
+    mass.subscribe.side_effect = [MagicMock(), MagicMock(), MagicMock()]
+
+
+async def test_init_recovers_and_persists_sole_legacy_qobuz_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unselected legacy receiver adopts its sole available native Qobuz instance."""
+    provider, mass = _make_provider(qobuz_provider_id=None)
+    native = _fake_qobuz_provider()
+    native.instance_id = "qobuz--only"
+    mass.config.get_provider_configs = AsyncMock(
+        return_value=[SimpleNamespace(instance_id="qobuz--only")]
+    )
+    mass.get_provider.side_effect = lambda instance_id, return_unavailable=False: (
+        native if instance_id == "qobuz--only" and return_unavailable else None
+    )
+    update_setup_data = MagicMock()
+    monkeypatch.setattr(provider, "_update_setup_data", update_setup_data)
+    _prepare_successful_init(provider, mass, monkeypatch)
+
+    await provider.handle_async_init()
+
+    assert provider._qobuz_provider_id == "qobuz--only"
+    update_setup_data.assert_called_once_with(CONF_QOBUZ_PROVIDER, "qobuz--only", immediate=True)
+
+
+async def test_init_rejects_ambiguous_legacy_qobuz_providers() -> None:
+    """An unselected legacy receiver never chooses between available Qobuz accounts."""
+    provider, mass = _make_provider(qobuz_provider_id=None)
+    qobuz_one = _fake_qobuz_provider()
+    qobuz_one.instance_id = "qobuz--one"
+    qobuz_two = _fake_qobuz_provider()
+    qobuz_two.instance_id = "qobuz--two"
+    mass.config.get_provider_configs = AsyncMock(
+        return_value=[
+            SimpleNamespace(instance_id="qobuz--one"),
+            SimpleNamespace(instance_id="qobuz--two"),
+        ]
+    )
+    mass.get_provider.side_effect = lambda instance_id, **_kwargs: {
+        "qobuz--one": qobuz_one,
+        "qobuz--two": qobuz_two,
+    }.get(instance_id)
+
+    with pytest.raises(InvalidDataError, match="reconfigure"):
+        await provider.handle_async_init()
+
+    assert provider._qobuz_provider_id is None
+
+
+@pytest.mark.parametrize(
+    ("configured_instances", "loaded_providers"),
+    [
+        ([], {}),
+        (
+            ["qobuz--disabled"],
+            {
+                "qobuz--disabled": SimpleNamespace(
+                    domain="qobuz", instance_id="qobuz--disabled", available=False
+                )
+            },
+        ),
+    ],
+)
+async def test_init_rejects_unrecoverable_legacy_qobuz_provider_selection(
+    configured_instances: list[str], loaded_providers: dict[str, SimpleNamespace]
+) -> None:
+    """Legacy receivers cannot recover when no exact available Qobuz instance exists."""
+    provider, mass = _make_provider(qobuz_provider_id=None)
+    mass.config.get_provider_configs = AsyncMock(
+        return_value=[
+            SimpleNamespace(instance_id=instance_id) for instance_id in configured_instances
+        ]
+    )
+    mass.get_provider.side_effect = lambda instance_id, **_kwargs: loaded_providers.get(instance_id)
+
+    with pytest.raises(InvalidDataError, match="reconfigure"):
+        await provider.handle_async_init()
+
+    assert provider._qobuz_provider_id is None
+
+
+async def test_init_keeps_existing_qobuz_provider_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicitly selected native Qobuz instance bypasses legacy recovery."""
+    provider, mass = _make_provider(qobuz_provider_id="qobuz--selected")
+    update_setup_data = MagicMock()
+    monkeypatch.setattr(provider, "_update_setup_data", update_setup_data)
+    mass.config.get_provider_configs = AsyncMock()
+    _prepare_successful_init(provider, mass, monkeypatch)
+
+    await provider.handle_async_init()
+
+    assert provider._qobuz_provider_id == "qobuz--selected"
+    mass.config.get_provider_configs.assert_not_awaited()
+    update_setup_data.assert_not_called()
 
 
 @pytest.mark.parametrize(
