@@ -1187,8 +1187,7 @@ class MusicAssistant:
 
         # handle dependency on other provider
         if prov_manifest.depends_on and not self.get_provider(prov_manifest.depends_on):
-            # we can safely ignore this completely as the setup will be retried later
-            # automatically when the dependency is loaded
+            await self._validate_provider_dependency(prov_manifest)
             return
 
         # seed the config with its stored raw values so any construction-time option reads
@@ -1250,6 +1249,19 @@ class MusicAssistant:
             await self.music.on_provider_loaded(provider)
         if isinstance(provider, PlayerProvider):
             await self.players.on_provider_loaded(provider)
+
+    async def _validate_provider_dependency(self, manifest: ProviderManifest) -> None:
+        """Defer an enabled dependency or reject a missing/disabled dependency."""
+        dependency_configs = await self.config.get_provider_configs(
+            provider_domain=manifest.depends_on
+        )
+        if any(config.enabled for config in dependency_configs):
+            return
+        msg = (
+            f"Required provider {manifest.depends_on!r} is not configured and enabled; "
+            f"please reconfigure {manifest.name}."
+        )
+        raise SetupFailedError(msg)
 
     async def __load_provider_manifests(self) -> None:
         """Preload all available provider manifest files."""

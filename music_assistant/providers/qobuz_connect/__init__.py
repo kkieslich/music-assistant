@@ -857,27 +857,34 @@ class QobuzConnectProvider(PluginProvider):
 
     async def _recover_legacy_qobuz_provider(self) -> None:
         """Select and persist the only available Qobuz provider for legacy configuration."""
-        candidates = []
-        for config in await self.mass.config.get_provider_configs(provider_domain="qobuz"):
-            provider = self.mass.get_provider(config.instance_id, return_unavailable=True)
-            if (
-                provider is not None
-                and provider.instance_id == config.instance_id
-                and provider.domain == "qobuz"
-                and provider.available is True
-            ):
-                candidates.append(provider)
-        if not candidates:
+        configs = [
+            config
+            for config in await self.mass.config.get_provider_configs(provider_domain="qobuz")
+            if config.enabled
+        ]
+        if not configs:
             raise InvalidDataError(
-                "No available Qobuz music provider instance was found; please reconfigure "
+                "No enabled Qobuz music provider instance was found; please reconfigure "
                 "Qobuz Connect after configuring one."
             )
-        if len(candidates) > 1:
+        if len(configs) > 1:
             raise InvalidDataError(
-                "Multiple available Qobuz music provider instances were found; please "
+                "Multiple enabled Qobuz music provider instances were found; please "
                 "reconfigure Qobuz Connect to select one."
             )
-        self._qobuz_provider_id = candidates[0].instance_id
+        config = configs[0]
+        provider = self.mass.get_provider(config.instance_id, return_unavailable=True)
+        if (
+            provider is None
+            or provider.instance_id != config.instance_id
+            or provider.domain != "qobuz"
+            or provider.available is not True
+        ):
+            raise InvalidDataError(
+                "No available Qobuz music provider instance was found; please reconfigure "
+                "Qobuz Connect after loading one."
+            )
+        self._qobuz_provider_id = provider.instance_id
         self._update_setup_data(CONF_QOBUZ_PROVIDER, self._qobuz_provider_id, immediate=True)
 
     async def _stop_runtime(self) -> None:

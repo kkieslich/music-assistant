@@ -324,7 +324,7 @@ async def test_init_recovers_and_persists_sole_legacy_qobuz_provider(
     native = _fake_qobuz_provider()
     native.instance_id = "qobuz--only"
     mass.config.get_provider_configs = AsyncMock(
-        return_value=[SimpleNamespace(instance_id="qobuz--only")]
+        return_value=[SimpleNamespace(instance_id="qobuz--only", enabled=True)]
     )
     mass.get_provider.side_effect = lambda instance_id, return_unavailable=False: (
         native if instance_id == "qobuz--only" and return_unavailable else None
@@ -348,8 +348,8 @@ async def test_init_rejects_ambiguous_legacy_qobuz_providers() -> None:
     qobuz_two.instance_id = "qobuz--two"
     mass.config.get_provider_configs = AsyncMock(
         return_value=[
-            SimpleNamespace(instance_id="qobuz--one"),
-            SimpleNamespace(instance_id="qobuz--two"),
+            SimpleNamespace(instance_id="qobuz--one", enabled=True),
+            SimpleNamespace(instance_id="qobuz--two", enabled=True),
         ]
     )
     mass.get_provider.side_effect = lambda instance_id, **_kwargs: {
@@ -361,6 +361,33 @@ async def test_init_rejects_ambiguous_legacy_qobuz_providers() -> None:
         await provider.handle_async_init()
 
     assert provider._qobuz_provider_id is None
+
+
+async def test_init_rejects_staggered_multiple_qobuz_configs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery never selects the first account merely because the second is still loading."""
+    provider, mass = _make_provider(qobuz_provider_id=None)
+    qobuz_one = _fake_qobuz_provider()
+    qobuz_one.instance_id = "qobuz--one"
+    mass.config.get_provider_configs = AsyncMock(
+        return_value=[
+            SimpleNamespace(instance_id="qobuz--one", enabled=True),
+            SimpleNamespace(instance_id="qobuz--two", enabled=True),
+        ]
+    )
+    mass.get_provider.side_effect = lambda instance_id, **_kwargs: (
+        qobuz_one if instance_id == "qobuz--one" else None
+    )
+    update_setup_data = MagicMock()
+    monkeypatch.setattr(provider, "_update_setup_data", update_setup_data)
+    _prepare_successful_init(provider, mass, monkeypatch)
+
+    with pytest.raises(InvalidDataError, match="reconfigure"):
+        await provider.handle_async_init()
+
+    assert provider._qobuz_provider_id is None
+    update_setup_data.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -384,7 +411,8 @@ async def test_init_rejects_unrecoverable_legacy_qobuz_provider_selection(
     provider, mass = _make_provider(qobuz_provider_id=None)
     mass.config.get_provider_configs = AsyncMock(
         return_value=[
-            SimpleNamespace(instance_id=instance_id) for instance_id in configured_instances
+            SimpleNamespace(instance_id=instance_id, enabled=True)
+            for instance_id in configured_instances
         ]
     )
     mass.get_provider.side_effect = lambda instance_id, **_kwargs: loaded_providers.get(instance_id)
