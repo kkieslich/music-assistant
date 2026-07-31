@@ -76,6 +76,11 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
+# How long MA may claim PLAYING without its position moving before we call it a
+# stall. Comfortably longer than a track change or a flow-stream restart, both of
+# which briefly hold the position steady.
+STALLED_PLAYBACK_WARN_AFTER_MS = 30_000
+
 # How long to wait for a cloud echo of an MA-origin proposal before giving up
 # and converging MA back to canonical truth. The shell half of the
 # lost-echo safety net; the reducer half (dropping the proposal on
@@ -157,6 +162,10 @@ class QobuzConnectCoordinator:
         # PushVolume/PushMute. ``None`` sentinel forces the first real value
         # through.
         self._last_volume_state: tuple[int, bool] | None = None
+        # (position_ms, wall-clock-ms first seen) for the stalled-playback guard,
+        # plus a latch so a stall warns once rather than on every MA event.
+        self._progress_anchor: tuple[int, int] | None = None
+        self._warned_stalled = False
 
     @property
     def state(self) -> CanonicalState:
@@ -304,12 +313,14 @@ class QobuzConnectCoordinator:
             current_track_id = self._qobuz_track_id_for(
                 queue.current_item, preferred=self._state.current_id
             )
+        position_ms = int(queue.corrected_elapsed_time * 1000)
+        self._note_playback_progress(playing, position_ms, player_id)
         await self._submit(
             MaTransportChanged(
                 now_ms=self._now(),
                 playing=playing,
                 current_track_id=current_track_id,
-                position_ms=int(queue.corrected_elapsed_time * 1000),
+                position_ms=position_ms,
                 target_player_id=player_id,
                 current_item_unmappable=(
                     queue.current_item is not None and current_track_id is None
@@ -341,16 +352,23 @@ class QobuzConnectCoordinator:
         player = self._bridge.get_player(player_id)
         if player is None:
             return
-        # A player can transiently report volume_level=None (network players do
-        # this while acking a volume change; BlackHole never does). The old
+        # Read the group-aware level: MA leaves `volume_level` unset on sync
+        # groups (the aggregate lives on `group_volume`), and `group_volume`
+        # falls back to the player's own level for non-group players — so this
+        # one read is correct for both. Reading `volume_level` instead made the
+        # None-guard below swallow every MA-side change for a group target
+        # (live 2026-07-31).
+        group_volume = player.group_volume
+        # A player can transiently report a None level (network players do this
+        # while acking a volume change; BlackHole never does). The old
         # `volume_level or 0` reported that as 0, so the Qobuz app showed the
         # renderer as muted a short while after the user changed volume (live
         # 2026-07-11). Never report a spurious 0 — skip until a real level is
         # known.
-        if player.volume_level is None:
+        if group_volume is None:
             return
-        volume = player.volume_level
-        muted = bool(player.volume_muted)
+        volume = group_volume
+        muted = bool(player.group_volume_muted)
         if self._last_volume_state == (volume, muted):
             return
         self._last_volume_state = (volume, muted)
@@ -361,6 +379,54 @@ class QobuzConnectCoordinator:
                 muted=muted,
             )
         )
+
+    def _note_playback_progress(
+        self, playing: PlayingState, position_ms: int, player_id: str
+    ) -> None:
+        """
+        Warn when MA claims PLAYING but its position stops advancing.
+
+        Without this the provider reports PLAYING to the Qobuz app for as long as
+        the condition lasts, so a target that cannot actually produce sound looks
+        like healthy playback on both ends (live 2026-07-31: a dead speaker in the
+        target group left MA "playing" and silent for two days).
+
+        :param playing: Playback state just derived from MA's queue.
+        :param position_ms: Position just derived from MA's queue.
+        :param player_id: Target player the state was read from, for the message.
+        """
+        if playing is not PlayingState.PLAYING:
+            self._progress_anchor = None
+            self._warned_stalled = False
+            return
+        now_ms = self._now()
+        anchor = self._progress_anchor
+        if anchor is None or anchor[0] != position_ms:
+            # Fresh position — re-arm so a later stall can warn again.
+            self._progress_anchor = (position_ms, now_ms)
+            self._warned_stalled = False
+            return
+        if self._warned_stalled:
+            return
+        stalled_for_ms = now_ms - anchor[1]
+        if stalled_for_ms < STALLED_PLAYBACK_WARN_AFTER_MS:
+            return
+        self._warned_stalled = True
+        LOGGER.warning(
+            "MA reports playing on %s but its position is not advancing "
+            "(stuck at %dms for %ds) — the target is probably not producing audio; "
+            "check that the player and, for a group, its members are available",
+            player_id,
+            position_ms,
+            stalled_for_ms // 1000,
+        )
+        if self._recorder is not None:
+            self._recorder.record(
+                "stalled_playback",
+                player_id=player_id,
+                position_ms=position_ms,
+                stalled_for_ms=stalled_for_ms,
+            )
 
     # ---- core intake --------------------------------------------------------
 

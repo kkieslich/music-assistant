@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -60,7 +61,9 @@ def _fake_player(player_id: str = "player_1") -> SimpleNamespace:
     return SimpleNamespace(
         player_id=player_id,
         display_name="Player One",
-        state=SimpleNamespace(playback_state=MAPlaybackState.IDLE),
+        state=SimpleNamespace(
+            playback_state=MAPlaybackState.IDLE, group_members=(), available=True
+        ),
         group_volume=50,
         group_volume_muted=False,
         volume_level=50,
@@ -1320,6 +1323,87 @@ async def test_ma_events_ignore_non_target_player() -> None:
     provider._coordinator.on_ma_modes_event.assert_not_awaited()
     provider._coordinator.on_ma_queue_event.assert_not_awaited()
     provider._coordinator.on_ma_volume_event.assert_not_awaited()
+
+
+def _group_target_with_members(
+    *members: tuple[str, bool],
+) -> tuple[QobuzConnectProvider, MagicMock]:
+    """Build a provider whose target is a group made of ``(player_id, available)`` members."""
+    group = _fake_player("group_1")
+    group.state.group_members = tuple(pid for pid, _ in members)
+    children = {pid: _fake_player(pid) for pid, _ in members}
+    for pid, available in members:
+        children[pid].state.available = available
+    provider, mass = _make_provider(target_player=group)
+    mass.players.get_player.side_effect = lambda pid, **_kw: (
+        group if pid == "group_1" else children.get(pid)
+    )
+    return provider, mass
+
+
+def test_activation_warns_when_no_group_member_can_output(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A target group with no available member must warn, not activate silently.
+
+    Live 2026-07-31: the target sync group's only real speaker was an orphaned
+    player that never became available, so Qobuz Connect reported PLAYING for
+    days while nothing could produce sound.
+    """
+    provider, _mass = _group_target_with_members(("member_1", False), ("member_2", False))
+
+    with caplog.at_level(logging.WARNING):
+        provider._warn_if_target_cannot_output()
+
+    assert "no available player" in caplog.text
+    assert "member_1" in caplog.text
+
+
+def test_activation_warns_about_individual_unavailable_member(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A partially-degraded group still names the dead member so it can be fixed."""
+    provider, _mass = _group_target_with_members(("member_1", False), ("member_2", True))
+
+    with caplog.at_level(logging.WARNING):
+        provider._warn_if_target_cannot_output()
+
+    assert "member_1" in caplog.text
+    assert "no available player" not in caplog.text
+
+
+def test_activation_stays_quiet_for_healthy_target(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A fully available target logs no availability warning."""
+    provider, _mass = _group_target_with_members(("member_1", True), ("member_2", True))
+
+    with caplog.at_level(logging.WARNING):
+        provider._warn_if_target_cannot_output()
+
+    assert "member_1" not in caplog.text
+    assert "no available player" not in caplog.text
+
+
+async def test_player_updated_from_group_member_drives_group_volume() -> None:
+    """
+    A PLAYER_UPDATED for a member of a group target must reach the volume lane.
+
+    MA emits PLAYER_UPDATED per player, and a sync group's aggregate volume only
+    moves when a *member's* level changes. Filtering strictly on the target id
+    therefore dropped every MA-side slider move for a group target, so the Qobuz
+    app's volume display never followed MA (live 2026-07-31).
+    """
+    group = _fake_player("group_1")
+    group.state.group_members = ("member_1", "member_2")
+    provider, _mass = _make_provider(target_player=group)
+    provider._coordinator = AsyncMock()
+
+    await provider._on_ma_player_updated(_fake_event("member_1"))
+
+    # The coordinator recomputes the *group's* aggregate volume, not the member's.
+    provider._coordinator.on_ma_volume_event.assert_awaited_once_with("group_1")
 
 
 def test_auto_target_stays_pinned_while_session_active() -> None:

@@ -653,6 +653,7 @@ class QobuzConnectProvider(PluginProvider):
             return
         if active:
             self.logger.info("Qobuz Connect activated")
+            self._warn_if_target_cannot_output()
             try:
                 await self._reconcile_active_quality()
             except Exception as err:
@@ -838,13 +839,85 @@ class QobuzConnectProvider(PluginProvider):
         Propagate MA-side volume + mute changes (``PLAYER_UPDATED``) into the coordinator.
 
         Fires for every ``PLAYER_UPDATED`` event MA emits; filtered to our
-        target player id. Volume + mute live on the player state and share
-        the same source event, so both go through one coordinator call.
+        target player and — when that target is a group — its members. Volume +
+        mute live on the player state and share the same source event, so both
+        go through one coordinator call.
         """
         player_id = self.get_target_player_id()
-        if not player_id or event.object_id != player_id:
+        if not player_id:
             return
+        if event.object_id != player_id and not self._is_group_member(player_id, event.object_id):
+            return
+        # Always resolve against the target: for a group the aggregate volume
+        # lives on the group player, not on the member that just changed.
         await self._coordinator.on_ma_volume_event(player_id)
+
+    def _warn_if_target_cannot_output(self) -> None:
+        """
+        Warn when the resolved target has no player that can actually produce sound.
+
+        Qobuz Connect happily reports PLAYING against a target whose speakers are
+        all gone, which reads as "connected but silent" with nothing in the log to
+        explain it (live 2026-07-31: the target sync group's only real speaker was
+        an orphaned player that never became available).
+        """
+        player_id = self.get_target_player_id()
+        if not player_id:
+            return
+        player = self.mass.players.get_player(player_id)
+        if player is None:
+            self.logger.warning(
+                "Qobuz Connect target player %s does not exist; playback will be silent",
+                player_id,
+            )
+            return
+        member_ids = getattr(player.state, "group_members", None) or ()
+        if not member_ids:
+            if not getattr(player.state, "available", True):
+                self.logger.warning(
+                    "Qobuz Connect target player %s is not available; "
+                    "playback will be silent until it comes back",
+                    player_id,
+                )
+            return
+        unavailable = [
+            member_id
+            for member_id in member_ids
+            if (member := self.mass.players.get_player(member_id)) is None
+            or not getattr(member.state, "available", True)
+        ]
+        if not unavailable:
+            return
+        if len(unavailable) == len(member_ids):
+            self.logger.warning(
+                "Qobuz Connect target group %s has no available player (%s); "
+                "playback will be silent — fix the group members in MA settings",
+                player_id,
+                ", ".join(unavailable),
+            )
+        else:
+            self.logger.warning(
+                "Qobuz Connect target group %s has unavailable member(s): %s; "
+                "audio will only reach the remaining members",
+                player_id,
+                ", ".join(unavailable),
+            )
+
+    def _is_group_member(self, group_player_id: str, candidate_id: str | None) -> bool:
+        """
+        Return whether ``candidate_id`` belongs to ``group_player_id``'s group.
+
+        :param group_player_id: Player id of the (possibly non-group) target player.
+        :param candidate_id: Player id carried by an incoming MA event.
+        """
+        if not candidate_id:
+            return False
+        # Runs for every PLAYER_UPDATED MA emits, so it must never raise on a
+        # player whose state is mid-teardown or lacks group membership.
+        player = self.mass.players.get_player(group_player_id)
+        if player is None:
+            return False
+        return candidate_id in (getattr(player.state, "group_members", None) or ())
 
     def _get_setup_or_legacy_value(
         self, key: str, default: ConfigValueType = None

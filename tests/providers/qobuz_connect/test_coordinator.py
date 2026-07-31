@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING, Any
 
 import music_assistant.providers.qobuz_connect.coordinator as coordinator_module
@@ -39,6 +40,8 @@ from music_assistant.providers.qobuz_connect.sync_types import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import pytest
 
 OUR_DEVICE_UUID = b"\x01" * 16
@@ -76,13 +79,33 @@ class _FakeQueue:
         self.shuffle_enabled = False
 
 
+_UNSET: Any = object()
+
+
 class _FakePlayer:
     """Minimal stand-in for MA's Player, exposing only volume fields."""
 
-    def __init__(self, *, volume_level: int | None = 50, volume_muted: bool = False) -> None:
-        """Hold the fixed volume fields the coordinator's on_ma_volume_event reads."""
+    def __init__(
+        self,
+        *,
+        volume_level: int | None = 50,
+        volume_muted: bool = False,
+        group_volume: int | None = _UNSET,
+        group_volume_muted: bool | None = _UNSET,
+    ) -> None:
+        """
+        Hold the fixed volume fields the coordinator's on_ma_volume_event reads.
+
+        MA's ``Player.group_volume``/``group_volume_muted`` fall back to the
+        player's own level when it is not a group, so default to mirroring
+        ``volume_level``/``volume_muted`` unless a group value is given.
+        """
         self.volume_level = volume_level
         self.volume_muted = volume_muted
+        self.group_volume = volume_level if group_volume is _UNSET else group_volume
+        self.group_volume_muted = (
+            volume_muted if group_volume_muted is _UNSET else group_volume_muted
+        )
 
 
 class _FakeBridge:
@@ -126,7 +149,7 @@ def _refs(*ids: int) -> tuple[QueueTrackRef, ...]:
 
 
 def _coordinator(
-    *, bridge: _FakeBridge | None = None
+    *, bridge: _FakeBridge | None = None, now: Callable[[], int] = lambda: 1
 ) -> tuple[QobuzConnectCoordinator, _RecordingRunner, _FakeBridge]:
     runner = _RecordingRunner()
     bridge = bridge if bridge is not None else _FakeBridge()
@@ -134,7 +157,7 @@ def _coordinator(
         runner=runner,  # type: ignore[arg-type]
         bridge=bridge,  # type: ignore[arg-type]
         device_uuid=OUR_DEVICE_UUID,
-        now=lambda: 1,
+        now=now,
     )
     return coord, runner, bridge
 
@@ -599,6 +622,98 @@ async def test_on_ma_volume_event() -> None:
     coord, runner, bridge = _coordinator()
     bridge.player = _FakePlayer(volume_level=42, volume_muted=True)
     await coord.on_ma_volume_event("player")
+    assert any(isinstance(e, PushVolume) and e.volume == 42 for e in runner.effects)
+    assert any(isinstance(e, PushMute) and e.muted is True for e in runner.effects)
+
+
+async def test_stalled_playback_warns_when_position_never_advances(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    MA claiming PLAYING while its position never advances must warn.
+
+    Live 2026-07-31: the target group's only real speaker was gone, so MA sat at
+    state=playing with corrected_elapsed_time pinned while Qobuz Connect happily
+    reported PLAYING upward — silent for two days with nothing in the log to
+    explain it. Surface the stall instead of reporting success.
+    """
+    clock = {"ms": 0}
+    coord, _runner, bridge = _coordinator(now=lambda: clock["ms"])
+    bridge.queue = _FakeQueue(state="playing", elapsed=12.0)
+
+    with caplog.at_level(logging.WARNING):
+        await coord.on_ma_transport_event("player")
+        clock["ms"] = 60_000
+        await coord.on_ma_transport_event("player")
+
+    assert "not advancing" in caplog.text
+
+
+async def test_stalled_playback_warns_only_once_until_it_recovers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The stall warning must not flood the log, and must re-arm after recovery."""
+    clock = {"ms": 0}
+    coord, _runner, bridge = _coordinator(now=lambda: clock["ms"])
+    bridge.queue = _FakeQueue(state="playing", elapsed=12.0)
+
+    with caplog.at_level(logging.WARNING):
+        await coord.on_ma_transport_event("player")
+        clock["ms"] = 60_000
+        await coord.on_ma_transport_event("player")
+        clock["ms"] = 120_000
+        await coord.on_ma_transport_event("player")
+
+    assert caplog.text.count("not advancing") == 1
+
+    # Position advances again -> the guard re-arms and can warn about a new stall.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        bridge.queue = _FakeQueue(state="playing", elapsed=30.0)
+        clock["ms"] = 130_000
+        await coord.on_ma_transport_event("player")
+        clock["ms"] = 200_000
+        await coord.on_ma_transport_event("player")
+
+    assert caplog.text.count("not advancing") == 1
+
+
+async def test_paused_playback_never_warns_about_stalling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A paused queue holds its position by design and must never warn."""
+    clock = {"ms": 0}
+    coord, _runner, bridge = _coordinator(now=lambda: clock["ms"])
+    bridge.queue = _FakeQueue(state="paused", elapsed=12.0)
+
+    with caplog.at_level(logging.WARNING):
+        await coord.on_ma_transport_event("player")
+        clock["ms"] = 600_000
+        await coord.on_ma_transport_event("player")
+
+    assert "not advancing" not in caplog.text
+
+
+async def test_on_ma_volume_event_reports_group_volume_for_group_target() -> None:
+    """
+    A group target must report its aggregate group volume, not its own level.
+
+    MA leaves ``volume_level`` unset (None) on sync groups — the aggregate lives
+    on ``group_volume``. Reading ``volume_level`` made the transient-None guard
+    swallow every MA-side volume change, so a Qobuz Connect session pinned to a
+    sync group never propagated MA slider moves to the app at all (live
+    2026-07-31: 0 outbound volume pushes across two 10-minute windows).
+    """
+    coord, runner, bridge = _coordinator()
+    bridge.player = _FakePlayer(
+        volume_level=None,
+        volume_muted=False,
+        group_volume=42,
+        group_volume_muted=True,
+    )
+
+    await coord.on_ma_volume_event("player")
+
     assert any(isinstance(e, PushVolume) and e.volume == 42 for e in runner.effects)
     assert any(isinstance(e, PushMute) and e.muted is True for e in runner.effects)
 
