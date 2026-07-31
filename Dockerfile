@@ -116,6 +116,8 @@ RUN chmod -R 777 /app \
 
 FROM ghcr.io/music-assistant/base:$BASE_IMAGE_VERSION
 
+RUN test -x /usr/local/bin/shairport-sync
+
 ENV VIRTUAL_ENV=/app/venv
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
