@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -43,6 +44,31 @@ def test_rejects_duplicate_base_image_version_key(tmp_path: Path) -> None:
         resolve_base_image_version(workflow)
 
 
+@pytest.mark.parametrize(
+    "duplicate",
+    ["BASE_IMAGE_VERSION_NIGHTLY: 1.6.1", 'BASE_IMAGE_VERSION_NIGHTLY: "1.6.1'],
+    ids=["unquoted", "malformed"],
+)
+def test_rejects_duplicate_key_with_invalid_second_declaration(
+    tmp_path: Path, duplicate: str
+) -> None:
+    """Every matching key declaration counts toward ambiguity before value parsing."""
+    workflow = tmp_path / "release.yml"
+    workflow.write_text(f'BASE_IMAGE_VERSION_NIGHTLY: "1.6.0"\n{duplicate}\n')
+
+    with pytest.raises(ValueError, match="exactly one"):
+        resolve_base_image_version(workflow)
+
+
+def test_rejects_unquoted_base_image_version(tmp_path: Path) -> None:
+    """A sole declaration must quote its semantic version value."""
+    workflow = tmp_path / "release.yml"
+    workflow.write_text("BASE_IMAGE_VERSION_NIGHTLY: 1.6.0\n")
+
+    with pytest.raises(ValueError, match="must be quoted"):
+        resolve_base_image_version(workflow)
+
+
 @pytest.mark.parametrize("version", ["latest", "1.6", "1.6.0-rc1"])
 def test_rejects_malformed_base_image_version(tmp_path: Path, version: str) -> None:
     """Only three-component numeric base-image versions are accepted."""
@@ -77,6 +103,39 @@ def test_fork_build_resolves_base_image_version_before_buildx() -> None:
     )
     assert "BASE_IMAGE_VERSION=${{ env.BASE_IMAGE_VERSION }}" in workflow
     assert workflow.index('>> "$GITHUB_ENV"') < workflow.index("Set up Buildx")
+
+
+def test_fork_build_stops_before_export_when_resolver_fails(tmp_path: Path) -> None:
+    """The workflow shell propagates resolver failure instead of exporting an empty value."""
+    workflow = FORK_BUILD_WORKFLOW.read_text()
+    match = re.search(
+        r"(?m)^      - name: Resolve upstream base image version\n"
+        r"        run: \|\n(?P<body>(?:          .*\n)+)",
+        workflow,
+    )
+    assert match is not None
+    script = "\n".join(line[10:] for line in match.group("body").splitlines())
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python"
+    fake_python.write_text("#!/bin/sh\nexit 23\n")
+    fake_python.chmod(0o755)
+    github_env = tmp_path / "github-env"
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "GITHUB_ENV": str(github_env),
+    }
+
+    result = subprocess.run(  # noqa: S603
+        ["/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+        cwd=ROOT,
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode == 23
+    assert not github_env.exists()
 
 
 def test_final_image_requires_shairport_sync_binary() -> None:

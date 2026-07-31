@@ -12,16 +12,22 @@ from pathlib import Path
 def resolve_base_image_version(path: Path, channel: str = "NIGHTLY") -> str:
     """Return the validated base-image version for a release channel."""
     key = re.escape(f"BASE_IMAGE_VERSION_{channel.upper()}")
-    matches = re.findall(
-        rf'^[ \t]*{key}[ \t]*:[ \t]*(["\'])([^"\']+)\1[ \t]*(?:#.*)?$',
-        path.read_text(),
-        flags=re.MULTILINE,
-    )
-    if len(matches) != 1:
-        msg = f"Expected exactly one quoted BASE_IMAGE_VERSION_{channel.upper()} value"
+    text = path.read_text()
+    declarations = re.findall(rf"^[ \t]*{key}[ \t]*:", text, flags=re.MULTILINE)
+    if len(declarations) != 1:
+        msg = f"Expected exactly one BASE_IMAGE_VERSION_{channel.upper()} declaration"
         raise ValueError(msg)
 
-    version = matches[0][1]
+    match = re.search(
+        rf'^[ \t]*{key}[ \t]*:[ \t]*(["\'])([^"\']+)\1[ \t]*(?:#.*)?$',
+        text,
+        flags=re.MULTILINE,
+    )
+    if match is None:
+        msg = f"BASE_IMAGE_VERSION_{channel.upper()} must be quoted"
+        raise ValueError(msg)
+
+    version = match.group(2)
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         msg = f"BASE_IMAGE_VERSION_{channel.upper()} must be a three-component numeric version"
         raise ValueError(msg)
